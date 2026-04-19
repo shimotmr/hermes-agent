@@ -204,6 +204,14 @@ def get_container_exec_info() -> Optional[dict]:
 
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home  # noqa: F811,E402
+from hermes_cli.openclaw_credentials import (
+    get_all_bridged_env_values as _get_openclaw_bridged_env_values,
+    populate_environment as _populate_openclaw_environment,
+)
+
+# Fill missing env vars from the local OpenClaw credential vault so Hermes can
+# reuse shared secrets without duplicating them into ~/.hermes/.env.
+_populate_openclaw_environment()
 
 def get_config_path() -> Path:
     """Get the main config file path."""
@@ -2975,6 +2983,10 @@ def load_env() -> Dict[str, str]:
     concatenated KEY=VALUE pairs on a single line) are handled
     gracefully instead of producing mangled values such as duplicated
     bot tokens.  See #8908.
+
+    When Hermes-specific keys are missing locally, merge fallback values from
+    the OpenClaw credential vault without writing them into ~/.hermes/.env.
+    Explicit ~/.hermes/.env entries still take precedence.
     """
     env_path = get_env_path()
     env_vars = {}
@@ -2993,6 +3005,9 @@ def load_env() -> Dict[str, str]:
             if line and not line.startswith('#') and '=' in line:
                 key, _, value = line.partition('=')
                 env_vars[key.strip()] = value.strip().strip('"\'')
+
+    for key, value in _get_openclaw_bridged_env_values().items():
+        env_vars.setdefault(key, value)
     
     return env_vars
 
