@@ -198,6 +198,49 @@ class TestRealSubagentInterrupt(unittest.TestCase):
         self.assertEqual(result["status"], "interrupted",
                         f"Expected 'interrupted', got '{result['status']}'")
 
+    def test_delegate_child_construction_disables_eager_compression_feasibility_check(self):
+        """Delegated child agents should not do unrelated auxiliary compression
+        feasibility preflight work during construction."""
+        from tools.delegate_tool import _build_child_agent
+
+        parent = MagicMock()
+        parent.enabled_toolsets = ["terminal"]
+        parent.model = "test/model"
+        parent.provider = "test"
+        parent.base_url = "http://localhost:1"
+        parent.api_mode = "chat_completions"
+        parent.api_key = "test-key"
+        parent.reasoning_config = None
+        parent.max_tokens = None
+        parent.prefill_messages = None
+        parent.platform = "cli"
+        parent.providers_allowed = None
+        parent.providers_ignored = None
+        parent.providers_order = None
+        parent.provider_sort = None
+        parent.tool_progress_callback = None
+        parent._session_db = None
+        parent.session_id = None
+        parent._delegate_depth = 0
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = _build_child_agent(
+                task_index=0,
+                goal="Test task",
+                context=None,
+                toolsets=["terminal"],
+                model=None,
+                max_iterations=5,
+                task_count=1,
+                parent_agent=parent,
+            )
+
+        self.assertIs(child, MockAgent.return_value)
+        self.assertFalse(
+            MockAgent.call_args.kwargs["eager_compression_feasibility_check"],
+            "Delegated child construction should skip eager compression feasibility preflight",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

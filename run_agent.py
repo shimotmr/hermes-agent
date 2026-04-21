@@ -754,6 +754,7 @@ class AIAgent:
         gateway_session_key: str = None,
         skip_context_files: bool = False,
         skip_memory: bool = False,
+        eager_compression_feasibility_check: bool = True,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -805,6 +806,10 @@ class AIAgent:
             skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
                 into the system prompt. Use this for batch processing and data generation to avoid
                 polluting trajectories with user-specific persona or project instructions.
+            eager_compression_feasibility_check (bool): If True (default), warn during init when the
+                configured auxiliary compression model appears too small for the main model's compression
+                threshold. Delegated child agents and other ephemeral/test-focused constructions can set
+                this False to avoid unrelated provider/auth preflight work during construction.
         """
         _install_safe_stdio()
 
@@ -1790,7 +1795,9 @@ class AIAgent:
         # Gateway status_callback is not yet wired, so any warning is stored
         # in _compression_warning and replayed in the first run_conversation().
         self._compression_warning = None
-        self._check_compression_model_feasibility()
+        self._eager_compression_feasibility_check = bool(eager_compression_feasibility_check)
+        if self._eager_compression_feasibility_check:
+            self._check_compression_model_feasibility()
 
         # Snapshot primary runtime for per-turn restoration.  When fallback
         # activates during a turn, the next turn restores these values so the
