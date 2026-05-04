@@ -643,6 +643,15 @@ class ChatCompletionsTransport(ProviderTransport):
                     _effort = reasoning_config.get("effort", "medium") or "medium"
                 extra_body["reasoning"] = {"enabled": True, "effort": _effort}
 
+        if provider_name == "zai":
+            _zai_thinking_enabled = True
+            if reasoning_config and isinstance(reasoning_config, dict):
+                if reasoning_config.get("enabled") is False:
+                    _zai_thinking_enabled = False
+            extra_body["thinking"] = {
+                "type": "enabled" if _zai_thinking_enabled else "disabled",
+            }
+
         if provider_name == "gemini":
             raw_thinking_config = _build_gemini_thinking_config(model, reasoning_config)
             if _is_gemini_openai_compat_base_url(base_url):
