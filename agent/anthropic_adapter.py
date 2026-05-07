@@ -345,6 +345,7 @@ def _supports_fast_mode(model: str) -> bool:
 _COMMON_BETAS = [
     "interleaved-thinking-2025-05-14",
     "fine-grained-tool-streaming-2025-05-14",
+    "context-1m-2025-08-07",
 ]
 # MiniMax's Anthropic-compatible endpoints fail tool-use requests when
 # the fine-grained tool streaming beta is present.  Omit it so tool calls
@@ -700,7 +701,11 @@ def _common_betas_for_base_url(
     would otherwise include it after a subscription/endpoint rejects the beta.
     """
     betas = list(_COMMON_BETAS)
-    if _base_url_needs_context_1m_beta(base_url) and not drop_context_1m_beta:
+    if (
+        not drop_context_1m_beta
+        and _base_url_needs_context_1m_beta(base_url)
+        and _CONTEXT_1M_BETA not in betas
+    ):
         betas.append(_CONTEXT_1M_BETA)
     if _is_minimax_anthropic_endpoint(base_url):
         _stripped = {_TOOL_STREAMING_BETA, _CONTEXT_1M_BETA}
