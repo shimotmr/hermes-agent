@@ -72,7 +72,7 @@ dependencies = [
   # it out of the lazy-install path that exists only for the heavy matrix deps.
   "Markdown==3.10.2",
   # Skills Hub (GitHub App JWT auth — optional, only needed for bot identity)
-  "PyJWT[crypto]==2.12.1",  # CVE-2026-32597
+  "PyJWT[crypto]==2.13.0",  # CVE-2026-32597 fixed in 2.13.0
   # Windows has no IANA tzdata shipped with the OS, so Python's ``zoneinfo``
   # (PEP 615) raises ``ZoneInfoNotFoundError`` for every non-UTC timezone
   # out of the box.  ``tzdata`` ships the Olson database as a data package
