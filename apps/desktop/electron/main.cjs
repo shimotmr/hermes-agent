@@ -26,6 +26,7 @@ const { fileURLToPath, pathToFileURL } = require('node:url')
 const { execFileSync, spawn } = require('node:child_process')
 const { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } = require('./bootstrap-platform.cjs')
 const { runBootstrap } = require('./bootstrap-runner.cjs')
+const { buildSessionWindowUrl, createSessionWindowRegistry } = require('./session-windows.cjs')
 const { canImportHermesCli, verifyHermesCli } = require('./backend-probes.cjs')
 const { probeGatewayWebSocket } = require('./gateway-ws-probe.cjs')
 const { serializeJsonBody, setJsonRequestHeaders } = require('./oauth-net-request.cjs')
@@ -4295,20 +4296,31 @@ async function teardownPrimaryBackendAndWait() {
   const dying = hermesProcess && !hermesProcess.killed ? hermesProcess : null
   resetHermesConnection()
 
-  if (!dying) {
+  await waitForBackendExit(dying)
+}
+
+async function waitForBackendExit(child, timeoutMs = 5000) {
+  if (!child) {
+    return
+  }
+  if (child.exitCode !== null || child.signalCode !== null) {
     return
   }
 
   await new Promise(resolve => {
     const timer = setTimeout(() => {
       try {
-        dying.kill('SIGKILL')
+        if (IS_WINDOWS && Number.isInteger(child.pid)) {
+          forceKillProcessTree(child.pid)
+        } else {
+          child.kill('SIGKILL')
+        }
       } catch {
         // Already gone.
       }
       resolve()
-    }, 5000)
-    dying.once('exit', () => {
+    }, timeoutMs)
+    child.once('exit', () => {
       clearTimeout(timer)
       resolve()
     })
@@ -4500,10 +4512,68 @@ function stopPoolBackend(profile) {
   }
 }
 
+async function teardownPoolBackendAndWait(profile) {
+  const entry = backendPool.get(profile)
+  if (!entry) return
+  backendPool.delete(profile)
+
+  if (entry.process && !entry.process.killed) {
+    try {
+      entry.process.kill('SIGTERM')
+    } catch {
+      // Already gone.
+    }
+  }
+
+  await waitForBackendExit(entry.process)
+}
+
 function stopAllPoolBackends() {
   for (const profile of [...backendPool.keys()]) {
     stopPoolBackend(profile)
   }
+}
+
+function profileNameFromDeleteRequest(request) {
+  if (!request || String(request.method || 'GET').toUpperCase() !== 'DELETE') {
+    return null
+  }
+
+  const match = String(request.path || '').match(/^\/api\/profiles\/([^/?#]+)(?:[?#].*)?$/)
+  if (!match) {
+    return null
+  }
+
+  let raw = ''
+  try {
+    raw = decodeURIComponent(match[1])
+  } catch {
+    return null
+  }
+
+  const name = raw.trim()
+  if (!name) {
+    return null
+  }
+  if (name.toLowerCase() === 'default') {
+    return 'default'
+  }
+  return name.toLowerCase()
+}
+
+async function prepareProfileDeleteRequest(request) {
+  const profile = profileNameFromDeleteRequest(request)
+  if (!profile || profile === 'default' || !PROFILE_NAME_RE.test(profile)) {
+    return
+  }
+
+  if (profile === primaryProfileKey()) {
+    writeActiveDesktopProfile('default')
+    await teardownPrimaryBackendAndWait()
+    return
+  }
+
+  await teardownPoolBackendAndWait(profile)
 }
 
 async function startHermes() {
@@ -4677,6 +4747,94 @@ async function startHermes() {
   return connectionPromise
 }
 
+// Shared navigation guards + window chrome wiring applied to every window
+// (the primary plus any secondary session windows). Factored out of
+// createWindow() so secondary windows can't drift from the main window's
+// security posture: external links open in the OS browser, in-app navigation
+// stays confined to the dev server / packaged file URL, and the preview /
+// devtools / zoom / context-menu affordances behave identically everywhere.
+function wireCommonWindowHandlers(win) {
+  installPreviewShortcut(win)
+  installDevToolsShortcut(win)
+  installZoomShortcuts(win)
+  installContextMenu(win)
+  win.webContents.setWindowOpenHandler(details => {
+    openExternalUrl(details.url)
+
+    return { action: 'deny' }
+  })
+  win.webContents.on('will-navigate', (event, url) => {
+    if ((DEV_SERVER && url.startsWith(DEV_SERVER)) || (!DEV_SERVER && url.startsWith('file:'))) {
+      return
+    }
+
+    event.preventDefault()
+    openExternalUrl(url)
+  })
+}
+
+// Secondary "session windows" — one extra OS window per chat so a user can
+// work with multiple chats side by side. The registry guarantees one window
+// per sessionId (re-opening focuses the existing window) and self-cleans on
+// close. The primary mainWindow is never tracked here. Pure logic + the URL
+// builder live in session-windows.cjs so they stay unit-testable.
+const sessionWindows = createSessionWindowRegistry()
+
+function focusWindow(win) {
+  if (!win || win.isDestroyed()) return
+  if (win.isMinimized()) win.restore()
+  if (!win.isVisible()) win.show()
+  win.focus()
+}
+
+// Open (or focus) a standalone window for a single chat session.
+function createSessionWindow(sessionId) {
+  return sessionWindows.openOrFocus(sessionId, () => {
+    const icon = getAppIconPath()
+    const win = new BrowserWindow({
+      width: 480,
+      height: 800,
+      minWidth: 420,
+      minHeight: 620,
+      title: 'Hermes',
+      titleBarStyle: 'hidden',
+      titleBarOverlay: getTitleBarOverlayOptions(),
+      trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
+      vibrancy: IS_MAC ? 'sidebar' : undefined,
+      icon,
+      backgroundColor: '#f7f7f7',
+      webPreferences: {
+        preload: path.join(__dirname, 'preload.cjs'),
+        contextIsolation: true,
+        webviewTag: true,
+        sandbox: true,
+        nodeIntegration: false,
+        devTools: true
+      }
+    })
+
+    if (IS_MAC) {
+      win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
+    }
+
+    win.on('will-enter-full-screen', () => sendWindowStateChanged(true))
+    win.on('enter-full-screen', () => sendWindowStateChanged(true))
+    win.on('will-leave-full-screen', () => sendWindowStateChanged(false))
+    win.on('leave-full-screen', () => sendWindowStateChanged(false))
+
+    wireCommonWindowHandlers(win)
+
+    win.loadURL(
+      buildSessionWindowUrl(sessionId, {
+        devServer: DEV_SERVER,
+        rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex()
+      })
+    )
+
+    return win
+  })
+}
+
 function createWindow() {
   const icon = getAppIconPath()
   mainWindow = new BrowserWindow({
@@ -4737,23 +4895,7 @@ function createWindow() {
   mainWindow.on('will-leave-full-screen', () => sendWindowStateChanged(false))
   mainWindow.on('leave-full-screen', () => sendWindowStateChanged(false))
 
-  installPreviewShortcut(mainWindow)
-  installDevToolsShortcut(mainWindow)
-  installZoomShortcuts(mainWindow)
-  installContextMenu(mainWindow)
-  mainWindow.webContents.setWindowOpenHandler(details => {
-    openExternalUrl(details.url)
-
-    return { action: 'deny' }
-  })
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    if ((DEV_SERVER && url.startsWith(DEV_SERVER)) || (!DEV_SERVER && url.startsWith('file:'))) {
-      return
-    }
-
-    event.preventDefault()
-    openExternalUrl(url)
-  })
+  wireCommonWindowHandlers(mainWindow)
 
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     rememberLog(`[renderer] render-process-gone reason=${details?.reason} exitCode=${details?.exitCode}`)
@@ -4859,6 +5001,15 @@ ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
   return { ok: true }
 })
 ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) => freshGatewayWsUrl(profile))
+ipcMain.handle('hermes:window:openSession', async (_event, sessionId) => {
+  if (typeof sessionId !== 'string' || !sessionId.trim()) {
+    return { ok: false, error: 'invalid-session-id' }
+  }
+
+  createSessionWindow(sessionId.trim())
+
+  return { ok: true }
+})
 ipcMain.handle('hermes:bootstrap:reset', async () => {
   // Renderer's "Reload and retry" path. Clear the latched failure and
   // reset connection state so the next startHermes() call restarts the
@@ -5123,6 +5274,8 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   if (rerouted !== undefined) {
     return rerouted
   }
+
+  await prepareProfileDeleteRequest(request)
 
   const connection = await ensureBackend(request?.profile)
   const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
@@ -5824,7 +5977,14 @@ app.whenReady().then(() => {
   createWindow()
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    // Recreate the primary window if it's gone. Guard on mainWindow directly
+    // (not just total window count) so a dock click still restores the main
+    // window when only secondary session windows remain open.
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      createWindow()
+    } else {
+      focusWindow(mainWindow)
+    }
   })
 })
 
