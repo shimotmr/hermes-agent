@@ -76,6 +76,12 @@ class RelayAdapter(BasePlatformAdapter):
         if self._transport is None:
             raise RuntimeError("RelayAdapter has no transport configured")
         self._transport.set_inbound_handler(self._on_inbound)
+        # Inbound interrupts (connector -> owning gateway) arrive as
+        # interrupt_inbound frames over the SAME outbound WS; bridge them to the
+        # adapter's interrupt path. WS-only: there is no inbound HTTP receiver.
+        set_interrupt = getattr(self._transport, "set_interrupt_inbound_handler", None)
+        if callable(set_interrupt):
+            set_interrupt(self.on_interrupt)
         ok = await self._transport.connect()
         if not ok:
             return False
@@ -88,6 +94,10 @@ class RelayAdapter(BasePlatformAdapter):
             logger.warning("relay handshake failed: %s", exc)
             return False
         self._apply_descriptor(descriptor)
+        # Inbound (messages + interrupts) is delivered over the outbound WS via
+        # the connector's relay bus — there is NO inbound HTTP endpoint (hosted
+        # gateways have no public IP). The transport's reader already dispatches
+        # `inbound` / `interrupt_inbound` frames to the handlers wired above.
         return True
 
     def _apply_descriptor(self, descriptor: CapabilityDescriptor) -> None:
