@@ -244,7 +244,16 @@ termux-all = [
   "hermes-agent[sms]",
   "hermes-agent[web]",
 ]
-dingtalk = ["dingtalk-stream==0.24.3", "alibabacloud-dingtalk==2.2.42", "qrcode==7.4.2"]
+dingtalk = [
+  "dingtalk-stream==0.24.3",
+  # Do not auto-install alibabacloud-dingtalk here. Its alibabacloud-tea-openapi
+  # dependency currently caps cryptography <47, which prevents resolving the
+  # patched cryptography wheels for GHSA-537c-gmf6-5ccf. The DingTalk adapter
+  # treats the Alibaba Card SDK as optional; basic stream/webhook messaging
+  # remains available via dingtalk-stream, and manually installed card SDKs are
+  # still detected at runtime.
+  "qrcode==7.4.2",
+]
 feishu = ["lark-oapi==1.5.3", "qrcode==7.4.2"]
 google = [
   # Required by the google-workspace skill (Gmail, Calendar, Drive, Contacts,

@@ -141,7 +141,11 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     ),
     "platform.dingtalk": (
         "dingtalk-stream==0.24.3",
-        "alibabacloud-dingtalk==2.2.42",
+        # Do not lazy-install alibabacloud-dingtalk automatically. Its current
+        # alibabacloud-tea-openapi dependency caps cryptography <47, blocking
+        # patched cryptography wheels for GHSA-537c-gmf6-5ccf. The DingTalk
+        # adapter treats the Alibaba Card SDK as optional and will use it only
+        # when an operator has installed a safe/compatible SDK manually.
         "qrcode==7.4.2",
     ),
     "platform.feishu": (
