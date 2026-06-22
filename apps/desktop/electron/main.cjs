@@ -43,6 +43,7 @@ const { fetchMarketplaceThemes, searchMarketplaceThemes } = require('./vscode-ma
 const { buildDesktopBackendEnv, normalizeHermesHomeRoot } = require('./backend-env.cjs')
 const { readWindowsUserEnvVar } = require('./windows-user-env.cjs')
 const { readDirForIpc } = require('./fs-read-dir.cjs')
+const { readLiveUpdateMarker } = require('./update-marker.cjs')
 const { gitRootForIpc } = require('./git-root.cjs')
 const { worktreesForIpc } = require('./git-worktrees.cjs')
 const { OFFICIAL_REPO_HTTPS_URL, isOfficialSshRemote } = require('./update-remote.cjs')
@@ -1110,6 +1111,59 @@ function directoryExists(filePath) {
   }
 }
 
+// --- in-app update mutual exclusion (#50238) -------------------------------
+// The Tauri updater writes HERMES_HOME/.hermes-update-in-progress for the whole
+// duration of an `--update` run (see update.rs UpdateMarkerGuard). If the user
+// relaunches the desktop mid-update — because the window vanished with no
+// progress and looks crashed — a fresh instance must NOT spawn its own local
+// backend: that backend re-locks the venv shim, the updater's straggler cleanup
+// (`force_kill_other_hermes`, taskkill /IM hermes.exe) kills it, the launch
+// fails with the 45s "backend didn't come up" error, and the relaunch/kill
+// cycle loops. Instead the fresh instance parks until the update finishes, then
+// brings the backend up itself (it is the surviving instance — the updater's
+// own relaunch hits our single-instance lock and quits). Marker parsing +
+// staleness self-heal live in update-marker.cjs (unit-tested).
+
+// How long we'll park the launch waiting for a live update to finish before
+// giving up and starting the backend anyway (belt-and-suspenders alongside the
+// marker's own age ceiling; covers a stuck-but-alive updater).
+const UPDATE_WAIT_TIMEOUT_MS = 20 * 60 * 1000
+const UPDATE_WAIT_POLL_MS = 1000
+// How long the desktop lingers on the "updating, don't reopen" overlay after
+// spawning the detached updater, before it quits to release the venv shim. The
+// old 600ms was long enough to register the child process but far too short for
+// the user to READ the overlay — the window just vanished, looked like a crash,
+// and the user relaunched mid-update (the #50238 restart-loop trigger). A
+// couple of seconds lets the message land and bridges the gap until the
+// updater's own progress window appears. (#50419)
+const UPDATE_HANDOFF_DWELL_MS = 2500
+
+// Block until no live update is in progress (or we hit the wait timeout).
+// Emits a boot-progress phase so the renderer shows "Update in progress…"
+// rather than a frozen splash. Returns true if it parked at all.
+async function waitForUpdateToFinish() {
+  let marker = readLiveUpdateMarker(HERMES_HOME)
+  if (!marker) return false
+
+  rememberLog(`[updates] update in progress (pid=${marker.pid}); deferring backend start until it finishes`)
+  const deadline = Date.now() + UPDATE_WAIT_TIMEOUT_MS
+  while (marker && Date.now() < deadline) {
+    await advanceBootProgress(
+      'backend.update-wait',
+      'An update is finishing — Hermes will start automatically when it completes…',
+      12
+    )
+    await new Promise(r => setTimeout(r, UPDATE_WAIT_POLL_MS))
+    marker = readLiveUpdateMarker(HERMES_HOME)
+  }
+  if (marker) {
+    rememberLog('[updates] update still in progress after wait timeout; starting backend anyway')
+  } else {
+    rememberLog('[updates] update finished; proceeding with backend start')
+  }
+  return true
+}
+
 function unpackedPathFor(filePath) {
   return filePath.replace(/app\.asar(?=$|[\\/])/, 'app.asar.unpacked')
 }
@@ -1821,7 +1875,11 @@ async function applyUpdates(opts = {}) {
       return { ok: true, manual: true, command, hermesRoot: updateRoot }
     }
 
-    emitUpdateProgress({ stage: 'restart', message: 'Handing off to the Hermes updater…', percent: 100 })
+    emitUpdateProgress({
+      stage: 'restart',
+      message: 'Updating Hermes — this window will close and the updater will open. Don’t reopen Hermes yourself; it restarts automatically when the update finishes.',
+      percent: 100
+    })
     repairMacUpdaterHelper(updater)
 
     const updateRoot = resolveUpdateRoot()
@@ -1857,11 +1915,14 @@ async function applyUpdates(opts = {}) {
 
     rememberLog(`[updates] launched updater: ${updater} ${updaterArgs.join(' ')}; exiting desktop to release venv shim`)
 
-    // Give the OS a beat to register the new process, then quit. The updater
-    // rebuilds and relaunches us when it's done.
+    // Linger on the "updating — don't reopen" overlay long enough for the user
+    // to actually read it (and to bridge the gap until the updater's own window
+    // appears), THEN quit to release the venv shim. The updater rebuilds and
+    // relaunches us when it's done. (#50419 — a 600ms quit looked like a crash
+    // and lured users into the #50238 relaunch loop.)
     setTimeout(() => {
       app.quit()
-    }, 600)
+    }, UPDATE_HANDOFF_DWELL_MS)
 
     return { ok: true, handedOff: true, updater }
   } finally {
@@ -1900,9 +1961,12 @@ async function handOffWindowsBootstrapRecovery(reason) {
   child.unref()
 
   rememberLog(`[bootstrap] handed off ${reason} recovery to updater: ${updater} ${updaterArgs.join(' ')}; exiting desktop to release app.asar`)
+  // Same dwell as the in-app update hand-off (#50419): give the updater's
+  // window time to appear before we vanish, so the recovery doesn't look like
+  // a crash and provoke a mid-recovery relaunch.
   setTimeout(() => {
     app.quit()
-  }, 600)
+  }, UPDATE_HANDOFF_DWELL_MS)
 
   return true
 }
@@ -4909,6 +4973,14 @@ async function startHermes() {
         ...getWindowState()
       }
     }
+
+    // Mutual exclusion with an in-app update (#50238). If this instance was
+    // relaunched while the Tauri updater is still applying an update, spawning
+    // a local backend now re-locks the venv shim and gets killed by the
+    // updater's straggler cleanup — looping. Park until the update finishes (or
+    // is detected stale), THEN start the backend. Local backends only; remote
+    // connections returned above and never touch the install tree.
+    await waitForUpdateToFinish()
 
     const token = crypto.randomBytes(32).toString('base64url')
     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
