@@ -513,39 +513,50 @@ class ToolRegistry:
         return {entry.name: entry.toolset for entry in self._snapshot_entries()}
 
     def is_toolset_available(self, toolset: str) -> bool:
-        """Check if a toolset's requirements are met.
+        """Check if at least one tool in a toolset is available.
 
-        Returns False (rather than crashing) when the check function raises
-        an unexpected exception (e.g. network error, missing import, bad config).
+        Toolsets can contain tools with different availability requirements
+        (for example the normal terminal tool plus desktop-only terminal-pane
+        helpers). Treat the toolset as usable when any registered tool in that
+        toolset can be exposed, matching get_definitions()' per-tool check_fn
+        behavior.
         """
-        with self._lock:
-            check = self._toolset_checks.get(toolset)
-        return self._evaluate_toolset_check(toolset, check)
+        entries, toolset_checks = self._snapshot_state()
+        matching_entries = [entry for entry in entries if entry.toolset == toolset]
+        if matching_entries:
+            return any(self._entry_available(entry) for entry in matching_entries)
+        return self._evaluate_toolset_check(toolset, toolset_checks.get(toolset))
+
+    def _entry_available(self, entry: ToolEntry) -> bool:
+        """Return whether a single tool entry passes its own availability check."""
+        if entry.check_fn is None:
+            return True
+        return self._evaluate_toolset_check(entry.toolset, entry.check_fn)
 
     def check_toolset_requirements(self) -> Dict[str, bool]:
-        """Return ``{toolset: available_bool}`` for every toolset."""
-        entries, toolset_checks = self._snapshot_state()
+        """Return {toolset: available_bool} for every registered toolset."""
+        entries, _toolset_checks = self._snapshot_state()
         toolsets = sorted({entry.toolset for entry in entries})
         return {
-            toolset: self._evaluate_toolset_check(toolset, toolset_checks.get(toolset))
+            toolset: any(self._entry_available(entry) for entry in entries if entry.toolset == toolset)
             for toolset in toolsets
         }
 
     def get_available_toolsets(self) -> Dict[str, dict]:
         """Return toolset metadata for UI display."""
         toolsets: Dict[str, dict] = {}
-        entries, toolset_checks = self._snapshot_state()
+        entries, _toolset_checks = self._snapshot_state()
         for entry in entries:
             ts = entry.toolset
             if ts not in toolsets:
                 toolsets[ts] = {
-                    "available": self._evaluate_toolset_check(
-                        ts, toolset_checks.get(ts)
-                    ),
+                    "available": False,
                     "tools": [],
                     "description": "",
                     "requirements": [],
                 }
+            if self._entry_available(entry):
+                toolsets[ts]["available"] = True
             toolsets[ts]["tools"].append(entry.name)
             if entry.requires_env:
                 for env in entry.requires_env:
@@ -579,19 +590,25 @@ class ToolRegistry:
         available = []
         unavailable = []
         seen = set()
-        entries, toolset_checks = self._snapshot_state()
+        entries, _toolset_checks = self._snapshot_state()
         for entry in entries:
             ts = entry.toolset
             if ts in seen:
                 continue
             seen.add(ts)
-            if self._evaluate_toolset_check(ts, toolset_checks.get(ts)):
+            toolset_entries = [e for e in entries if e.toolset == ts]
+            if any(self._entry_available(e) for e in toolset_entries):
                 available.append(ts)
             else:
+                env_vars = []
+                for e in toolset_entries:
+                    for env in e.requires_env:
+                        if env not in env_vars:
+                            env_vars.append(env)
                 unavailable.append({
                     "name": ts,
-                    "env_vars": entry.requires_env,
-                    "tools": [e.name for e in entries if e.toolset == ts],
+                    "env_vars": env_vars,
+                    "tools": [e.name for e in toolset_entries],
                 })
         return available, unavailable
 

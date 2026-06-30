@@ -287,6 +287,30 @@ class TestCheckFnExceptionHandling:
         assert "works" in available
         assert any(u["name"] == "crashes" for u in unavailable)
 
+    def test_toolset_availability_uses_any_available_tool_not_first_registered_check(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="desktop_only_helper",
+            toolset="terminal",
+            schema=_make_schema("desktop_only_helper"),
+            handler=_dummy_handler,
+            check_fn=lambda: False,
+        )
+        reg.register(
+            name="shell",
+            toolset="terminal",
+            schema=_make_schema("shell"),
+            handler=_dummy_handler,
+            check_fn=lambda: True,
+        )
+
+        available, unavailable = reg.check_tool_availability()
+
+        assert "terminal" in available
+        assert not any(u["name"] == "terminal" for u in unavailable)
+        assert reg.is_toolset_available("terminal") is True
+        assert reg.get_available_toolsets()["terminal"]["available"] is True
+
 
 class TestBuiltinDiscovery:
     def test_discovers_all_real_self_registering_builtin_tool_modules(self):
