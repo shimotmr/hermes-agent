@@ -209,6 +209,12 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: Dict[str, ToolEntry] = {}
+        # Durable map: plugin module namespace (handler.__globals__["__name__"])
+        # -> operator opt-in for built-in override. Populated at plugin load and
+        # never cleared, so a plugin's override authorization is bound to the
+        # code that defined the handler, independent of WHEN the register() call
+        # happens (sync during load, or a delayed/threaded callback afterwards).
+        self._plugin_override_policy: Dict[str, bool] = {}
         self._toolset_checks: Dict[str, Callable] = {}
         self._toolset_aliases: Dict[str, str] = {}
         # MCP dynamic refresh can mutate the registry while other threads are
@@ -231,19 +237,29 @@ class ToolRegistry:
         """Return a stable snapshot of registered tool entries."""
         return self._snapshot_state()[0]
 
-    def _snapshot_toolset_checks(self) -> Dict[str, Callable]:
-        """Return a stable snapshot of toolset availability checks."""
-        return self._snapshot_state()[1]
+    def _toolset_has_exposable_tools(
+        self,
+        toolset: str,
+        entries: List[ToolEntry],
+    ) -> bool:
+        """Return True when at least one tool in *toolset* would be exposed.
 
-    def _evaluate_toolset_check(self, toolset: str, check: Callable | None) -> bool:
-        """Run a toolset check, treating missing or failing checks as unavailable/available."""
-        if not check:
-            return True
-        try:
-            return bool(check())
-        except Exception:
-            logger.debug("Toolset %s check raised; marking unavailable", toolset)
-            return False
+        Mirrors :meth:`get_tool_definitions` per-tool filtering so doctor,
+        banners, and other toolset-level surfaces agree with runtime exposure.
+        Mixed toolsets (e.g. ``terminal`` plus desktop-only ``read_terminal``)
+        must not be gated solely by the first registered ``check_fn``.
+        """
+        check_results: Dict[Callable, bool] = {}
+        for entry in entries:
+            if entry.toolset != toolset:
+                continue
+            if not entry.check_fn:
+                return True
+            if entry.check_fn not in check_results:
+                check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
+            if check_results[entry.check_fn]:
+                return True
+        return False
 
     def get_entry(self, name: str) -> Optional[ToolEntry]:
         """Return a registered tool entry by name, or None."""
@@ -287,6 +303,39 @@ class ToolRegistry:
     # Registration
     # ------------------------------------------------------------------
 
+    def register_plugin_override_policy(self, module_namespace: str, allowed: bool) -> None:
+        """Bind a plugin module namespace to its operator opt-in for built-in
+        override. Called once per plugin at load time. Durable: never cleared,
+        so later (even threaded/delayed) register() calls from that module are
+        still gated by the same policy.
+        """
+        with self._lock:
+            self._plugin_override_policy[module_namespace] = bool(allowed)
+
+    def _plugin_owner_of(self, handler: Callable) -> Optional[str]:
+        """Return the plugin module namespace that defined *handler*, or None
+        if it was not defined in a loaded plugin module.
+
+        Authorization is bound to where the handler was DEFINED
+        (``handler.__globals__["__name__"]``), which is fixed at definition
+        time and cannot drift with the call site, thread, or timing. Lambdas
+        and nested functions inherit the defining module's globals, so a
+        plugin cannot launder an override through a callback. Built-in/MCP
+        handlers live outside the plugin namespace and return None (unchanged
+        behavior).
+        """
+        try:
+            mod = handler.__globals__.get("__name__", "")  # type: ignore[attr-defined]
+        except AttributeError:
+            return None
+        if mod in self._plugin_override_policy:
+            return mod
+        # Also gate plugin modules currently loading but not yet policy-recorded
+        # (defensive: a handler defined in the plugin namespace is plugin code).
+        if isinstance(mod, str) and mod.startswith("hermes_plugins."):
+            return mod
+        return None
+
     def register(
         self,
         name: str,
@@ -325,7 +374,22 @@ class ToolRegistry:
                         name, toolset, existing.toolset,
                     )
                 elif override:
-                    # Explicit plugin opt-in: replace the existing tool.
+                    _owner = self._plugin_owner_of(handler)
+                    if _owner is not None and not self._plugin_override_policy.get(_owner, False):
+                        logger.error(
+                            "Tool registration REJECTED: plugin %r attempted to "
+                            "override built-in tool %r (existing toolset %r) without "
+                            "operator opt-in. Set "
+                            "plugins.entries.<plugin_id>.allow_tool_override: true "
+                            "in config.yaml to allow it.",
+                            _owner, name, existing.toolset,
+                        )
+                        raise PermissionError(
+                            f"Plugin module {_owner!r} cannot override built-in "
+                            f"tool {name!r} without operator opt-in "
+                            f"(allow_tool_override)."
+                        )
+                    # Explicit opt-in (or non-plugin caller): replace the tool.
                     # Logged at INFO so the override is auditable in agent.log.
                     logger.info(
                         "Tool '%s': toolset '%s' overriding existing toolset '%s' "
@@ -356,6 +420,12 @@ class ToolRegistry:
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
             )
+            # Availability is now derived per-tool (_toolset_has_exposable_tools),
+            # so this map no longer gates a toolset. It is still consumed by
+            # get_toolset_requirements -> TOOLSET_REQUIREMENTS["check_fn"], which
+            # banner.py reads (presence only, never called) to classify an
+            # already-unavailable toolset as lazy-init vs disabled. Keep the
+            # write path for that classification.
             if check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
@@ -513,50 +583,40 @@ class ToolRegistry:
         return {entry.name: entry.toolset for entry in self._snapshot_entries()}
 
     def is_toolset_available(self, toolset: str) -> bool:
-        """Check if at least one tool in a toolset is available.
+        """Check if a toolset has at least one exposable tool.
 
         Toolsets can contain tools with different availability requirements
         (for example the normal terminal tool plus desktop-only terminal-pane
         helpers). Treat the toolset as usable when any registered tool in that
         toolset can be exposed, matching get_definitions()' per-tool check_fn
-        behavior.
+        behavior. Per-tool check exceptions are caught by _check_fn_cached and
+        are treated as unavailable rather than crashing the caller.
         """
-        entries, toolset_checks = self._snapshot_state()
-        matching_entries = [entry for entry in entries if entry.toolset == toolset]
-        if matching_entries:
-            return any(self._entry_available(entry) for entry in matching_entries)
-        return self._evaluate_toolset_check(toolset, toolset_checks.get(toolset))
-
-    def _entry_available(self, entry: ToolEntry) -> bool:
-        """Return whether a single tool entry passes its own availability check."""
-        if entry.check_fn is None:
-            return True
-        return self._evaluate_toolset_check(entry.toolset, entry.check_fn)
+        entries, _ = self._snapshot_state()
+        return self._toolset_has_exposable_tools(toolset, entries)
 
     def check_toolset_requirements(self) -> Dict[str, bool]:
-        """Return {toolset: available_bool} for every registered toolset."""
-        entries, _toolset_checks = self._snapshot_state()
+        """Return ``{toolset: available_bool}`` for every toolset."""
+        entries, _ = self._snapshot_state()
         toolsets = sorted({entry.toolset for entry in entries})
         return {
-            toolset: any(self._entry_available(entry) for entry in entries if entry.toolset == toolset)
+            toolset: self._toolset_has_exposable_tools(toolset, entries)
             for toolset in toolsets
         }
 
     def get_available_toolsets(self) -> Dict[str, dict]:
         """Return toolset metadata for UI display."""
         toolsets: Dict[str, dict] = {}
-        entries, _toolset_checks = self._snapshot_state()
+        entries, _ = self._snapshot_state()
         for entry in entries:
             ts = entry.toolset
             if ts not in toolsets:
                 toolsets[ts] = {
-                    "available": False,
+                    "available": self._toolset_has_exposable_tools(ts, entries),
                     "tools": [],
                     "description": "",
                     "requirements": [],
                 }
-            if self._entry_available(entry):
-                toolsets[ts]["available"] = True
             toolsets[ts]["tools"].append(entry.name)
             if entry.requires_env:
                 for env in entry.requires_env:
@@ -589,26 +649,21 @@ class ToolRegistry:
         """Return (available_toolsets, unavailable_info) like the old function."""
         available = []
         unavailable = []
-        seen = set()
-        entries, _toolset_checks = self._snapshot_state()
-        for entry in entries:
-            ts = entry.toolset
-            if ts in seen:
-                continue
-            seen.add(ts)
-            toolset_entries = [e for e in entries if e.toolset == ts]
-            if any(self._entry_available(e) for e in toolset_entries):
+        entries, _ = self._snapshot_state()
+        for ts in sorted({entry.toolset for entry in entries}):
+            toolset_entries = [entry for entry in entries if entry.toolset == ts]
+            if self._toolset_has_exposable_tools(ts, entries):
                 available.append(ts)
             else:
                 env_vars = []
-                for e in toolset_entries:
-                    for env in e.requires_env:
+                for entry in toolset_entries:
+                    for env in entry.requires_env:
                         if env not in env_vars:
                             env_vars.append(env)
                 unavailable.append({
                     "name": ts,
                     "env_vars": env_vars,
-                    "tools": [e.name for e in toolset_entries],
+                    "tools": [entry.name for entry in toolset_entries],
                 })
         return available, unavailable
 
