@@ -99,6 +99,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "provider.anthropic": ("anthropic==0.87.0",),  # CVE-2026-34450, CVE-2026-34452
     # AWS Bedrock provider
     "provider.bedrock": ("boto3==1.42.89",),
+    # Google Vertex AI provider — OAuth2 token minting for the Gemini
+    # OpenAI-compatible endpoint. Only loaded when provider=vertex is selected;
+    # google-auth is NOT in [all] so plain installs don't carry it.
+    "provider.vertex": ("google-auth==2.55.1",),
     # Microsoft Foundry — Entra ID auth (managed identity, workload identity,
     # service principal, az login, VS Code, azd, PowerShell). Only loaded
     # when model.auth_mode=entra_id is selected; key-based azure-foundry
@@ -154,21 +158,33 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # back to google's `Brotli` package (1-arg API), and any .txt/.md/.doc
     # uploaded to the Discord gateway fails to decode at att.read() with
     # "Can not decode content-encoding: br" — see #12511 / #15744.
-    "platform.discord": ("discord.py[voice]==2.7.1", "brotlicffi==1.2.0.1"),
+    "platform.discord": (
+        "discord.py[voice]==2.7.1",
+        "brotlicffi==1.2.0.1",
+        # discord.py pulls aiohttp transitively (>=3.7.4,<4) as its HTTP
+        # backbone. Pin the patched floor here too so the lazy Discord path
+        # can't keep an already-installed vulnerable aiohttp satisfying that
+        # range — mirrors the messaging extra and platform.slack.
+        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
+    ),
     "platform.slack": (
         "slack-bolt==1.27.0",
         "slack-sdk==3.40.1",
-        "aiohttp==3.13.4",  # CVE-2026-34513/34518/34519/34520/34525
+        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
     ),
     "platform.matrix": (
         "mautrix[encryption]==0.21.0",
         "aiosqlite==0.22.1",
         "asyncpg==0.31.0",
         "aiohttp-socks==0.11.0",
+        # mautrix (aiohttp>=3,<4) and aiohttp-socks (aiohttp>=3.10.0) only cap
+        # aiohttp transitively, so a vulnerable already-installed aiohttp still
+        # satisfies both — pin the patched floor here too, like platform.discord.
+        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
     ),
     "platform.dingtalk": (
         "dingtalk-stream==0.24.3",
-        "alibabacloud-dingtalk==2.2.42",
+        "alibabacloud-dingtalk==2.2.50",
         "qrcode==7.4.2",
     ),
     "platform.feishu": (
@@ -183,7 +199,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # (microsoft-teams-api/cards/common, dependency-injector, msal). Lazy-
     # installed on demand like every other messaging platform; also exposed
     # as the `teams` extra in pyproject for packagers / explicit installs.
-    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.13.4"),
+    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.1"),  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525
 
     # ─── Terminal backends ─────────────────────────────────────────────────
     "terminal.modal": ("modal==1.3.4",),
@@ -204,8 +220,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "tool.dashboard": (
         "fastapi==0.133.1",
         "uvicorn[standard]==0.41.0",
-        "starlette==1.0.1",  # CVE-2026-48710 (BadHost) — keep lazy-install in sync with pyproject [web]
-        "python-multipart==0.0.27",  # FastAPI UploadFile/Form for streaming uploads (NS-501)
+        "starlette==1.3.1",  # CVE-2026-48710/48818/54283 (BadHost) — keep lazy-install in sync with pyproject [web]
+        "python-multipart==0.0.32",  # FastAPI UploadFile/Form for streaming uploads (NS-501)
     ),
     # Vision image-resize recovery (Pillow). Pillow is now a CORE dependency
     # (pyproject `dependencies`), so this entry is a belt-and-suspenders fallback
@@ -220,7 +236,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # installs so computer_use never dead-ends on `No module named 'mcp'`.
     "tool.computer_use": (
         "mcp==1.26.0",
-        "starlette==1.0.1",  # CVE-2026-48710 — keep in sync with pyproject [computer-use]
+        "starlette==1.3.1",  # CVE-2026-48710/48818/54283 — keep in sync with pyproject [computer-use]
     ),
 }
 
