@@ -280,6 +280,38 @@ _MCP_MESSAGE_HANDLER_SUPPORTED = _check_message_handler_support()
 if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
     logger.debug("MCP SDK does not support message_handler -- dynamic tool discovery disabled")
 
+
+def _check_logging_callback_support() -> bool:
+    """Check if ClientSession accepts the ``logging_callback`` kwarg.
+
+    Mirrors ``_check_message_handler_support`` for backward compatibility
+    with older MCP SDK versions.  Without a logging_callback, the SDK's
+    default handler silently discards every ``notifications/message`` a
+    server emits, so server-side diagnostics never reach Hermes' logs.
+    """
+    if not _MCP_AVAILABLE:
+        return False
+    try:
+        return "logging_callback" in inspect.signature(ClientSession).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+_MCP_LOGGING_CALLBACK_SUPPORTED = _check_logging_callback_support()
+
+# MCP logging levels (RFC 5424 syslog severities) -> Python logging levels.
+# Port of anomalyco/opencode#34529's serverLog mapping.
+_MCP_LOG_LEVEL_MAP = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "notice": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+    "critical": logging.ERROR,
+    "alert": logging.ERROR,
+    "emergency": logging.ERROR,
+}
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -1539,6 +1571,40 @@ class MCPServerTask:
         task.add_done_callback(self._pending_refresh_tasks.discard)
         return task
 
+    def _make_logging_callback(self):
+        """Build a ``logging_callback`` for ``ClientSession``.
+
+        Routes MCP ``notifications/message`` log notifications from the
+        server into Hermes' logging (agent.log via hermes_logging), tagged
+        with the server name.  Without this, the SDK's default callback
+        silently discards them, so server-side warnings/errors during a
+        tool call were invisible.  Port of anomalyco/opencode#34529.
+        """
+        async def _on_log(params):
+            try:
+                level = _MCP_LOG_LEVEL_MAP.get(
+                    str(getattr(params, "level", "info")).lower(), logging.INFO,
+                )
+                data = getattr(params, "data", None)
+                if not isinstance(data, str):
+                    try:
+                        data = json.dumps(data, ensure_ascii=False, default=str)
+                    except (TypeError, ValueError):
+                        data = str(data)
+                # Cap pathological payloads so a chatty/broken server can't
+                # flood agent.log with megabyte lines.
+                if len(data) > 2000:
+                    data = data[:2000] + "... [truncated]"
+                logger_name = getattr(params, "logger", None)
+                origin = f"{self.name}/{logger_name}" if logger_name else self.name
+                logger.log(level, "MCP server log [%s]: %s", origin, data)
+            except Exception:
+                logger.debug(
+                    "Failed to handle MCP log notification from '%s'",
+                    self.name, exc_info=True,
+                )
+        return _on_log
+
     def _make_message_handler(self):
         """Build a ``message_handler`` callback for ``ClientSession``.
 
@@ -1615,8 +1681,7 @@ class MCPServerTask:
             # notifications. Tools absent from the fresh list are no longer
             # callable, so remove only those stale registry entries first.
             stale_tool_names = old_tool_names - {
-                f"mcp_{sanitize_mcp_name_component(self.name)}_"
-                f"{sanitize_mcp_name_component(tool.name)}"
+                mcp_prefixed_tool_name(self.name, tool.name)
                 for tool in new_mcp_tools
             }
             for tool_name in stale_tool_names:
@@ -1864,6 +1929,8 @@ class MCPServerTask:
             sampling_kwargs.update(self._elicitation.session_kwargs())
         if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
             sampling_kwargs["message_handler"] = self._make_message_handler()
+        if _MCP_LOGGING_CALLBACK_SUPPORTED:
+            sampling_kwargs["logging_callback"] = self._make_logging_callback()
 
         # Snapshot child PIDs before spawning so we can track the new one.
         pids_before = _snapshot_child_pids()
@@ -2079,6 +2146,8 @@ class MCPServerTask:
             sampling_kwargs.update(self._elicitation.session_kwargs())
         if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
             sampling_kwargs["message_handler"] = self._make_message_handler()
+        if _MCP_LOGGING_CALLBACK_SUPPORTED:
+            sampling_kwargs["logging_callback"] = self._make_logging_callback()
 
         # SSE transport (for MCP servers that implement the SSE transport protocol
         # rather than Streamable HTTP). Configure with ``transport: sse`` in the
@@ -3925,6 +3994,27 @@ def sanitize_mcp_name_component(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", str(value or ""))
 
 
+# Native MCP tool-name prefix. Hermes uses the ``mcp__<server>__<tool>``
+# convention shared by Claude Code, Codex, and OpenCode (anomalyco/opencode
+# #33533). The double-underscore delimiter disambiguates the server/tool
+# boundary even when either component contains underscores, and matches the
+# naming models are trained on. It also aligns native registration with the
+# Anthropic-OAuth wire form (``_MCP_TOOL_PREFIX`` in anthropic_adapter.py),
+# removing the single->double rewrite that path previously had to perform.
+MCP_TOOL_NAME_PREFIX = "mcp__"
+_MCP_NAME_DELIM = "__"
+
+
+def mcp_prefixed_tool_name(server_name: str, tool_name: str) -> str:
+    """Build the registry/wire name for an MCP tool.
+
+    Produces ``mcp__<sanitizedServer>__<sanitizedTool>``.
+    """
+    safe_server = sanitize_mcp_name_component(server_name)
+    safe_tool = sanitize_mcp_name_component(tool_name)
+    return f"{MCP_TOOL_NAME_PREFIX}{safe_server}{_MCP_NAME_DELIM}{safe_tool}"
+
+
 def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     """Convert an MCP tool listing to the Hermes registry schema format.
 
@@ -3936,9 +4026,7 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     Returns:
         A dict suitable for ``registry.register(schema=...)``.
     """
-    safe_tool_name = sanitize_mcp_name_component(mcp_tool.name)
-    safe_server_name = sanitize_mcp_name_component(server_name)
-    prefixed_name = f"mcp_{safe_server_name}_{safe_tool_name}"
+    prefixed_name = mcp_prefixed_tool_name(server_name, mcp_tool.name)
     return {
         "name": prefixed_name,
         "description": mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}",
@@ -3952,11 +4040,10 @@ def _build_utility_schemas(server_name: str) -> List[dict]:
     Returns a list of (schema, handler_factory_name) tuples encoded as dicts
     with keys: schema, handler_key.
     """
-    safe_name = sanitize_mcp_name_component(server_name)
     return [
         {
             "schema": {
-                "name": f"mcp_{safe_name}_list_resources",
+                "name": mcp_prefixed_tool_name(server_name, "list_resources"),
                 "description": f"List available resources from MCP server '{server_name}'",
                 "parameters": {
                     "type": "object",
@@ -3967,7 +4054,7 @@ def _build_utility_schemas(server_name: str) -> List[dict]:
         },
         {
             "schema": {
-                "name": f"mcp_{safe_name}_read_resource",
+                "name": mcp_prefixed_tool_name(server_name, "read_resource"),
                 "description": f"Read a resource by URI from MCP server '{server_name}'",
                 "parameters": {
                     "type": "object",
@@ -3984,7 +4071,7 @@ def _build_utility_schemas(server_name: str) -> List[dict]:
         },
         {
             "schema": {
-                "name": f"mcp_{safe_name}_list_prompts",
+                "name": mcp_prefixed_tool_name(server_name, "list_prompts"),
                 "description": f"List available prompts from MCP server '{server_name}'",
                 "parameters": {
                     "type": "object",
@@ -3995,7 +4082,7 @@ def _build_utility_schemas(server_name: str) -> List[dict]:
         },
         {
             "schema": {
-                "name": f"mcp_{safe_name}_get_prompt",
+                "name": mcp_prefixed_tool_name(server_name, "get_prompt"),
                 "description": f"Get a prompt by name from MCP server '{server_name}'",
                 "parameters": {
                     "type": "object",
@@ -4455,15 +4542,15 @@ def discover_mcp_tools() -> List[str]:
 def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
     """Check if an MCP tool belongs to a server that supports parallel tool calls.
 
-    MCP tool names follow the pattern ``mcp_{server}_{tool}``, but that string
-    shape is ambiguous when server names contain underscores. Use the exact
-    server provenance captured at registration time rather than prefix
+    MCP tool names follow the pattern ``mcp__{server}__{tool}``, but that
+    string shape is ambiguous when server names contain underscores. Use the
+    exact server provenance captured at registration time rather than prefix
     matching, then check whether that server's config includes
     ``supports_parallel_tool_calls: true``.
 
     Returns False for non-MCP tools or tools from servers without the flag.
     """
-    if not tool_name.startswith("mcp_"):
+    if not tool_name.startswith(MCP_TOOL_NAME_PREFIX):
         return False
     with _lock:
         server_name = _mcp_tool_server_names.get(tool_name)
