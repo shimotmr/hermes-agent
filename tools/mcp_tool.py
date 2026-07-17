@@ -3203,6 +3203,15 @@ def _signal_reconnect(server: Any) -> bool:
     return True
 
 
+def reconnect_mcp_server(server_name: str) -> bool:
+    """Ask a currently-live MCP server to rebuild after external re-auth."""
+    with _lock:
+        server = _servers.get(server_name)
+    if server is None:
+        return False
+    return _signal_reconnect(server)
+
+
 def _wait_for_server_session_ready(
     srv: "MCPServerTask",
     *,
@@ -3775,6 +3784,27 @@ def _wrap_with_home_override(coro: "Coroutine") -> "Coroutine":
     return _scoped()
 
 
+def _wrap_with_dashboard_oauth_flow(coro):
+    """Propagate a dashboard OAuth flow onto the dedicated MCP loop task."""
+    try:
+        from tools.mcp_dashboard_oauth import (
+            dashboard_oauth_flow,
+            get_dashboard_oauth_flow,
+        )
+
+        flow = get_dashboard_oauth_flow()
+    except Exception:
+        return coro
+    if flow is None:
+        return coro
+
+    async def _scoped():
+        with dashboard_oauth_flow(flow):
+            return await coro
+
+    return _scoped()
+
+
 def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     """Schedule a coroutine on the MCP event loop and block until done.
 
@@ -3809,6 +3839,7 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     # task's own context (task-local — concurrent calls carrying different
     # scopes don't interfere). No-op when no override is active.
     coro = _wrap_with_home_override(coro)
+    coro = _wrap_with_dashboard_oauth_flow(coro)
 
     future = safe_schedule_threadsafe(
         coro, loop,
