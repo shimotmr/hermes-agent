@@ -37,6 +37,17 @@ export interface StateSetter<T> {
 
 export type StatusBarMode = 'bottom' | 'off' | 'top'
 
+export type BatteryCategory = 'bad' | 'critical' | 'dim' | 'good' | 'warn'
+
+// A single battery reading pushed from the Python gateway (`system.battery`).
+// `available` is false on machines without a battery; `percent` is 0-100.
+export interface BatteryInfo {
+  available: boolean
+  category: BatteryCategory
+  percent: null | number
+  plugged: null | boolean
+}
+
 export type BusyInputMode = 'interrupt' | 'queue' | 'steer'
 
 export type NoticeLevel = 'error' | 'info' | 'success' | 'warn'
@@ -272,6 +283,8 @@ export interface OverlayState {
   billing: BillingOverlayState | null
   clarify: ClarifyReq | null
   confirm: ConfirmReq | null
+  dialog: DialogState | null
+  gridTest: GridTestState | null
   journey: boolean
   modelPicker: boolean | { refresh?: boolean }
   pager: null | PagerState
@@ -284,10 +297,39 @@ export interface OverlayState {
   sudo: null | SudoReq
 }
 
+export interface DialogState {
+  body: string
+  hint?: string
+  title?: string
+  zone?: 'bottom' | 'bottom-left' | 'bottom-right' | 'center' | 'left' | 'right' | 'top' | 'top-left' | 'top-right'
+}
+
 export interface PagerState {
   lines: string[]
   offset: number
   title?: string
+}
+
+/** Number of live panels in the /grid-test streams demo (focus wraps mod this). */
+export const GRID_STREAM_COUNT = 6
+
+export interface GridTestState {
+  activeCol: number
+  activeRow: number
+  /** Areas mode: fixed-height 2D grid with rowSpan/colSpan demo cells. */
+  areas: boolean
+  cols: number
+  gap: null | number
+  nested: boolean
+  paddingX: null | number
+  rows: number
+  /** Streams mode: live-updating panels tiled by GridAreas. */
+  streams: boolean
+  /** Streams mode: which panel h/l focus is on (0-based, wraps). */
+  streamFocus: number
+  /** Streams mode: which panel owns the promoted 2x2 slot. */
+  streamMain: number
+  zoomed: boolean
 }
 
 export interface TranscriptRow {
@@ -297,6 +339,8 @@ export interface TranscriptRow {
 }
 
 export interface UiState {
+  battery: boolean
+  batteryStatus: BatteryInfo | null
   bgTasks: Set<string>
   busy: boolean
   busyInputMode: BusyInputMode
