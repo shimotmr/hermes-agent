@@ -9,6 +9,7 @@ Usage:
     python -m hermes_cli.main web --port 8080
 """
 
+import contextlib
 from contextlib import asynccontextmanager, contextmanager
 
 import asyncio
@@ -28,6 +29,7 @@ import json
 import logging
 import mimetypes
 import os
+import queue
 import re
 import secrets
 import shlex
@@ -4074,6 +4076,18 @@ async def update_hermes():
             "update_command": recommended_update_command_for_method(install_method),
         }
 
+    if install_method in {"nix", "nixos"}:
+        message = recommended_update_command_for_method(install_method)
+        _record_completed_action("hermes-update", message, exit_code=1)
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": "nix_update_unsupported",
+            "message": message,
+            "update_command": message,
+        }
+
     try:
         proc = _spawn_hermes_action(["update"], "hermes-update")
     except Exception as exc:
@@ -4143,18 +4157,18 @@ async def check_hermes_update(force: bool = False):
     ``POST /api/hermes/update`` actually runs ``hermes update``.
 
     Returns:
-        install_method: 'git' | 'pip' | 'docker' | 'nixos' | 'homebrew' | ...
+        install_method: 'git' | 'docker' | 'nix' | 'nixos' | 'unknown'
         current_version: installed Hermes version string
         behind: commits behind upstream (>=1), 0 if up to date,
-                -1 if behind by an unknown count (nix/pypi), or null if the
+                -1 if behind by an unknown count, or null if the
                 check could not run (offline, no remote, etc.)
         update_available: convenience bool (behind is non-zero and not null)
         can_apply: True when the dashboard's update button can apply it
-                   in place (git/pip); False for docker/nix/homebrew where the
+                   in place (git); False for other install methods where the
                    user must update out-of-band
         update_command: the recommended command for this install method
         message: human-readable guidance for non-applyable methods
-        commits: for git/pip installs that are behind, a list of the commits
+        commits: for git installs that are behind, a list of the commits
                  the local checkout is behind upstream by — each
                  {sha, summary, author, at}. Absent/empty otherwise. The
                  desktop's remote update overlay renders this as "what's
@@ -4182,7 +4196,7 @@ async def check_hermes_update(force: bool = False):
         "current_version": __version__,
         "behind": None,
         "update_available": False,
-        "can_apply": install_method in ("git", "pip"),
+        "can_apply": install_method == "git",
         "update_command": update_command,
         "message": None,
     }
@@ -4191,7 +4205,7 @@ async def check_hermes_update(force: bool = False):
         payload["message"] = format_docker_update_message()
         return payload
 
-    # banner.check_for_updates() handles git / pypi / nix-revision paths and
+    # banner.check_for_updates() handles git / nix-revision paths and
     # caches the result for 6h. ``force`` busts the cache so the "Check now"
     # button reflects reality immediately.
     try:
@@ -4216,9 +4230,9 @@ async def check_hermes_update(force: bool = False):
     else:
         payload["update_available"] = True
         # Enrich with the actual commits we're behind by, so the desktop's
-        # remote update overlay can show "what's changed". git/pip only;
+        # remote update overlay can show "what's changed". git only;
         # best-effort (empty list on any failure).
-        if install_method in ("git", "pip"):
+        if install_method == "git":
             payload["commits"] = await asyncio.to_thread(_recent_upstream_commits)
 
     return payload
@@ -4269,10 +4283,14 @@ async def transcribe_audio_upload(payload: AudioTranscriptionRequest):
             tmp.write(audio_bytes)
             temp_path = tmp.name
 
-        from tools.transcription_tools import transcribe_audio
+        # transcribe_recording (not raw transcribe_audio): filters Whisper
+        # hallucinations and maps provider "empty transcript" errors to a
+        # successful empty result — the live voice loop treats "" as silence
+        # and re-listens instead of surfacing a 400 on every quiet turn.
+        from tools.voice_mode import transcribe_recording
 
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, transcribe_audio, temp_path)
+        result = await loop.run_in_executor(None, transcribe_recording, temp_path)
     except HTTPException:
         raise
     except Exception as exc:
@@ -4462,6 +4480,151 @@ async def speak_text(payload: TTSSpeakRequest):
         "mime_type": mime_type,
         "provider": result.get("provider"),
     }
+
+
+def _split_text_for_speak_stream(text: str, cap: int) -> list:
+    """Split *text* into provider-cap-sized pieces on sentence boundaries."""
+    from tools.tts_streaming import SENTENCE_BOUNDARY_RE as _SENTENCE_BOUNDARY_RE
+
+    cap = cap if cap and cap > 0 else 4000
+    pieces, buf = [], ""
+    for sentence in filter(str.strip, _SENTENCE_BOUNDARY_RE.split(text)):
+        while len(sentence) > cap:
+            pieces.append(sentence[:cap])
+            sentence = sentence[cap:]
+        if buf and len(buf) + len(sentence) + 1 > cap:
+            pieces.append(buf)
+            buf = sentence
+        else:
+            buf = f"{buf} {sentence}" if buf else sentence
+    if buf:
+        pieces.append(buf)
+    return pieces
+
+
+@app.websocket("/api/audio/speak-stream")
+async def speak_stream_ws(ws: "WebSocket") -> None:
+    """Streaming TTS for the desktop: text in, raw int16 PCM frames out.
+
+    The socket is a per-reply speech *session*: the client feeds text
+    incrementally as LLM deltas arrive, the server cuts sentences
+    (``SentenceChunker`` — same cutter as the CLI/TUI speaker pipeline) and
+    streams each one's PCM the moment it's ready. Speech overlaps generation,
+    exactly like the token→sentence→TTS pipelining the realtime-voice
+    literature converges on.
+
+    Protocol:
+      client → ``{"text": "..."}`` frames (incremental; may combine with done),
+               ``{"done": true}`` when the reply is complete,
+               ``{"stop": true}`` or disconnect = barge-in
+      server → ``{"type": "start", "sample_rate": N, "channels": 1}``,
+               binary PCM frames, then ``{"type": "end"}``
+      server → ``{"type": "fallback"}`` when the configured provider has no
+               chunked API — the client uses the POST endpoint instead.
+    """
+    if not _ws_auth_ok(ws):
+        await ws.close(code=4401)
+        return
+    if not _ws_request_is_allowed(ws):
+        await ws.close(code=4403)
+        return
+    await ws.accept()
+
+    loop = asyncio.get_running_loop()
+
+    def _resolve():
+        from tools.tts_streaming import resolve_streaming_provider
+        from tools.tts_tool import _get_provider, _load_tts_config, _resolve_max_text_length
+
+        cfg = _load_tts_config()
+        streamer = resolve_streaming_provider(cfg)
+        cap = _resolve_max_text_length(_get_provider(cfg), cfg) if streamer else 0
+        return streamer, cap
+
+    try:
+        streamer, cap = await loop.run_in_executor(None, _resolve)
+    except Exception:
+        _log.exception("speak-stream provider resolution failed")
+        streamer, cap = None, 0
+    if streamer is None:
+        with contextlib.suppress(Exception):
+            await ws.send_json({"type": "fallback"})
+            await ws.close()
+        return
+
+    await ws.send_json(
+        {"type": "start", "sample_rate": streamer.sample_rate, "channels": streamer.channels}
+    )
+
+    stop = threading.Event()
+    text_q: queue.Queue = queue.Queue()  # str deltas; None = end-of-text
+    chunks: asyncio.Queue = asyncio.Queue()  # PCM out; None = synthesis done
+
+    def _produce():
+        from tools.tts_streaming import SentenceChunker
+        from tools.tts_tool import _strip_markdown_for_tts
+
+        chunker = SentenceChunker()
+
+        def _sentences():
+            while not stop.is_set():
+                delta = text_q.get()
+                if delta is None:
+                    yield from chunker.flush()
+                    return
+                yield from chunker.feed(delta)
+
+        try:
+            for sentence in _sentences():
+                cleaned = _strip_markdown_for_tts(sentence)
+                if not cleaned:
+                    continue
+                for piece in _split_text_for_speak_stream(cleaned, cap):
+                    for chunk in streamer.stream(piece):
+                        if stop.is_set():
+                            return
+                        loop.call_soon_threadsafe(chunks.put_nowait, chunk)
+        except Exception as exc:
+            _log.warning("speak-stream synthesis failed: %s", exc)
+        finally:
+            loop.call_soon_threadsafe(chunks.put_nowait, None)
+
+    threading.Thread(target=_produce, daemon=True).start()
+
+    async def _pump_client():
+        # Text frames feed synthesis; done ends the text; stop/disconnect
+        # (or any unparseable frame) is barge-in.
+        try:
+            while True:
+                frame = json.loads(await ws.receive_text())
+                if frame.get("text"):
+                    text_q.put(str(frame["text"]))
+                if frame.get("stop"):
+                    break
+                if frame.get("done"):
+                    text_q.put(None)
+        except Exception:
+            pass
+        stop.set()
+        text_q.put(None)  # unblock the producer
+
+    pump = asyncio.ensure_future(_pump_client())
+    try:
+        while True:
+            chunk = await chunks.get()
+            if chunk is None:
+                break
+            await ws.send_bytes(chunk)
+        if not stop.is_set():
+            await ws.send_json({"type": "end"})
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        stop.set()
+        text_q.put(None)
+        pump.cancel()
+        with contextlib.suppress(Exception):
+            await ws.close()
 
 
 @app.get("/api/actions/{name}/status")
