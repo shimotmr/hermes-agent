@@ -1414,7 +1414,32 @@ DEFAULT_CONFIG = {
                                       # (e.g. 6) for tool-schema-heavy sessions where 3
                                       # rounds cannot clear the request estimate.
                                       # Validated >= 1, hard-capped at 10.
+        "proactive_prune_tokens": 0,  # opt-in trigger (tokens) for the deterministic,
+                                      # no-LLM tool-result prune, run independently of
+                                      # `threshold` above. On large-window models
+                                      # `threshold` (≈50% of the window) rarely fires,
+                                      # so old tool output otherwise rides in history
+                                      # and is re-sent every turn; a low value like
+                                      # 48000 reclaims it early. 0 = off. Recent tail
+                                      # protected by `protect_last_n`. Built-in
+                                      # compressor only (other engines inherit a no-op).
+                                      # NOTE: each committed prune rewrites already-sent
+                                      # history, breaking the provider prompt-cache
+                                      # prefix — the min_reclaim gate below keeps those
+                                      # breaks episodic rather than per-turn.
+        "proactive_prune_min_result_chars": 8000,  # the prune's summarize pass only
+                                      # touches tool results larger than this (chars);
+                                      # clamped to >= 200 so a generated summary can't
+                                      # itself be re-summarized.
+        "proactive_prune_min_reclaim_tokens": 4096,  # a proactive prune only commits
+                                      # when it reclaims at least this many tokens
+                                      # (measured on the pruned output). Keeps
+                                      # prompt-cache invalidation amortized: one big
+                                      # episodic break instead of a tiny break every
+                                      # tool iteration. 0 = commit any non-zero prune.
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count
+        "hygiene_timeout_seconds": 30,  # max seconds gateway waits for pre-agent hygiene compression
+        "hygiene_failure_cooldown_seconds": 300,  # skip repeated failed hygiene attempts for this session
         "protect_first_n": 3,         # non-system head messages always preserved
                                       # verbatim, in ADDITION to the system prompt
                                       # (which is always implicitly protected). Set to
@@ -1974,9 +1999,9 @@ DEFAULT_CONFIG = {
         # per platform:
         #   - Telegram has native animated draft streaming (sendMessageDraft),
         #     which is smooth, so streaming is on by default there.
-        #   - Discord/Slack/etc. only have edit-based streaming (repeated
+        #   - Discord and Slack only have edit-based streaming (repeated
         #     editMessage), which flickers and is noticeably jankier, so
-        #     streaming is off by default there.
+        #     streaming is off by default for both.
         # These are gap-fillers: a user who explicitly sets, e.g.,
         # display.platforms.discord.streaming: true keeps their value
         # (config deep-merge has user values win over defaults). The global
@@ -1985,6 +2010,7 @@ DEFAULT_CONFIG = {
         "platforms": {
             "telegram": {"streaming": True},
             "discord": {"streaming": False},
+            "slack": {"streaming": False},
         },
         # Gateway runtime-metadata footer appended to the FINAL message of a turn
         # (disabled by default to keep replies minimal). When enabled, renders
@@ -2520,6 +2546,15 @@ DEFAULT_CONFIG = {
         "require_mention": True,       # Require @mention to respond in channels
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
+        # Channel IDs where @mention is ALWAYS required, even when
+        # require_mention is false globally (per-channel force-mention override).
+        "require_mention_channels": "",
+        # Ignore a channel/thread message addressed to another user (first token
+        # @mentions someone other than the bot) unless the bot is also mentioned.
+        # Opt-in; default off keeps existing behaviour. Env: SLACK_IGNORE_OTHER_USER_MENTIONS.
+        "ignore_other_user_mentions": False,
+        # If True, require @mention in Slack thread replies too.
+        "thread_require_mention": False,
         "channel_prompts": {},         # Per-channel ephemeral system prompts
     },
 
@@ -3465,6 +3500,21 @@ DEFAULT_CONFIG = {
         # every invocation (MCP backend, status, doctor, install). Set true
         # to let cua-driver use its own default (telemetry on).
         "cua_telemetry": False,
+        # Cap driver screenshot longest edge (pixels) via set_config on
+        # session start. Shrinks SOM multimodal payloads; 0 disables.
+        "max_image_dimension": 1456,
+        # Mode for capture_after follow-ups: som (screenshot + overlays —
+        # default), ax (elements only, no PNG — faster), vision (pixels only).
+        "capture_after_mode": "som",
+        # Disable the cursor overlay rendered by cua-driver. The overlay
+        # shows where agent actions land but can peg a core when idle
+        # (macOS vImage redraw loop #47032; Linux/WSL2 idle spin #28152).
+        # cua-driver ≥ 0.6.x supports --no-overlay; Hermes also calls
+        # set_agent_cursor_enabled(false) after start_session when this is on.
+        #   None  = auto-detect (off on macOS + headless/WSL2 Linux; on elsewhere)
+        #   True  = always disable the overlay
+        #   False = always enable the overlay
+        "no_overlay": None,
     },
 
     # Hermes Desktop (Electron app) launch options. These only affect
