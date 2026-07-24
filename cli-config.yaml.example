@@ -407,6 +407,18 @@ compression:
   # Enable automatic context compression (default: true)
   # Set to false if you prefer to manage context manually or want errors on overflow
   enabled: true
+
+  # Opt-in compression progress notices on chat platforms (default: false).
+  # By design, routine automatic compression is SILENT on human-facing chat
+  # gateways (Telegram, Discord, Slack, ...) — it happens in the background
+  # with server-side logging only. Set true to also deliver the routine
+  # progress statuses (compacting started, preflight/pre-API compression,
+  # idle compaction, retry progress, and the compaction-complete notice) to
+  # chat platforms. Unrelated operational noise (auxiliary model failures,
+  # provider retry chatter) stays suppressed either way, and compression
+  # FAILURE notices + manual /compress feedback are always visible
+  # regardless of this setting. (#52995)
+  progress_notices: false
   
   # Trigger compression at this % of model's context limit (default: 0.50 = 50%)
   # Lower values = more aggressive compression, higher values = compress later
@@ -447,6 +459,15 @@ compression:
   # Higher values keep more recent conversation intact at the cost of more aggressive
   # compression of older turns.
   protect_last_n: 20
+
+  # Minimum number of REAL (actionable) user messages guaranteed to survive in
+  # the uncompressed tail (default: 1 = the existing single last-user anchor,
+  # behavior-preserving). Raise to e.g. 3 to keep the last 3 real user turns
+  # verbatim even when bulky tool outputs fill the tail token budget — blank
+  # platform echoes, compaction handoffs, and synthetic continuation rows never
+  # count toward N. The tail can exceed the token budget when this pulls the
+  # cut back; the guarantee wins over the budget by design.
+  min_tail_user_messages: 1
 
   # Compression retry rounds before a turn gives up with "max compression
   # attempts reached" (default: 3, same as the previous hardcoded value).

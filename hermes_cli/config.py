@@ -1398,6 +1398,15 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
+        "progress_notices": False,    # opt-in (#52995): when True, routine compression
+                                      # progress statuses (compacting/preflight/pre-API/
+                                      # idle/retry) are delivered to chat gateway
+                                      # platforms instead of being suppressed by the
+                                      # gateway noise filter. Default False keeps
+                                      # routine compression silent-by-design on chat
+                                      # surfaces (server-side logging only). Failure
+                                      # notices and manual /compress feedback are
+                                      # always visible regardless of this setting.
         "threshold": 0.50,            # compress when context usage exceeds this ratio.
                                       # Models with context windows below 512K are
                                       # floored at 0.75 (raise-only) so compaction
@@ -1409,6 +1418,12 @@ DEFAULT_CONFIG = {
                                       # the model's context length at apply-time.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
+        "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to
+                                      # survive in the uncompressed tail. 1 = existing
+                                      # single last-user anchor (default, behavior-
+                                      # preserving); raise to e.g. 3 to keep the last
+                                      # 3 real user turns verbatim when bulky tool
+                                      # outputs fill the tail token budget.
         "max_attempts": 3,            # compression retry rounds before a turn gives up
                                       # with "max compression attempts reached". Raise
                                       # (e.g. 6) for tool-schema-heavy sessions where 3
@@ -2425,6 +2440,16 @@ DEFAULT_CONFIG = {
         # override the output directory.
         "save_traces": False,
         "trace_dir": "",
+        # Privacy redaction filter for advisor (reference) outputs. Advisors
+        # can echo PII from the conversation (emails, formatted phone numbers)
+        # and credential shapes into reference blocks, traces, and the
+        # aggregator prompt. Modes ('' = off, the default):
+        #   "display" — redact user-visible surfaces only (reference blocks
+        #               shown in the UI + saved MoA trace records); the
+        #               aggregator still sees raw advisor text.
+        #   "full"    — additionally redact the advisor text injected into
+        #               the aggregator prompt (issue #59959).
+        "privacy_filter": "",
         "presets": {
             "default": {
                 "reference_models": [
