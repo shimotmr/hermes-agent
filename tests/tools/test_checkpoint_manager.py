@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
 import pytest
@@ -1156,3 +1157,262 @@ class TestClearFunctions:
         result = clear_all()
         assert result["deleted"] is False
         assert result["bytes_freed"] == 0
+
+
+# =========================================================================
+# Orphan pruning must not act on an unreachable volume
+# =========================================================================
+
+class TestOrphanPruneRequiresObservableDeletion:
+    """A missing workdir is ambiguous: deleted, or just not mounted right now.
+
+    Orphan pruning deletes a project's whole checkpoint history and runs
+    unattended at startup (``maybe_auto_prune_checkpoints`` from the CLI and
+    the gateway), so it must only fire when the deletion is something we
+    actually observed — the parent directory present, the project gone. An
+    unplugged drive, a share behind a downed VPN, or a bind-mount absent from
+    this container must not cost the user their restore points.
+    """
+
+    def _project_with_history(self, work_dir, checkpoint_base, monkeypatch):
+        monkeypatch.setattr(
+            "tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base
+        )
+        m = CheckpointManager(enabled=True, max_snapshots=10)
+        m.ensure_checkpoint(str(work_dir), "initial")
+        return m
+
+    def _history_survives(self, checkpoint_base, work_dir):
+        store = _store_path(checkpoint_base)
+        return _project_meta_path(
+            store, _project_hash(str(work_dir))
+        ).exists()
+
+    def test_unreachable_volume_keeps_its_checkpoints(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """The whole mount is absent (parent missing too) → keep the history."""
+        mount = tmp_path / "mnt" / "nas"
+        work_dir = mount / "work" / "proj"
+        work_dir.mkdir(parents=True)
+        (work_dir / "main.py").write_text("print('x')\n")
+        self._project_with_history(work_dir, checkpoint_base, monkeypatch)
+
+        # The volume goes away — project AND its parents disappear together.
+        shutil.rmtree(tmp_path / "mnt")
+        assert not work_dir.exists()
+
+        prune_checkpoints(
+            retention_days=0, delete_orphans=True, checkpoint_base=checkpoint_base,
+        )
+
+        assert self._history_survives(checkpoint_base, work_dir), (
+            "checkpoint history was deleted for a project whose volume was "
+            "merely unmounted"
+        )
+
+    def test_surviving_empty_mountpoint_keeps_its_checkpoints(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """The mount point outlives the volume as an empty dir → keep history.
+
+        The classic static layout (``/mnt/volume/proj``, an fstab entry, a
+        container bind-mount) does not remove the mount point on unmount: the
+        project disappears but ``/mnt/volume`` stays behind as an empty
+        directory. The parent being present is therefore not evidence on its
+        own — an empty parent looks exactly the same whether the volume was
+        detached or the project was deleted.
+        """
+        mount_point = tmp_path / "mnt" / "volume"
+        work_dir = mount_point / "proj"
+        work_dir.mkdir(parents=True)
+        (work_dir / "main.py").write_text("print('x')\n")
+        self._project_with_history(work_dir, checkpoint_base, monkeypatch)
+
+        # Unmount: contents go, the mount point itself remains.
+        shutil.rmtree(work_dir)
+        assert mount_point.is_dir() and not any(mount_point.iterdir())
+
+        prune_checkpoints(
+            retention_days=0, delete_orphans=True, checkpoint_base=checkpoint_base,
+        )
+
+        assert self._history_survives(checkpoint_base, work_dir), (
+            "checkpoint history was deleted for a project whose mount point "
+            "merely survived the unmount as an empty directory"
+        )
+
+    def test_empty_parent_project_is_still_reclaimed_by_retention(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """Skipping an ambiguous parent defers reclamation, it does not lose it.
+
+        A project deleted out of an otherwise-empty parent is indistinguishable
+        from an unmounted volume, so orphan pruning leaves it alone — but the
+        retention rule, which reads ``last_touch`` instead of probing the
+        filesystem, still reclaims it.
+        """
+        parent = tmp_path / "solo"
+        work_dir = parent / "proj"
+        work_dir.mkdir(parents=True)
+        (work_dir / "main.py").write_text("print('x')\n")
+        self._project_with_history(work_dir, checkpoint_base, monkeypatch)
+
+        shutil.rmtree(work_dir)
+        assert parent.is_dir() and not any(parent.iterdir())
+
+        store = _store_path(checkpoint_base)
+        meta_path = _project_meta_path(store, _project_hash(str(work_dir)))
+        meta = json.loads(meta_path.read_text())
+        meta["last_touch"] = time.time() - 60 * 86400
+        meta_path.write_text(json.dumps(meta))
+
+        result = prune_checkpoints(
+            retention_days=30, delete_orphans=True, checkpoint_base=checkpoint_base,
+        )
+
+        assert result["deleted_stale"] >= 1
+        assert not self._history_survives(checkpoint_base, work_dir)
+
+    def test_genuinely_deleted_project_is_still_pruned(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """Control: a populated parent without the project → a real orphan."""
+        parent = tmp_path / "projects"
+        work_dir = parent / "proj"
+        work_dir.mkdir(parents=True)
+        (work_dir / "main.py").write_text("print('x')\n")
+        (parent / "other-project").mkdir()
+        self._project_with_history(work_dir, checkpoint_base, monkeypatch)
+
+        shutil.rmtree(work_dir)
+        assert parent.exists() and not work_dir.exists()
+
+        result = prune_checkpoints(
+            retention_days=0, delete_orphans=True, checkpoint_base=checkpoint_base,
+        )
+
+        assert result["deleted_orphan"] >= 1
+        assert not self._history_survives(checkpoint_base, work_dir)
+
+    def test_live_project_is_never_pruned_as_orphan(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        """Control: a present project keeps its history."""
+        self._project_with_history(work_dir, checkpoint_base, monkeypatch)
+
+        result = prune_checkpoints(
+            retention_days=0, delete_orphans=True, checkpoint_base=checkpoint_base,
+        )
+
+        assert result["deleted_orphan"] == 0
+        assert self._history_survives(checkpoint_base, work_dir)
+
+    def test_populated_underlay_mountpoint_keeps_its_checkpoints(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """A detached volume exposing a populated underlay dir → keep history.
+
+        An entry in the parent does not prove the project volume is attached.
+        Unmounting swaps which directory is visible at the mount point's
+        path: the mounted filesystem's root gives way to the *underlying*
+        directory, whose own files (a ``.keep`` placeholder, sibling mount
+        points) become visible. Those entries were never next to the project,
+        so they must not corroborate an orphan classification — yet a naive
+        "parent has any entry" guard treats them as proof of deletion.
+
+        Simulate the detach faithfully: the directory visible at
+        ``mnt/volume`` after the unmount is a *different* directory (new
+        inode — the underlay) carrying a ``.keep`` placeholder.
+        """
+        mount_point = tmp_path / "mnt" / "volume"
+        work_dir = mount_point / "project"
+        work_dir.mkdir(parents=True)
+        (work_dir / "main.py").write_text("print('x')\n")
+        self._project_with_history(work_dir, checkpoint_base, monkeypatch)
+
+        # Detach: the directory that was mounted at the path (with the
+        # project on it) stops being visible there; the underlay directory —
+        # same path, different directory, its own contents — shows through,
+        # exposing a placeholder. Renaming (rather than deleting) the mounted
+        # directory keeps its inode alive, so the underlay directory is
+        # guaranteed a distinct identity, exactly as in a real unmount.
+        mount_point.rename(tmp_path / "detached-volume")
+        mount_point.mkdir()
+        (mount_point / ".keep").write_text("")
+        assert not work_dir.exists()
+        assert any(mount_point.iterdir())
+
+        result = prune_checkpoints(
+            retention_days=0, delete_orphans=True, checkpoint_base=checkpoint_base,
+        )
+
+        assert result["deleted_orphan"] == 0
+        assert self._history_survives(checkpoint_base, work_dir), (
+            "checkpoint history was deleted because underlay entries exposed "
+            "by an unmount were mistaken for attachment evidence"
+        )
+
+    def test_metadata_without_parent_identity_is_not_orphan_classified(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """Metadata from an older version (no recorded identity) → keep.
+
+        Without a recorded parent ``(st_dev, st_ino)`` we cannot tell the
+        project's real parent from an underlay directory exposed by an
+        unmount, so the classification stays conservative: not an orphan.
+        The retention rule still reclaims genuinely abandoned projects.
+        """
+        parent = tmp_path / "projects"
+        work_dir = parent / "proj"
+        work_dir.mkdir(parents=True)
+        (work_dir / "main.py").write_text("print('x')\n")
+        (parent / "other-project").mkdir()
+        self._project_with_history(work_dir, checkpoint_base, monkeypatch)
+
+        # Strip the recorded identity, as metadata written by an older
+        # version would lack it.
+        store = _store_path(checkpoint_base)
+        meta_path = _project_meta_path(store, _project_hash(str(work_dir)))
+        meta = json.loads(meta_path.read_text())
+        meta.pop("workdir_parent_dev", None)
+        meta.pop("workdir_parent_ino", None)
+        meta_path.write_text(json.dumps(meta))
+
+        shutil.rmtree(work_dir)
+
+        result = prune_checkpoints(
+            retention_days=0, delete_orphans=True, checkpoint_base=checkpoint_base,
+        )
+
+        assert result["deleted_orphan"] == 0
+        assert self._history_survives(checkpoint_base, work_dir)
+
+    def test_recorded_parent_identity_survives_probe_failure_on_touch(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """A later failed evidence probe must not erase recorded identity."""
+        from tools.checkpoint_manager import _register_project
+
+        parent = tmp_path / "projects"
+        work_dir = parent / "proj"
+        work_dir.mkdir(parents=True)
+        (work_dir / "main.py").write_text("print('x')\n")
+        self._project_with_history(work_dir, checkpoint_base, monkeypatch)
+
+        store = _store_path(checkpoint_base)
+        meta_path = _project_meta_path(store, _project_hash(str(work_dir)))
+        before = json.loads(meta_path.read_text())
+        assert "workdir_parent_dev" in before
+        assert "workdir_parent_ino" in before
+
+        # Re-register while the evidence probe fails (e.g. transient I/O
+        # error): the previously recorded identity must be preserved.
+        monkeypatch.setattr(
+            "tools.checkpoint_manager._volume_evidence", lambda _wd: {},
+        )
+        _register_project(store, str(work_dir))
+
+        after = json.loads(meta_path.read_text())
+        assert after["workdir_parent_dev"] == before["workdir_parent_dev"]
+        assert after["workdir_parent_ino"] == before["workdir_parent_ino"]
