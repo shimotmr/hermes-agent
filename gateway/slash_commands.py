@@ -478,8 +478,16 @@ class GatewaySlashCommandsMixin:
                         platform.value if hasattr(platform, "value") else str(platform or "")
                     ).lower()
                     chat_id = str(getattr(source, "chat_id", "") or "")
+                    chat_type = str(getattr(source, "chat_type", "") or "") or None
                     thread_id = str(getattr(source, "thread_id", "") or "")
                     user_id = str(getattr(source, "user_id", "") or "") or None
+                    delivery_metadata = self._thread_metadata_for_source(
+                        source, self._reply_anchor_for_event(event)
+                    ) or None
+                    if isinstance(delivery_metadata, dict):
+                        chat_type = str(getattr(source, "chat_type", "") or "")
+                        if chat_type:
+                            delivery_metadata.setdefault("chat_type", chat_type)
                     if platform_str and chat_id:
                         def _sub():
                             from hermes_cli import kanban_db as _kb
@@ -488,9 +496,11 @@ class GatewaySlashCommandsMixin:
                                 _kb.add_notify_sub(
                                     conn, task_id=task_id,
                                     platform=platform_str, chat_id=chat_id,
+                                    chat_type=chat_type,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
                                     notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
+                                    delivery_metadata=delivery_metadata,
                                 )
                             finally:
                                 conn.close()
