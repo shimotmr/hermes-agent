@@ -257,6 +257,7 @@ export const en: Translations = {
       'view.toggleSidebar': 'Toggle sessions sidebar',
       'view.toggleRightSidebar': 'Toggle file browser',
       'view.toggleReview': 'Toggle review pane',
+      'view.toggleStatusbar': 'Toggle status bar',
       'view.showFiles': 'Show file browser',
       'view.showTerminal': 'Toggle terminal',
       'view.newTerminal': 'New terminal',
@@ -1764,10 +1765,7 @@ export const en: Translations = {
     open: 'Open'
   },
 
-  artifactPane: {
-    tabFallback: 'Artifact',
-    modePreview: 'PREVIEW',
-    modeSource: 'SOURCE',
+  artifactPreview: {
     versionOf: (current, total) => `v${current} of ${total}`,
     olderVersion: 'Older version',
     newerVersion: 'Newer version',
@@ -1804,11 +1802,11 @@ export const en: Translations = {
     allPinned: 'Everything here is pinned. Unpin a chat to show it in recents.',
     shiftClickHint: 'Shift-click a chat to pin',
     noWorkspace: 'No workspace',
-    noProject: 'No project',
     projectEmpty: 'No sessions yet',
     noSessions: 'No sessions yet',
     projects: {
       sectionLabel: 'Projects',
+      home: 'Home',
       newButton: 'New project',
       createTitle: 'New project',
       createDesc: 'Name a workspace and add one or more folders.',
@@ -2427,6 +2425,7 @@ export const en: Translations = {
       gatewayRestarting: 'restarting…',
       gatewayTitle: 'Hermes inference gateway status',
       customizeTitle: 'Show in status bar',
+      hideStatusbar: 'Hide status bar',
       toggleApprovalMode: 'Approvals',
       toggleBackendVersion: 'Backend version',
       toggleCommandCenter: 'Command Center',
