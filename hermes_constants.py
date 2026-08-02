@@ -18,6 +18,14 @@ _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
     "_HERMES_HOME_OVERRIDE", default=_UNSET
 )
 
+# ── TUI busy-indicator styles ─────────────────────────────────────────
+# Single source of truth shared by the CLI /indicator command, the TUI
+# gateway config handler, and the /help command registry. Keep in sync
+# with ``INDICATOR_STYLES`` / ``DEFAULT_INDICATOR_STYLE`` in
+# ``ui-tui/src/app/interfaces.ts`` on the frontend side.
+INDICATOR_STYLES: tuple[str, ...] = ("ascii", "emoji", "kaomoji", "unicode")
+DEFAULT_INDICATOR_STYLE: str = "kaomoji"
+
 
 def set_hermes_home_override(path: str | Path | None) -> Token:
     """Set a context-local Hermes home override and return its reset token.
@@ -427,6 +435,80 @@ def _heal_managed_node_windows() -> bool:
         return False
 
     return node_tool_runnable(str(target / "node.exe"))
+
+
+def _bootstrap_managed_node_posix() -> bool:
+    """Install a fresh managed Node under ``$HERMES_HOME/node`` on POSIX.
+
+    Shells out to ``_nb_install_bundled_node`` in ``scripts/lib/node-bootstrap.sh``
+    (the same pinned-nodejs.org path ``install.sh`` uses), so the resulting
+    tree matches what a normal install would have produced. Runs with
+    ``HERMES_NODE_SKIP_LINKS=1`` so the user's own node/npm on PATH is not
+    shadowed by ``~/.local/bin`` symlinks.
+    """
+    if not _NODE_BOOTSTRAP_SCRIPT.is_file():
+        return False
+
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'source "{_NODE_BOOTSTRAP_SCRIPT}" && _nb_install_bundled_node',
+            ],
+            env={
+                **os.environ,
+                "HERMES_HOME": str(get_hermes_home()),
+                # Private provisioning: do not symlink node/npm/npx into
+                # ~/.local/bin — the user has their own toolchain on PATH and
+                # this tree must not shadow it.
+                "HERMES_NODE_SKIP_LINKS": "1",
+            },
+            capture_output=True,
+            timeout=600,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def bootstrap_hermes_managed_node() -> str | None:
+    """Install a Hermes-managed Node tree and return its npm path.
+
+    Used when the only Node/npm on the machine belongs to the user (system,
+    nvm, brew, Nix) and cannot satisfy the repo's ``engines`` requirements —
+    Hermes never modifies a toolchain it does not own, so instead it provisions
+    its own tree under ``$HERMES_HOME/node`` (the same tree a fresh install
+    creates) and works with that.
+
+    Returns the managed npm executable path on success, ``None`` on failure.
+    No-ops (returning the existing npm) when a healthy managed tree is already
+    present.
+    """
+    existing = find_hermes_node_executable("npm")
+    if existing:
+        return existing
+
+    if sys.platform == "win32":
+        ok = _heal_managed_node_windows()
+    else:
+        ok = _bootstrap_managed_node_posix()
+    if not ok:
+        return None
+
+    for directory in iter_hermes_node_dirs():
+        for name in _candidate_node_command_names("npm"):
+            candidate = directory / name
+            if candidate.is_file() and (
+                sys.platform == "win32" or os.access(candidate, os.X_OK)
+            ):
+                resolved = str(candidate)
+                if node_tool_runnable(resolved):
+                    return resolved
+    return None
 
 
 def heal_hermes_managed_node() -> bool:
@@ -1240,3 +1322,115 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODELS_URL = f"{OPENROUTER_BASE_URL}/models"
 
 AI_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/v1"
+
+
+# ─── Venv layout ─────────────────────────────────────────────────────────────
+
+def venv_bin_dir(venv_dir, *, windows: bool | None = None) -> Path:
+    """Directory holding a venv's executables (``Scripts`` / ``bin``).
+
+    Canonical helper for venv layout. This was open-coded in seven places
+    across four ``hermes_cli`` modules using three different Windows
+    predicates (``platform.system()``, ``is_windows()``, ``_is_windows()``);
+    each new call site had to re-derive it, and #76091 shipped an eighth copy
+    because the correct behaviour lived 2400 lines away in another function.
+    A few sites outside ``hermes_cli`` (``tools/code_execution_tool.py``,
+    ``agent/lsp/install.py``, ``agent/lsp/servers.py``) still hand-roll it —
+    convert them as they are touched.
+
+    *windows* lets a caller pass its own platform verdict. Several callers
+    resolve this through predicates the test-suite patches to exercise
+    Windows paths on Linux CI (``hermes_cli.main._is_windows`` and friends);
+    reading ``sys.platform`` unconditionally here would silently drop those
+    paths out of coverage. Defaults to the host platform.
+
+    The path is returned unconditionally — callers legitimately differ on
+    whether a missing venv is an error, so existence checking stays with them.
+    """
+    if windows is None:
+        windows = sys.platform == "win32"
+    return Path(venv_dir) / ("Scripts" if windows else "bin")
+
+
+def venv_python_path(venv_dir, *, windows: bool | None = None) -> Path:
+    """Path to the Python interpreter inside *venv_dir* (may not exist)."""
+    if windows is None:
+        windows = sys.platform == "win32"
+    return venv_bin_dir(venv_dir, windows=windows) / (
+        "python.exe" if windows else "python"
+    )
+
+
+# ─── Partial-update diagnostics ──────────────────────────────────────────────
+
+# Top-level packages/modules that ship as part of Hermes itself. An ImportError
+# naming one of these means our own tree is inconsistent; anything else is a
+# third-party problem with different remediation. Single source of truth —
+# `hermes_cli.update_cmd`'s post-update probe consumes this same set so the
+# guard that BLOCKS and the hint that EXPLAINS can never disagree.
+FIRST_PARTY_MODULE_ROOTS = frozenset(
+    {
+        "agent",
+        "acp_adapter",
+        "cli",
+        "cron",
+        "gateway",
+        "model_tools",
+        "plugins",
+        "providers",
+        "tools",
+        "toolsets",
+        "run_agent",
+        "tui_gateway",
+        "utils",
+    }
+)
+
+
+def is_first_party_module(name: str | None) -> bool:
+    """True when *name* is a module that ships with Hermes.
+
+    Matches on the first dotted segment against an exact set — a substring or
+    ``startswith`` test would also claim third-party ``agents``, ``agentops``,
+    and ``toolsets_x``.
+    """
+    root = str(name).split(".")[0] if name else ""
+    if not root:
+        return False
+    return root in FIRST_PARTY_MODULE_ROOTS or root.startswith("hermes_")
+
+
+def partial_update_hint(exc: BaseException) -> list[str]:
+    """Return recovery guidance lines when *exc* looks like a half-updated tree.
+
+    An interrupted or partially-applied update can leave the checkout with new
+    files in one package and stale files in another. Every file still parses,
+    so nothing is corrupt in the usual sense — but a module that imports a name
+    added in the same release from a sibling that wasn't refreshed dies with
+    ``ImportError: cannot import name 'X' from 'y'`` on every startup.
+
+    Users hit this as an opaque crash with no indication that the *install*,
+    rather than their config, is the problem — and `hermes update` is exactly
+    the command they need but are least likely to trust after a failed update.
+    Return the guidance so callers can print it alongside the raw error.
+
+    Returns an empty list for unrelated exceptions, so callers can splat it
+    unconditionally.
+    """
+    if not isinstance(exc, ImportError):
+        return []
+    # A missing third-party dependency is a different problem (bad venv, missing
+    # extra) with different remediation, so don't claim a partial update.
+    if isinstance(exc, ModuleNotFoundError):
+        return []
+    name = getattr(exc, "name", None)
+    if not is_first_party_module(name):
+        return []
+    return [
+        "",
+        "This looks like a partially-updated install: one module was refreshed "
+        "and a related one was not.",
+        "Re-run the update to bring the whole tree to the same version:",
+        "    hermes update",
+        "If that also fails, reinstall: https://hermes-agent.nousresearch.com",
+    ]
