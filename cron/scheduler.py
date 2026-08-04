@@ -2821,9 +2821,22 @@ def run_job(
             _job_workdir = None
 
         try:
-            ok, output = _run_job_script_with_claim_heartbeat(
-                job, script_path, workdir=_job_workdir,
+            from gateway.session_context import clear_session_vars, set_session_vars
+
+            _ctx_tokens = set_session_vars(
+                platform="",
+                chat_id="",
+                chat_name="",
+                async_delivery=False,
+                cwd=_job_workdir or "",
+                cron_session="1",
             )
+            try:
+                ok, output = _run_job_script_with_claim_heartbeat(
+                    job, script_path, workdir=_job_workdir,
+                )
+            finally:
+                clear_session_vars(_ctx_tokens)
         except Exception as exc:
             logger.exception(
                 "Job '%s': script execution raised unexpectedly", job_id,

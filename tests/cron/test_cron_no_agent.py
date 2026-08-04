@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import patch
 
 import pytest
@@ -103,6 +104,39 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     assert error is None
     assert "RAM 92% on host" in final_response
     assert "RAM 92% on host" in doc
+
+
+def test_run_job_no_agent_marks_script_subprocess_as_cron_without_env_leak(
+    hermes_env, monkeypatch
+):
+    """no_agent scripts must see cron context so they do not restart their own gateway synchronously."""
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+    from gateway.session_context import get_session_env, reset_session_vars
+
+    reset_session_vars()
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    script_path = hermes_env / "scripts" / "cron_context_probe.py"
+    script_path.write_text(
+        "import os\n"
+        "print('cron_session=' + os.environ.get('HERMES_CRON_SESSION', 'missing'))\n"
+    )
+
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="cron_context_probe.py",
+        no_agent=True,
+        deliver="local",
+    )
+    success, doc, final_response, error = run_job(job)
+
+    assert success is True
+    assert error is None
+    assert "cron_session=1" in final_response
+    assert "cron_session=1" in doc
+    assert "HERMES_CRON_SESSION" not in os.environ
+    assert get_session_env("HERMES_CRON_SESSION") == ""
 
 
 # ---------------------------------------------------------------------------
