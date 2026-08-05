@@ -420,6 +420,8 @@ class TestCheckForSkillUpdates:
             files={
                 "SKILL.md": "same content",
                 "references/checklist.md": "- [ ] security\n",
+                "references/styles.md": "style index\n",
+                "references/styles/blueprint.md": "blueprint\n",
             },
             source="github",
             identifier="owner/repo/demo-skill",
@@ -430,6 +432,9 @@ class TestCheckForSkillUpdates:
         (skill_dir / "SKILL.md").write_text("same content")
         (skill_dir / "references").mkdir()
         (skill_dir / "references" / "checklist.md").write_text("- [ ] security\n")
+        (skill_dir / "references" / "styles.md").write_text("style index\n")
+        (skill_dir / "references" / "styles").mkdir()
+        (skill_dir / "references" / "styles" / "blueprint.md").write_text("blueprint\n")
 
         assert bundle_content_hash(bundle) == content_hash(skill_dir)
 
@@ -1260,6 +1265,54 @@ class TestInstallPathSafety:
         # The old directory was replaced by the new one.
         assert installed.exists()
         assert (installed / "SKILL.md").read_text().strip() == "---\nname: my-skill\n---\nnew"
+
+    def test_install_from_quarantine_supports_symlinked_skills_root(self, tmp_path):
+        """A profile may externalize the entire skills root through a symlink.
+
+        The install target is resolved for confinement checks, so recording its
+        relative lock path must compare against the resolved skills root too.
+        """
+        import tools.skills_hub as hub
+        from tools.skills_guard import ScanResult
+
+        real_skills = tmp_path / "external" / "skills"
+        real_skills.mkdir(parents=True)
+        skills_link = tmp_path / "skills"
+        try:
+            skills_link.symlink_to(real_skills, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlink creation unsupported on this platform")
+
+        quarantine_root = skills_link / ".hub" / "quarantine"
+        quarantine_root.mkdir(parents=True)
+        q_dir = quarantine_root / "pending"
+        q_dir.mkdir()
+        (q_dir / "SKILL.md").write_text("---\nname: linked-skill\n---\n")
+
+        bundle = hub.SkillBundle(
+            name="linked-skill",
+            files={"SKILL.md": "---\nname: linked-skill\n---\n"},
+            source="community",
+            identifier="x",
+            trust_level="community",
+        )
+        scan_result = ScanResult(
+            skill_name="linked-skill",
+            source="community",
+            trust_level="community",
+            verdict="safe",
+        )
+
+        with patch.object(hub, "SKILLS_DIR", skills_link), \
+             patch.object(hub, "QUARANTINE_DIR", quarantine_root):
+            installed = hub.install_from_quarantine(
+                q_dir, "linked-skill", "", bundle, scan_result,
+            )
+
+        assert installed == real_skills / "linked-skill"
+        assert (installed / "SKILL.md").is_file()
+        lock = json.loads((real_skills / ".hub" / "lock.json").read_text())
+        assert lock["installed"]["linked-skill"]["install_path"] == "linked-skill"
 
     def test_install_from_quarantine_allows_empty_category_dir(self, tmp_path):
         """Installing into an existing but empty category directory is allowed

@@ -165,6 +165,35 @@ def test_real_temp_repo_and_home_install_e2e(served_repo, monkeypatch, tmp_path)
     assert "Scan provenance: fresh" in sink.getvalue()
 
 
+def test_real_temp_repo_install_with_symlinked_skills_root(served_repo, monkeypatch, tmp_path):
+    from hermes_cli.skills_hub import do_install
+    import tools.skills_hub as hub
+
+    _repo, url = served_repo
+    home = tmp_path / "home"
+    home.mkdir()
+    external_skills = tmp_path / "external-skills"
+    external_skills.mkdir()
+    try:
+        (home / "skills").symlink_to(external_skills, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation unsupported on this platform")
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("tools.skills_hub.is_safe_url", lambda _url: True)
+    monkeypatch.setattr("tools.skills_hub.check_website_access", lambda _url: None)
+    monkeypatch.setattr(hub, "create_source_router", lambda auth=None: [UrlSource()])
+
+    sink = StringIO()
+    do_install(url, console=Console(file=sink, force_terminal=False), skip_confirm=True)
+
+    installed = external_skills / "demo-bundle"
+    assert (installed / "SKILL.md").is_file()
+    assert "Installed: demo-bundle" in sink.getvalue()
+    entry = json.loads((external_skills / ".hub" / "lock.json").read_text())["installed"]["demo-bundle"]
+    assert entry["install_path"] == "demo-bundle"
+
+
 def test_bundled_optional_source_still_includes_support_files(tmp_path, monkeypatch):
     from tools.skills_hub import OptionalSkillSource
 
