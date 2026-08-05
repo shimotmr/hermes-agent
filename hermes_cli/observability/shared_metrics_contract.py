@@ -18,10 +18,12 @@ MODEL_CALL_SCOPE = "hermes.model_call"
 MODEL_CALL_PROFILE_MODEL = "unknown"
 TASK_SCOPE = "hermes.task_run"
 TOOL_CALL_SCOPE = "hermes.tool_call"
+CLIENT_ACTIVE_MARK = "hermes.client.active"
 TOOL_APPROVAL_MARK = "hermes.tool_approval"
 SKILL_LIFECYCLE_MARK = "hermes.skill.lifecycle"
 SKILL_LOAD_MARK = "hermes.skill.load"
 SUBSCRIBER_NAME = "hermes.nemo_relay.shared_metrics"
+CLIENT_ACTIVE_METRIC = "hermes.client.active"
 LEGACY_MODEL_CALL_METRIC = "hermes.model_call.count"
 MODEL_ROUTE_METRIC = "hermes.model_route.count"
 TASK_STARTED_METRIC = "hermes.task_run.started"
@@ -178,6 +180,99 @@ SKILL_POST_PATCH_STATES: frozenset[str] = frozenset({
     "not_applicable",
     "reused_after_patch",
 })
+CLIENT_OS_FAMILIES: frozenset[str] = frozenset({
+    "linux",
+    "macos",
+    "unknown",
+    "windows",
+})
+CLIENT_ARCHITECTURES: frozenset[str] = frozenset({
+    "arm",
+    "arm64",
+    "unknown",
+    "x86",
+    "x86_64",
+})
+CLIENT_INSTALL_METHODS: frozenset[str] = frozenset({
+    "docker",
+    "git",
+    "homebrew",
+    "nixos",
+    "pip",
+    "unknown",
+})
+CLIENT_RESOURCE_KEYS: frozenset[str] = frozenset({
+    "architecture",
+    "hermes_version",
+    "install_method",
+    "os_family",
+})
+
+def client_os_family(value: Any) -> str:
+    """Map a platform system name to the shared-metrics OS taxonomy."""
+    normalized = str(value or "").strip().lower()
+    return {
+        "darwin": "macos",
+        "linux": "linux",
+        "macos": "macos",
+        "windows": "windows",
+    }.get(normalized, "unknown")
+
+
+def client_architecture(value: Any) -> str:
+    """Map a machine architecture to the shared-metrics taxonomy."""
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"amd64", "x64", "x86_64"}:
+        return "x86_64"
+    if normalized in {"aarch64", "arm64"}:
+        return "arm64"
+    if normalized in {"i386", "i486", "i586", "i686", "x86"}:
+        return "x86"
+    if normalized.startswith("armv"):
+        return "arm"
+    return "unknown"
+
+
+def client_install_method(value: Any) -> str:
+    """Return an allowlisted Hermes installation method."""
+    normalized = str(value or "").strip().lower()
+    if normalized == "nix":
+        return "nixos"
+    return normalized if normalized in CLIENT_INSTALL_METHODS else "unknown"
+
+
+def client_resource(
+    hermes_version: Any,
+    *,
+    os_name: Any,
+    architecture: Any,
+    install_method: Any,
+) -> dict[str, str]:
+    """Build the bounded client resource attached to aggregate packages."""
+    normalized_version = str(hermes_version or "").strip()
+    if not normalized_version or len(normalized_version) > 64:
+        normalized_version = "unknown"
+    return {
+        "architecture": client_architecture(architecture),
+        "hermes_version": normalized_version,
+        "install_method": client_install_method(install_method),
+        "os_family": client_os_family(os_name),
+    }
+
+
+def client_resource_is_valid(resource: Any) -> bool:
+    """Return whether a package resource exactly matches the bounded contract."""
+    if not isinstance(resource, dict) or set(resource) != CLIENT_RESOURCE_KEYS:
+        return False
+    version = resource.get("hermes_version")
+    return (
+        isinstance(version, str)
+        and 0 < len(version) <= 64
+        and resource.get("os_family") in CLIENT_OS_FAMILIES
+        and resource.get("architecture") in CLIENT_ARCHITECTURES
+        and resource.get("install_method") in CLIENT_INSTALL_METHODS
+    )
+
 
 _LEGACY_PROVIDER_FAMILIES = frozenset({
     "aggregator",
@@ -213,6 +308,7 @@ _LEGACY_MODEL_FAMILIES = frozenset({
 })
 
 _COUNTER_DIMENSION_VALUES: dict[str, dict[str, frozenset[str]]] = {
+    CLIENT_ACTIVE_METRIC: {},
     # Retained only so pre-v2 pending rows remain packageable.
     LEGACY_MODEL_CALL_METRIC: {
         "call_role": frozenset({"primary"}),
@@ -259,6 +355,7 @@ _COUNTER_DIMENSION_VALUES: dict[str, dict[str, frozenset[str]]] = {
     },
 }
 COUNTER_METRICS: frozenset[str] = frozenset({
+    CLIENT_ACTIVE_METRIC,
     MODEL_ROUTE_METRIC,
     SKILL_LIFECYCLE_METRIC,
     SKILL_LOAD_METRIC,
@@ -305,6 +402,22 @@ def _event_metadata_is_valid(event: Any) -> bool:
     return not relay_metadata - {"otel.status_code"} and metadata.get(
         "otel.status_code", "OK"
     ) in {"OK", "ERROR"}
+
+
+def client_active_counter(event: Any) -> tuple[str, dict[str, str]] | None:
+    """Return the active-install counter for one empty allowlisted mark."""
+    if not _event_metadata_is_valid(event):
+        return None
+    if (
+        str(getattr(event, "kind", "") or "") != "mark"
+        or str(getattr(event, "name", "") or "") != CLIENT_ACTIVE_MARK
+        or getattr(event, "category", None) is not None
+        or getattr(event, "scope_category", None) is not None
+        or getattr(event, "category_profile", None) is not None
+        or getattr(event, "data", None) != {}
+    ):
+        return None
+    return CLIENT_ACTIVE_METRIC, {}
 
 
 def model_call_dimensions(event: Any) -> dict[str, str] | None:

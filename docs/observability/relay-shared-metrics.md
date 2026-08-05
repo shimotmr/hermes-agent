@@ -55,8 +55,9 @@ dependency does not change the collection or privacy policy.
 
 ## Current Slices
 
-The current vertical slices record logical model calls, top-level task runs,
-tool and approval outcomes, and skill lifecycle and reuse:
+The current vertical slices record pseudonymous profile activity, logical
+model calls, top-level task runs, tool and approval outcomes, and skill
+lifecycle and reuse:
 
 ```text
 Hermes turn, API, tool, and approval hooks
@@ -78,6 +79,15 @@ IDs, and request IDs are not included in the metrics event or package.
 New calls use `hermes.model_route.count`. The previous
 `hermes.model_call.count` contract remains readable only so pending local
 counters created by older builds can be exported without losing data.
+
+The first consented session start emits an empty `hermes.client.active` Relay
+mark. The profile-scoped subscriber creates a random UUID install identity and
+uses a transactional compare-and-set to record at most one client-active
+counter in any rolling 24-hour window. The metric has no dimensions; Hermes
+version, OS family, architecture, and install method remain bounded package
+resources. Concurrent Hermes processes share the SQLite latch, so simultaneous
+starts cannot double-count one install. A later session or task can attempt the
+mark again, but the subscriber suppresses it until the rolling window expires.
 
 Each task run is a Relay `Function` scope named `hermes.task_run`, parented to
 the owning Hermes session. The start counter contains only bounded execution
@@ -126,9 +136,13 @@ $HERMES_HOME/telemetry/shared_metrics/outbox/*.json
 
 The database keeps transactional aggregate and package-outbox state. Package
 files are immutable delta documents that conform to a closed JSON schema and
-are written with atomic replacement. Fully packaged aggregate rows and
-successfully exported package rows and files are retained locally for 30 days.
-Pending package rows and counters with unexported deltas are never pruned.
+are written with atomic replacement. Each package records the Hermes version,
+OS family, architecture, and install method as bounded client resources.
+Unrecognized platform or installation values are exported as `unknown`; raw
+platform strings, hostnames, and paths are never included. Fully packaged
+aggregate rows and successfully exported package rows and files are retained
+locally for 30 days. Pending package rows and counters with unexported deltas
+are never pruned.
 Package schema v1 remains unchanged for existing outbox files. New packages
 use v2, which accepts both the retired model-call contract and the current
 model-route contract so upgrades can drain pending counters safely.
@@ -146,6 +160,13 @@ the persistent local identifier by default. It requires a separate product and
 privacy decision covering consent, identity scope, rotation or keyed
 pseudonymization, reset behavior, retention, and deletion.
 
+The install identity is scoped to one `HERMES_HOME`. To reset it, stop Hermes
+processes and remove `$HERMES_HOME/telemetry/shared_metrics`. This deliberately
+removes the old identity, aggregate database, and queued local packages
+together; the next consented session creates a new identity. Disabling shared
+metrics stops new collection but does not silently delete previously collected
+local state.
+
 ## Smoke Test
 
 Run a real Hermes CLI turn against the deterministic local model server:
@@ -162,6 +183,6 @@ The smoke has the local model request a real `read_file` tool call before its
 final response, then drives create, load, reuse, patch, edit, stale, archive,
 restore, and install skill transitions through the installed Relay binding. It
 verifies model, provider, task, tool, and skill counters in SQLite, validates
-all exported delta packages against the closed schema, and checks that prompt,
-response, tool-call ID, tool-result, and skill-name canaries are absent from the
-packages.
+all exported delta packages against the closed schema, verifies the
+pseudonymous client-active counter, and checks that prompt, response, tool-call
+ID, tool-result, and skill-name canaries are absent from the packages.
