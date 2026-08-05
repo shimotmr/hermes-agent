@@ -38,7 +38,9 @@
   "overrides": {
     "serialize-javascript": "7.0.7",
     "uuid": "14.0.1",
-    "minimatch": "10.2.6"
+    "minimatch": "10.2.6",
+    "postcss": "8.5.23",
+    "undici": "7.29.0"
   },
   "browserslist": {
     "production": [
