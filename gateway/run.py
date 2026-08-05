@@ -24828,9 +24828,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # stream completion never reached any API call (#71643).
                 # Reconcile the recorded turn-final payload against the
                 # completed response; only a demonstrable mismatch (False)
-                # overrides the flag — None (no record / multi-message split
-                # delivery) keeps the legacy trust so overflow splits are not
-                # re-sent.
+                # overrides the flag — including payload-less multi-message
+                # split delivery (#78541). None (no record on a non-split
+                # legacy path) keeps the legacy trust so ambiguous-timeout
+                # dedup is not regressed.
                 matcher = getattr(consumer, "delivered_final_matches", None)
                 if callable(matcher):
                     try:
@@ -25621,8 +25622,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Reconcile the consumer's recorded turn-final payload against the
             # completed response: on a demonstrable mismatch (False) neither
             # final_response_sent nor final_content_delivered may suppress the
-            # normal final send. None (no record / multi-message split
-            # delivery) keeps legacy trust; the failed-finalize family
+            # normal final send. False also covers payload-less multi-message
+            # split delivery (#78541). None (no record on a non-split legacy
+            # path) keeps legacy trust; the failed-finalize family
             # (#51828 / #33793) is unaffected because those paths leave the
             # flags False or record the complete fallback payload.
             _stale_finalized = False
@@ -25666,9 +25668,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # user gets one corrected message; on edit failure fall through
                 # with already_sent unset so the normal final send delivers the
                 # complete text.
+                #
+                # Not valid for a multi-message split delivery: there
+                # ``message_id`` is only the LAST chunk, so editing it with the
+                # complete response would repeat every sealed head chunk's text
+                # inside the tail message. Fall through to the normal final send
+                # instead (#78541).
                 _sc_msg_id = _sc.message_id
                 _sc_adapter = getattr(_sc, "adapter", None)
-                if _sc_msg_id and _sc_msg_id != "__no_edit__" and _sc_adapter is not None:
+                if getattr(_sc, "_turn_split_delivery", False):
+                    logger.info(
+                        "Stale streamed finalize detected for session %s on a multi-message split; skipping the in-place reconciliation edit and delivering the complete response via normal final send (#78541).",
+                        session_key or "?",
+                    )
+                elif _sc_msg_id and _sc_msg_id != "__no_edit__" and _sc_adapter is not None:
                     try:
                         _reconcile_res = await _sc_adapter.edit_message(
                             chat_id=source.chat_id,
