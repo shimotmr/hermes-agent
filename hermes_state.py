@@ -56,6 +56,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _shape_preview,
     _sql_session_last_active,
     _sql_session_last_active_by_id,
+    escape_like as _escape_like,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
     FTS_SQL,
@@ -178,7 +179,16 @@ _MODEL_CONFIG_ROW_MISSING = object()
 
 def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
     prefix = cwd_prefix.rstrip("/\\") or cwd_prefix
-    return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [prefix, f"{prefix}/%", f"{prefix}\\%"]
+    # ``_`` and ``%`` are LIKE wildcards but ordinary characters in a path
+    # (``my_project``), so an unescaped prefix also matches sibling directories.
+    # Escape the needle and pair it with ESCAPE; the literal separator
+    # backslash in the Windows pattern needs escaping for the same reason. The
+    # ``=`` arm is an exact compare and keeps the raw prefix.
+    esc = _escape_like(prefix)
+    return (
+        "(s.cwd = ? OR s.cwd LIKE ? ESCAPE '\\' OR s.cwd LIKE ? ESCAPE '\\')",
+        [prefix, f"{esc}/%", f"{esc}\\\\%"],
+    )
 
 
 def _workspace_key_clause(key: str) -> Tuple[str, List[str]]:
@@ -5266,12 +5276,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if exact:
             return exact["id"]
 
-        escaped = (
-            session_id_or_prefix
-            .replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
+        escaped = _escape_like(session_id_or_prefix)
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
@@ -5660,7 +5665,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
-        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        escaped = _escape_like(title)
         with self._read_ctx() as conn:
             cursor = conn.execute(
                 "SELECT id, title, started_at FROM sessions "
@@ -5691,7 +5696,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         # Find all existing numbered variants
         # Escape SQL LIKE wildcards (%, _) in the base to prevent false matches
-        escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        escaped = _escape_like(base)
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
@@ -5944,10 +5949,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             filter_clauses: List[str] = []
 
             def _like_pattern(needle: str) -> str:
-                escaped = (
-                    needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                )
-                return f"%{escaped}%"
+                return f"%{_escape_like(needle)}%"
 
             if id_needle:
                 # Admit a surfaced row if its own id or any id in its forward
@@ -8402,8 +8404,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("s.source = ?")
             params.append(source)
         if title_like:
-            clauses.append("LOWER(COALESCE(s.title, '')) LIKE ?")
-            params.append(f"%{title_like.lower()}%")
+            clauses.append("LOWER(COALESCE(s.title, '')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(title_like.lower())}%")
         if end_reason:
             clauses.append("s.end_reason = ?")
             params.append(end_reason)
@@ -8418,8 +8420,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("s.message_count <= ?")
             params.append(max_messages)
         if model_like:
-            clauses.append("LOWER(COALESCE(s.model, '')) LIKE ?")
-            params.append(f"%{model_like.lower()}%")
+            clauses.append("LOWER(COALESCE(s.model, '')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(model_like.lower())}%")
         if provider:
             clauses.append("LOWER(COALESCE(s.billing_provider, '')) = ?")
             params.append(provider.lower())
@@ -8433,8 +8435,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("s.chat_type = ?")
             params.append(chat_type)
         if branch_like:
-            clauses.append("LOWER(COALESCE(s.git_branch, '')) LIKE ?")
-            params.append(f"%{branch_like.lower()}%")
+            clauses.append("LOWER(COALESCE(s.git_branch, '')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(branch_like.lower())}%")
         if min_tokens is not None:
             clauses.append(
                 "(COALESCE(s.input_tokens, 0) + COALESCE(s.output_tokens, 0)) >= ?"
@@ -8836,7 +8838,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             cursor = conn.execute(
                 "UPDATE sessions SET source = 'kanban' "
                 "WHERE source = 'cli' AND (cwd = ? OR cwd LIKE ? ESCAPE '\\')",
-                (prefix, prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "/%"),
+                (prefix, _escape_like(prefix) + "/%"),
             )
             # Read rowcount before set_meta reuses this cursor for its INSERT,
             # which would otherwise overwrite it with the meta write's count.
