@@ -436,9 +436,16 @@ class HermesTokenStorage:
         HERMES_HOME/mcp-tokens/<server_name>.meta.json     -- oauth server metadata
     """
 
-    def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
+    def __init__(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+        token_endpoint_auth_method: str | None = None,
+    ):
         self._server_name = _safe_filename(server_name)
         self._hermes_home = Path(hermes_home) if hermes_home is not None else None
+        self._token_endpoint_auth_method = token_endpoint_auth_method
 
     def _tokens_path(self) -> Path:
         return _get_token_dir(self._hermes_home) / f"{self._server_name}.json"
@@ -527,6 +534,12 @@ class HermesTokenStorage:
             return None
 
     async def set_client_info(self, client_info: "OAuthClientInformationFull") -> None:
+        # Some DCR providers return a client_secret but omit (or mis-advertise)
+        # token_endpoint_auth_method. Mutate the same object held by the MCP SDK
+        # so the current flow, not only the next process, uses the configured
+        # confidential-client exchange method.
+        if self._token_endpoint_auth_method and getattr(client_info, "client_secret", None):
+            client_info.token_endpoint_auth_method = self._token_endpoint_auth_method
         _write_json(self._client_info_path(), client_info.model_dump(mode="json", exclude_none=True))
         logger.debug("OAuth client info saved for %s", self._server_name)
 
@@ -1134,6 +1147,15 @@ def _resolve_redirect_uri(cfg: dict, port: int) -> str:
 # different name via oauth.client_name if Figma ever admits one.
 _FIGMA_DCR_CLIENT_NAME = "Claude Code"
 _FIGMA_DEFAULT_SCOPE = "mcp:connect"
+_SUPABASE_REMOTE_MCP_HOST = "mcp.supabase.com"
+
+
+def _is_supabase_remote_mcp(server_url: str | None = None) -> bool:
+    """True only for Supabase's official hosted remote MCP endpoint."""
+    try:
+        return (urlparse(server_url or "").hostname or "").lower() == _SUPABASE_REMOTE_MCP_HOST
+    except ValueError:
+        return False
 
 
 def _is_figma_remote_mcp(
@@ -1179,6 +1201,13 @@ def apply_oauth_provider_defaults(
         # exchange with "Client secret is required". Request confidential-
         # client registration so the SDK includes client_secret on the token
         # POST (auth method client_secret_post).
+        if not cfg.get("token_endpoint_auth_method"):
+            cfg["token_endpoint_auth_method"] = "client_secret_post"
+    if _is_supabase_remote_mcp(server_url):
+        # Supabase's hosted MCP DCR issues a confidential client and its token
+        # endpoint requires client_secret in the form body. Requesting the
+        # public-client default ("none") lets browser authorization succeed but
+        # fails the code exchange with HTTP 422: Required parameter: client_secret.
         if not cfg.get("token_endpoint_auth_method"):
             cfg["token_endpoint_auth_method"] = "client_secret_post"
     return cfg
@@ -1337,7 +1366,10 @@ def build_oauth_auth(
     apply_oauth_provider_defaults(
         cfg, server_name=server_name, server_url=server_url
     )
-    storage = HermesTokenStorage(server_name)
+    storage = HermesTokenStorage(
+        server_name,
+        token_endpoint_auth_method=cfg.get("token_endpoint_auth_method"),
+    )
 
     if not _is_interactive() and not storage.has_cached_tokens():
         raise OAuthNonInteractiveError(

@@ -62,6 +62,22 @@ def test_manager_restore_entry_preserves_newer_concurrent_entry(tmp_path, monkey
     assert manager.get_or_build_provider("shared", "https://new.example", {}) is new_provider
     assert new_provider is not old_provider
 
+
+def test_manager_propagates_supabase_confidential_client_override(tmp_path, monkeypatch):
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _set_interactive_stdin(monkeypatch)
+    provider = MCPOAuthManager().get_or_build_provider(
+        "supabase",
+        "https://mcp.supabase.com/mcp",
+        {},
+    )
+
+    assert provider is not None
+    assert provider.context.storage._token_endpoint_auth_method == "client_secret_post"
+
+
 pytest.importorskip(
     "mcp.client.auth.oauth2",
     reason="MCP SDK 1.26.0+ required for OAuth support",
