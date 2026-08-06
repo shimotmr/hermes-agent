@@ -150,6 +150,48 @@ class TestHermesTokenStorage:
         assert saved is not None
         assert saved.token_endpoint_auth_method == "client_secret_post"
 
+    def test_cached_client_info_auth_override_migrates_disk_and_token_body(self, tmp_path, monkeypatch):
+        pytest.importorskip("mcp")
+        from mcp.client.auth.oauth2 import OAuthContext
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage(
+            "supabase",
+            token_endpoint_auth_method="client_secret_post",
+        )
+        legacy = OAuthClientInformationFull.model_validate(
+            {
+                "client_id": "legacy-client",
+                "client_secret": "legacy-secret",
+                "redirect_uris": ["http://127.0.0.1:12345/callback"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+            }
+        )
+        storage._client_info_path().parent.mkdir(parents=True)
+        storage._client_info_path().write_text(
+            json.dumps(legacy.model_dump(mode="json", exclude_none=True))
+        )
+
+        loaded = asyncio.run(storage.get_client_info())
+
+        assert loaded is not None
+        assert loaded.token_endpoint_auth_method == "client_secret_post"
+        cached = json.loads(storage._client_info_path().read_text())
+        assert cached["token_endpoint_auth_method"] == "client_secret_post"
+        context = OAuthContext(
+            server_url="https://mcp.supabase.com/mcp",
+            client_metadata=MagicMock(),
+            storage=storage,
+            redirect_handler=None,
+            callback_handler=None,
+        )
+        context.client_info = loaded
+        body, _ = context.prepare_token_auth({"client_id": "legacy-client"})
+        assert body["client_secret"] == "legacy-secret"
+
 
 # ---------------------------------------------------------------------------
 # build_oauth_auth
