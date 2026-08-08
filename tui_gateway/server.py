@@ -1348,6 +1348,34 @@ def _db_for_profile(profile: str | None = None):
         return None, False
 
 
+def _transfer_db_to_agent(agent, db) -> bool:
+    """Hand a DEDICATED profile handle to *agent*, which closes it on teardown.
+
+    The build sites open a per-profile ``state.db`` handle, pass it to
+    ``_make_agent``, and own it until the built agent is the one that will be
+    torn down. This marks that transfer: from here ``AIAgent.close()`` (reached
+    via :func:`_teardown_session`) releases the handle, so the caller must stop
+    closing it.
+
+    Returns True only when the transfer actually happened. It is refused when
+    *agent* is not holding *this* handle — the build failed before
+    ``_make_agent``, or the agent was given a different db — because a False
+    return is what tells the caller the handle is still its own to close.
+    Never called for the shared launch handle: that one is opened by
+    ``_get_db()``, outlives every agent, and stays at ``_owns_session_db``
+    False.
+    """
+    if agent is None or db is None:
+        return False
+    try:
+        if getattr(agent, "_session_db", None) is not db:
+            return False
+        agent._owns_session_db = True
+        return True
+    except Exception:
+        return False
+
+
 @contextlib.contextmanager
 def _profile_db(params: dict | None = None):
     """Yield the SessionDB for ``params['profile']`` (app-global remote mode).
@@ -2139,6 +2167,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
         notify_registered = False
         home_token = None
         secret_token = None
+        session_db = None
+        owns_db = False
         profile_home = current.get("profile_home")
         try:
             tokens = _set_session_context(key)
@@ -2157,7 +2187,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 try:
                     from hermes_state import SessionDB
 
+                    # DEDICATED handle — ours until _transfer_db_to_agent hands
+                    # it to the built agent in the finally below. Every path
+                    # that leaves this build without that transfer (the except
+                    # below, and a session reaped mid-build) must close it.
                     session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                    owns_db = True
                 except Exception:
                     session_db = None
 
@@ -2293,6 +2328,18 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     unregister_gateway_notify(key)
                 except Exception:
                     pass
+            # Dedicated profile handle: hand it to the agent that will actually
+            # be torn down, or close it here when no such agent exists. Both
+            # non-transfer cases are real: the except above (build raised, so
+            # nothing holds the handle) and `replaced` (the session was reaped
+            # mid-build, so this agent is discarded and _teardown_session will
+            # never reach it). Transferring to a discarded agent would leak the
+            # handle exactly as before.
+            if owns_db and session_db is not None:
+                built = None if replaced else current.get("agent")
+                if not _transfer_db_to_agent(built, session_db):
+                    with contextlib.suppress(Exception):
+                        session_db.close()
             ready.set()
 
     build_thread = threading.Thread(target=_build, daemon=True)
@@ -4086,7 +4133,29 @@ def _load_tool_progress_mode() -> str:
     return mode if mode in {"off", "new", "all", "verbose"} else "all"
 
 
-def _load_enabled_toolsets() -> list[str] | None:
+def _gui_surface_toolsets(platform: str) -> set[str]:
+    """Toolsets that exist because of the CLIENT on the other end, not the host.
+
+    Both entries are deliberately off ``_HERMES_CORE_TOOLS`` — every other
+    platform would carry their schema for nothing — so this resolver is the one
+    gate that exposes them.
+
+    ``platform`` is the SESSION's source (``session.create``'s ``source``
+    field), never a process env var. The desktop app is a client: it can be
+    driving a local, SSH, URL, or cloud backend, and only the local/SSH spawn
+    paths run with ``HERMES_DESKTOP=1``. Keying GUI capability off that env var
+    silently stripped every pane/browser tool from URL and cloud gateways while
+    the same backend told the model it was "chatting inside the Hermes desktop
+    app". See the surface-capability rule in AGENTS.md.
+    """
+    surfaces = {"project"}
+    if platform == "desktop":
+        surfaces.add("desktop_ui")
+    return surfaces
+
+
+def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
+    session_platform = platform or _resolve_session_platform()
     explicit = [
         item.strip()
         for item in os.environ.get("HERMES_TUI_TOOLSETS", "").split(",")
@@ -4105,13 +4174,13 @@ def _load_enabled_toolsets() -> list[str] | None:
         try:
             from agent.coding_context import coding_selection
 
-            selection = coding_selection(platform=_resolve_session_platform())
+            selection = coding_selection(platform=session_platform)
             if selection is not None:
-                # Fold in `project` here too: this is a GUI-only resolver, and
-                # the focus-mode coding posture returns before the fallback path
-                # that normally adds it — without this the desktop loses the
-                # project tools exactly when sitting in a repo (see below).
-                return sorted({*selection, "project"})
+                # Fold in the client-surface toolsets here too: the focus-mode
+                # coding posture returns before the fallback path that normally
+                # adds them — without this the desktop loses its pane/project
+                # tools exactly when sitting in a repo (see below).
+                return sorted({*selection, *_gui_surface_toolsets(session_platform)})
         except Exception:
             pass
 
@@ -4222,13 +4291,13 @@ def _load_enabled_toolsets() -> list[str] | None:
             print(fallback_notice, file=sys.stderr, flush=True)
         if not enabled:
             return None
-        # The desktop Project tools are off _HERMES_CORE_TOOLS (every other
+        # The client-surface toolsets are off _HERMES_CORE_TOOLS (every other
         # platform would carry their schema for nothing), so the platform
         # recovery above — which keys off hermes-cli's tool universe — can't
         # surface them. This resolver runs ONLY in the desktop/TUI gateway, so
-        # folding in the `project` toolset here is the gate that exposes them on
-        # exactly the surface that can follow a project move.
-        return sorted(enabled | {"project"})
+        # folding them in here is the gate that exposes them on exactly the
+        # surface that can answer them.
+        return sorted(enabled | _gui_surface_toolsets(session_platform))
     except Exception:
         if fallback_notice is not None:
             print(
@@ -5990,7 +6059,11 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "model": getattr(agent, "model", None) or _resolve_model(),
         "max_iterations": _cfg_max_turns(cfg, 25),
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
-        or _load_enabled_toolsets(),
+        # Detached background tasks declare platform="tui" below: they have no
+        # UI session id, so a renderer-routed event has nowhere to land. Resolve
+        # their toolsets against that same platform rather than the gateway
+        # process's, so they never carry GUI schema they cannot use.
+        or _load_enabled_toolsets("tui"),
         "quiet_mode": True,
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
@@ -6485,7 +6558,7 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(),
+        enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -7657,6 +7730,22 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
     _emit("message.complete", sid, payload)
 
 
+def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
+    """Keep a failed turn's working transcript in the gateway session.
+
+    ``AIAgent`` persists its working messages independently of the gateway's
+    history snapshot. If the turn raises after that persistence, the next
+    prompt must see the working transcript instead of the pre-turn snapshot.
+    """
+    agent_messages = getattr(agent, "_session_messages", None)
+    if not isinstance(agent_messages, list):
+        return False
+    with session["history_lock"]:
+        session["history"] = list(agent_messages)
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+    return True
+
+
 def _queued_prompt_snapshot(session: dict) -> dict | None:
     """Return the accepted next-turn prompt without its transport handle.
 
@@ -7879,9 +7968,17 @@ def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
         return _session_info(agent)
-    cwd = _default_session_cwd()
+    # The SESSION's own workspace, not the gateway's launch directory. Reporting
+    # `_default_session_cwd()` here told a lazily-resumed session's client that
+    # its workspace was wherever the gateway process happened to start, so the
+    # desktop Files pane painted the wrong project even after the renderer
+    # rebound correctly (#71254). `branch` is always emitted ("" outside a git
+    # repo) so a client can clear a stale label instead of retaining it — the
+    # same contract `_lazy_session_info` above already follows.
+    cwd = _session_cwd(session)
     return {
         "cwd": cwd,
+        "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
         "lazy": True,
         "model": _resolve_model(),
@@ -10065,6 +10162,12 @@ def _run_prompt_submit(
             print(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
+            # The agent persists its working transcript on normal finalization,
+            # but an exception in that finalizer can otherwise leave the
+            # gateway's separate in-memory history at the turn-start snapshot.
+            # Keep the partial turn available to the next prompt; the durable
+            # inflight record still carries the recoverable error state.
+            _restore_agent_history_after_turn_error(session, agent)
             try:
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining

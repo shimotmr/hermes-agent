@@ -412,6 +412,14 @@ def finalize_turn(
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
 
+    # The gateway owns a separate in-memory history snapshot. Keep it current
+    # even when finalization reports a cleanup error: a later prompt must not be
+    # sent with the pre-turn snapshot while the durable DB already has this turn.
+    try:
+        agent._session_messages = messages
+    except Exception:
+        pass
+
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
     # When the last message is a tool result (agent was mid-work), log
@@ -713,7 +721,15 @@ def finalize_turn(
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    # Suppressed when skip_background_review=True (e.g. cron) — review forks
+    # spawn another AIAgent (~30K tokens / event) and cron sessions have no
+    # human-in-the-loop benefit from the review.
+    if (
+        final_response
+        and not interrupted
+        and not getattr(agent, "skip_background_review", False)
+        and (_should_review_memory or _should_review_skills)
+    ):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
