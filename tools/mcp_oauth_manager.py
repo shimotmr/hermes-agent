@@ -551,7 +551,10 @@ class MCPOAuthManager:
         apply_oauth_provider_defaults(
             cfg, server_name=server_name, server_url=entry.server_url
         )
-        storage = HermesTokenStorage(server_name)
+        storage = HermesTokenStorage(
+            server_name,
+            token_endpoint_auth_method=cfg.get("token_endpoint_auth_method"),
+        )
 
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 

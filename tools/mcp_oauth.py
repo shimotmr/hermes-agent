@@ -436,9 +436,16 @@ class HermesTokenStorage:
         HERMES_HOME/mcp-tokens/<server_name>.meta.json     -- oauth server metadata
     """
 
-    def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
+    def __init__(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+        token_endpoint_auth_method: str | None = None,
+    ):
         self._server_name = _safe_filename(server_name)
         self._hermes_home = Path(hermes_home) if hermes_home is not None else None
+        self._token_endpoint_auth_method = token_endpoint_auth_method
 
     def _tokens_path(self) -> Path:
         return _get_token_dir(self._hermes_home) / f"{self._server_name}.json"
@@ -514,6 +521,24 @@ class HermesTokenStorage:
 
     # -- client info -------------------------------------------------------
 
+    def _apply_client_info_auth_override(
+        self,
+        client_info: "OAuthClientInformationFull",
+    ) -> bool:
+        """Apply a configured confidential-client method in-place.
+
+        Returns True when the object changed so callers can persist a migrated
+        legacy cache. The MCP SDK keeps the same object in its active context,
+        therefore in-place mutation also fixes the current token exchange.
+        """
+        method = self._token_endpoint_auth_method
+        if not method or not getattr(client_info, "client_secret", None):
+            return False
+        if getattr(client_info, "token_endpoint_auth_method", None) == method:
+            return False
+        client_info.token_endpoint_auth_method = method
+        return True
+
     async def get_client_info(self) -> "OAuthClientInformationFull | None":
         data = _read_json(self._client_info_path())
         if data is None:
@@ -521,12 +546,27 @@ class HermesTokenStorage:
         if OAuthClientInformationFull is None and not _ensure_sdk_loaded():
             return None
         try:
-            return OAuthClientInformationFull.model_validate(data)
+            client_info = OAuthClientInformationFull.model_validate(data)
+            if self._apply_client_info_auth_override(client_info):
+                _write_json(
+                    self._client_info_path(),
+                    client_info.model_dump(mode="json", exclude_none=True),
+                )
+                logger.info(
+                    "OAuth client auth method migrated for %s",
+                    self._server_name,
+                )
+            return client_info
         except (ValueError, TypeError, KeyError) as exc:
             logger.warning("Corrupt client info at %s -- ignoring: %s", self._client_info_path(), exc)
             return None
 
     async def set_client_info(self, client_info: "OAuthClientInformationFull") -> None:
+        # Some DCR providers return a client_secret but omit (or mis-advertise)
+        # token_endpoint_auth_method. Mutate the same object held by the MCP SDK
+        # so the current flow, not only the next process, uses the configured
+        # confidential-client exchange method.
+        self._apply_client_info_auth_override(client_info)
         _write_json(self._client_info_path(), client_info.model_dump(mode="json", exclude_none=True))
         logger.debug("OAuth client info saved for %s", self._server_name)
 
@@ -1134,6 +1174,15 @@ def _resolve_redirect_uri(cfg: dict, port: int) -> str:
 # different name via oauth.client_name if Figma ever admits one.
 _FIGMA_DCR_CLIENT_NAME = "Claude Code"
 _FIGMA_DEFAULT_SCOPE = "mcp:connect"
+_SUPABASE_REMOTE_MCP_HOST = "mcp.supabase.com"
+
+
+def _is_supabase_remote_mcp(server_url: str | None = None) -> bool:
+    """True only for Supabase's official hosted remote MCP endpoint."""
+    try:
+        return (urlparse(server_url or "").hostname or "").lower() == _SUPABASE_REMOTE_MCP_HOST
+    except ValueError:
+        return False
 
 
 def _is_figma_remote_mcp(
@@ -1179,6 +1228,13 @@ def apply_oauth_provider_defaults(
         # exchange with "Client secret is required". Request confidential-
         # client registration so the SDK includes client_secret on the token
         # POST (auth method client_secret_post).
+        if not cfg.get("token_endpoint_auth_method"):
+            cfg["token_endpoint_auth_method"] = "client_secret_post"
+    if _is_supabase_remote_mcp(server_url):
+        # Supabase's hosted MCP DCR issues a confidential client and its token
+        # endpoint requires client_secret in the form body. Requesting the
+        # public-client default ("none") lets browser authorization succeed but
+        # fails the code exchange with HTTP 422: Required parameter: client_secret.
         if not cfg.get("token_endpoint_auth_method"):
             cfg["token_endpoint_auth_method"] = "client_secret_post"
     return cfg
@@ -1337,7 +1393,10 @@ def build_oauth_auth(
     apply_oauth_provider_defaults(
         cfg, server_name=server_name, server_url=server_url
     )
-    storage = HermesTokenStorage(server_name)
+    storage = HermesTokenStorage(
+        server_name,
+        token_endpoint_auth_method=cfg.get("token_endpoint_auth_method"),
+    )
 
     if not _is_interactive() and not storage.has_cached_tokens():
         raise OAuthNonInteractiveError(
