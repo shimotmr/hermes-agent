@@ -31,6 +31,10 @@ declare global {
       }) => Promise<GatewayWsUrlResult>
       // Union agent roster across every registered connection.
       getAgentRoster?: () => Promise<DesktopAgentRoster>
+      // Credential-free routes across the union connection registry. The
+      // optional profile list is used only by the single-local v1 fallback;
+      // endpoint and auth material never crosses the IPC boundary.
+      getProfileRoutes: (profiles: string[]) => Promise<DesktopPluginProfileRoute[]>
       // Reconnect-after-wake recovery: liveness-probe the cached PRIMARY backend
       // and drop it if a remote one has gone unreachable, so the next
       // getConnection() rebuilds a reachable descriptor instead of the renderer
@@ -143,6 +147,11 @@ declare global {
         // Fan out `hermes update` to every eligible registered connection;
         // cloud entries are skipped (platform-managed), each row independent.
         updateAll?: () => Promise<{ ok: boolean; results: DesktopConnectionUpdateResult[] }>
+        // Registry lifecycle push: fired when a connection is removed or
+        // materially edited so the renderer can dispose (and re-dial) the
+        // secondary gateways scoped to it. Optional: older Electron mains
+        // don't emit it.
+        onChanged?: (callback: (payload: { connectionId: string; reason: 'removed' | 'updated' }) => void) => () => void
       }
       sshConfigHosts: () => Promise<DesktopSshHostsResult>
       sshResolveHost: (host: string) => Promise<DesktopSshResolveResult>
@@ -497,8 +506,21 @@ export interface DesktopUpdateStatus {
 
 export type DesktopUpdateDirtyStrategy = 'abort' | 'stash' | 'force'
 
+export interface DesktopUpdateBlocker {
+  pid: number
+  name: string
+  cmdline: string
+  kind: 'local-preview' | 'other'
+  safeToStop: boolean
+  label?: string
+  port?: number
+  createTime?: number
+}
+
 export interface DesktopUpdateApplyOptions {
   dirtyStrategy?: DesktopUpdateDirtyStrategy
+  /** User confirmed that Desktop may stop freshly re-scanned safe local preview servers. */
+  stopSafeBlockers?: boolean
 }
 
 export interface DesktopUpdateApplyResult {
@@ -506,6 +528,7 @@ export interface DesktopUpdateApplyResult {
   branch?: string
   error?: string
   message?: string
+  blockers?: DesktopUpdateBlocker[]
   /** True when no staged updater exists (CLI install) and the user should run
    *  `hermes update` themselves. `command` is the exact line to run. */
   manual?: boolean
@@ -557,6 +580,15 @@ export interface DesktopUpdateProgress {
   percent: number | null
   error: string | null
   at: number
+}
+
+export interface DesktopPluginProfileRoute {
+  // Registry source identity. Pair with profile; profile names are not unique
+  // across sources.
+  connectionId: string
+  mode: 'local' | 'remote'
+  profile: string
+  targetProfile: string
 }
 
 export interface HermesConnection {
@@ -972,6 +1004,12 @@ export interface HermesApiRequest {
   // (window) backend. Read-only cross-profile data is served by the primary, so
   // this is only needed for profile-scoped live/settings calls.
   profile?: string | null
+  // Route this REST call to a specific REGISTERED gateway connection (v2
+  // registry). Data owned by a remote gateway — cron jobs and their run
+  // sessions — lives in that host's state.db, so requests for it must resolve
+  // through the owning connection, not the local profile pool. Omit / '' /
+  // 'local' keep the legacy profile-routed path.
+  connectionId?: string | null
 }
 
 export interface HermesNotification {
