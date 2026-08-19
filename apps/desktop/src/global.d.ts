@@ -350,6 +350,7 @@ declare global {
         start: (options?: { cols?: number; cwd?: string; rows?: number }) => Promise<HermesTerminalSession>
         write: (id: string, data: string) => Promise<boolean>
       }
+      reachPreviewUrl?: (url: string) => Promise<string>
       onClosePreviewRequested?: (callback: () => void) => () => void
       onPreviewNav?: (callback: (command: 'back' | 'forward' | 'reload') => void) => () => void
       onOpenFolderRequested?: (callback: () => void) => () => void
@@ -358,9 +359,28 @@ declare global {
         callback: (payload: { kind: string; name: string; params: Record<string, string> }) => void
       ) => () => void
       signalDeepLinkReady?: () => Promise<{ ok: boolean }>
+      probePluginRepo?: (payload: { identifier?: string; repo?: string }) => Promise<{
+        ok: boolean
+        agent: boolean
+        desktop: boolean
+        agentName?: string | null
+        desktopName?: string | null
+        warnings?: string[]
+        insecure?: boolean
+        error?: string
+      }>
+      installDesktopPlugin?: (payload: {
+        identifier?: string
+        repo?: string
+        force?: boolean
+      }) => Promise<{ ok: boolean; pluginName?: string; path?: string; error?: string }>
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
       onFocusSession?: (callback: (sessionId: string) => void) => () => void
       onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
+      /** Plugin (and other session-less) notification body/action activation. */
+      onNotificationActivate?: (
+        callback: (payload: { actionId?: string; activate?: string; notifyId?: string; tag?: string }) => void
+      ) => () => void
       onPreviewFileChanged: (callback: (payload: HermesPreviewFileChanged) => void) => () => void
       onBackendExit: (callback: (payload: BackendExit) => void) => () => void
       // Soft gateway-mode apply: primary backend was torn down without a window
@@ -1051,7 +1071,13 @@ export interface HermesNotification {
   sessionId?: string
   /** Dedupe discriminator for session-less notifications (e.g. plugin id). */
   tag?: string
-  actions?: { id: string; text: string }[]
+  /** Absolute icon path for Electron `Notification`. */
+  icon?: string
+  /** Resolved hash-router path opened on body click (plugin / deeplink-compatible). */
+  activate?: string
+  /** Renderer handle for onActivate / onAction callbacks. */
+  notifyId?: string
+  actions?: { id: string; text: string; activate?: string }[]
 }
 
 export interface HermesPreviewTarget {
