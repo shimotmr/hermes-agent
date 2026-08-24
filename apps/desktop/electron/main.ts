@@ -8708,7 +8708,11 @@ function writeDesktopConnectionsRegistry(registry) {
  */
 function sanitizeRegistryConnection(entry) {
   const { token, headers, ...rest } = entry
-  const decrypted = decryptDesktopSecret(token)
+  // Renderer metadata never needs plaintext. Avoid synchronous safeStorage
+  // decryption while enumerating the registry: on macOS a locked/unavailable
+  // Keychain can otherwise freeze the whole Electron main loop during local
+  // boot. The selected remote route decrypts its token only when dialing.
+  const storedTokenSet = Boolean(token && typeof token === 'object' && token.value)
   // Last-known stable backend identity (from roster enumeration / Test) so
   // Settings can hint "Same backend as <label>" on connections that are two
   // addresses for one box. Display-only; absent until a probe has seen it.
@@ -8716,8 +8720,8 @@ function sanitizeRegistryConnection(entry) {
 
   return {
     ...rest,
-    tokenSet: Boolean(decrypted),
-    tokenPreview: tokenPreview(decrypted),
+    tokenSet: storedTokenSet,
+    tokenPreview: '',
     ...(knownInstallId ? { installId: knownInstallId } : {}),
     // Header VALUES are secrets (Cloudflare Access client secrets etc.) and
     // never cross the IPC boundary — the renderer only needs the names to
@@ -8852,10 +8856,17 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
 
   const savedSsh = savedMode === 'local' ? (key ? savedProfileSsh(config, key) : normalizeSshConfig(block)) : null
 
-  const remoteToken = decryptDesktopSecret(block.token)
   const authMode = normAuthMode(block.authMode)
   const remoteUrl = envOverride ? String(process.env.HERMES_DESKTOP_REMOTE_URL || '') : String(block.url || '')
   const mode = envOverride ? 'remote' : savedMode === 'ssh' ? 'ssh' : modeIsRemoteLike(savedMode) ? savedMode : 'local'
+  // Local boot must not synchronously unlock/decrypt a dormant remote token.
+  // macOS Keychain may block SecItemCopyMatching indefinitely for an unsigned
+  // or freshly replaced Desktop build, freezing the entire Electron main loop
+  // before the local backend can finish connecting. Preserve the renderer's
+  // "token is set" signal from the opaque stored blob; decrypt only when the
+  // selected route can actually use remote credentials.
+  const remoteToken = mode === 'local' ? '' : decryptDesktopSecret(block.token)
+  const storedRemoteTokenSet = Boolean(block.token && typeof block.token === 'object' && block.token.value)
 
   // Whether the OS keyring (safeStorage) can encrypt the saved token. When
   // false the renderer knows to offer the plain-text opt-in in Settings →
@@ -8901,7 +8912,7 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
     // remote/local. Lets Settings → Gateway reopen into the same org.
     cloudOrg: mode === 'cloud' ? String(block.org || '') : '',
     remoteTokenPreview: tokenPreview(remoteToken),
-    remoteTokenSet: Boolean(remoteToken),
+    remoteTokenSet: mode === 'local' ? storedRemoteTokenSet : Boolean(remoteToken),
     // Whether the OS keyring can encrypt a token; drives the plain-text opt-in
     // affordance in Settings → Gateway on keyring-less Linux.
     secureTokenStorage,
