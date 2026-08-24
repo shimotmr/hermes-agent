@@ -732,7 +732,15 @@ def should_require_dashboard_auth(
     ``dashboard.public_url`` requires authentication even when a reverse proxy
     reaches a backend bound to loopback. Callers may pass the already-resolved
     host set so startup and request validation use the same snapshot.
+
+    A Desktop-owned child is a distinct private loopback service with a random
+    process token. It must not inherit the operator-facing dashboard's public
+    URL/auth mode; otherwise ``/api/ws?token=...`` is rejected as gated even
+    though the child is reachable only on loopback. This exception never
+    weakens a non-loopback bind.
     """
+    if host in _LOOPBACK_HOST_VALUES and os.environ.get("HERMES_DESKTOP") == "1":
+        return False
     if trusted_public_hosts is None:
         trusted_public_hosts = _dashboard_public_hosts()
     return should_require_auth(host) or any(
