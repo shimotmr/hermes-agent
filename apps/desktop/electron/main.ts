@@ -137,7 +137,11 @@ import {
   updateEligibility,
   upsertConnection
 } from './connection-registry'
-import { registryTokenMetadata, resolveRemoteTokenMetadata } from './connection-secret-metadata'
+import {
+  registryTokenMetadata,
+  resolveRemoteTokenMetadata,
+  shouldCheckNativeOauthSession
+} from './connection-secret-metadata'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
@@ -8886,7 +8890,7 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
 
   let remoteOauthConnected = false
 
-  if (authMode === 'oauth' && remoteUrl) {
+  if (shouldCheckNativeOauthSession(mode, authMode, remoteUrl)) {
     try {
       // Display signal: treat a live RT cookie as "connected" even if the AT
       // cookie has lapsed — the gateway refreshes the AT on the next request,

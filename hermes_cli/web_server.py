@@ -739,14 +739,19 @@ def should_require_dashboard_auth(
     though the child is reachable only on loopback. This exception never
     weakens a non-loopback bind.
     """
-    if host in _LOOPBACK_HOST_VALUES and os.environ.get("HERMES_DESKTOP") == "1":
-        return False
     if trusted_public_hosts is None:
-        trusted_public_hosts = _dashboard_public_hosts()
+        trusted_public_hosts = _dashboard_public_hosts_for_startup(host)
     return should_require_auth(host) or any(
         candidate not in _LOOPBACK_HOST_VALUES
         for candidate in trusted_public_hosts
     )
+
+
+def _dashboard_public_hosts_for_startup(host: str) -> frozenset[str]:
+    """Resolve public Host trust without leaking it into a private Desktop child."""
+    if host in _LOOPBACK_HOST_VALUES and os.environ.get("HERMES_DESKTOP") == "1":
+        return frozenset()
+    return _dashboard_public_hosts()
 
 
 def _host_header_hostname(host_header: str) -> str:
@@ -19396,7 +19401,7 @@ def start_server(
     # request middleware never reloads config. Any non-loopback public hostname
     # engages the auth gate even when the backend itself remains on loopback;
     # otherwise the SPA's local session token would become remotely reachable.
-    app.state.trusted_public_hosts = _dashboard_public_hosts()
+    app.state.trusted_public_hosts = _dashboard_public_hosts_for_startup(host)
     # Stash the auth-gate flag on app.state so middleware / SPA-token injection /
     # WS-auth paths can branch on it consistently. It also decides whether to
     # refuse startup, log the gate-on banner, and enable uvicorn proxy_headers.

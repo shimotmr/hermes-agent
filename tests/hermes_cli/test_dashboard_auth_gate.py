@@ -222,8 +222,10 @@ def test_start_server_gate_with_provider_proceeds_and_sets_proxy_headers(monkeyp
     captured = _stub_uvicorn_run(monkeypatch)
     try:
         web_server.app.state.auth_required = None
+        # This test exercises auth/proxy-header wiring, not a fixed listener.
+        # Use an ephemeral port so a running Hermes gateway cannot collide.
         web_server.start_server(
-            host="0.0.0.0", port=9119,
+            host="0.0.0.0", port=0,
             open_browser=False, allow_public=False,
         )
         assert web_server.app.state.auth_required is True
@@ -267,6 +269,39 @@ def test_desktop_private_loopback_ignores_operator_public_url(monkeypatch):
 
     assert should_require_dashboard_auth("127.0.0.1") is False
     assert should_require_dashboard_auth("0.0.0.0") is True
+
+
+def test_start_server_desktop_loopback_discards_operator_public_host(monkeypatch):
+    """Desktop token mode must remain unreachable through the public hostname."""
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+
+    web_server.start_server(
+        host="127.0.0.1", port=0,
+        open_browser=False, allow_public=False,
+    )
+
+    assert web_server.app.state.auth_required is False
+    assert web_server.app.state.trusted_public_hosts == frozenset()
+    assert web_server._is_accepted_host(
+        "dashboard.example.test", "127.0.0.1",
+        web_server.app.state.trusted_public_hosts,
+    ) is False
+    assert web_server._is_accepted_host(
+        "127.0.0.1", "127.0.0.1",
+        web_server.app.state.trusted_public_hosts,
+    ) is True
 
 
 def test_start_server_loopback_public_url_enables_gate(monkeypatch):

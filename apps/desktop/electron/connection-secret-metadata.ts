@@ -29,4 +29,8 @@ function registryTokenMetadata(storedSecret: StoredSecret, _decrypt: DecryptSecr
   }
 }
 
-export { registryTokenMetadata, resolveRemoteTokenMetadata }
+function shouldCheckNativeOauthSession(mode: string, authMode: string, remoteUrl: string): boolean {
+  return mode !== 'local' && authMode === 'oauth' && Boolean(remoteUrl)
+}
+
+export { registryTokenMetadata, resolveRemoteTokenMetadata, shouldCheckNativeOauthSession }

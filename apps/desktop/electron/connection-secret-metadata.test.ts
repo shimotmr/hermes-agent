@@ -2,7 +2,9 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { registryTokenMetadata, resolveRemoteTokenMetadata } from './connection-secret-metadata'
+import * as secretMetadata from './connection-secret-metadata'
+
+const { registryTokenMetadata, resolveRemoteTokenMetadata } = secretMetadata
 
 const stored = { encoding: 'safeStorage', value: 'opaque-ciphertext-bytes' }
 
@@ -59,4 +61,26 @@ test('registry metadata neither decrypts nor exposes token bytes or a plaintext 
   assert.deepEqual(metadata, { tokenSet: true, tokenPreview: '' })
   assert.equal(JSON.stringify(metadata).includes(stored.value), false)
   assert.equal(JSON.stringify(metadata).includes('plaintext-secret'), false)
+})
+
+test('local connection metadata never checks a dormant native OAuth session', () => {
+  const shouldCheckNativeOauthSession = (
+    secretMetadata as typeof secretMetadata & {
+      shouldCheckNativeOauthSession?: (mode: string, authMode: string, remoteUrl: string) => boolean
+    }
+  ).shouldCheckNativeOauthSession
+
+  assert.equal(typeof shouldCheckNativeOauthSession, 'function')
+  assert.equal(shouldCheckNativeOauthSession?.('local', 'oauth', 'https://remote.example.test'), false)
+})
+
+test('selected remote OAuth metadata still checks its native session', () => {
+  const shouldCheckNativeOauthSession = (
+    secretMetadata as typeof secretMetadata & {
+      shouldCheckNativeOauthSession?: (mode: string, authMode: string, remoteUrl: string) => boolean
+    }
+  ).shouldCheckNativeOauthSession
+
+  assert.equal(typeof shouldCheckNativeOauthSession, 'function')
+  assert.equal(shouldCheckNativeOauthSession?.('remote', 'oauth', 'https://remote.example.test'), true)
 })
