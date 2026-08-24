@@ -1594,8 +1594,17 @@ async function drainRelayOutboxes() {
           clearBotAttention(attentionKey)
           await postReply({ reply: String(res?.reply || '') })
         } catch (error) {
-          noteBotAttention(attentionKey, error?.message || error)
-          await postReply({ error: String(error?.message || error || 'delivery failed') })
+          // #93091: bot_relay.deliver classifies the failed turn and ships the
+          // typed code in the JSON-RPC error's `data.reason`; forward it into
+          // the sender-side reply file so the waiter (and the sending agent)
+          // get the machine-readable cause, and prefer it for the badge —
+          // classified codes beat free-text re-parsing.
+          const reason = String(error?.data?.reason || '').trim()
+          noteBotAttention(attentionKey, reason || error?.message || error)
+          await postReply({
+            error: String(error?.message || error || 'delivery failed'),
+            ...(reason ? { reason } : {})
+          })
         }
       }
     }
@@ -2093,10 +2102,23 @@ function hideOwnedBotSessions() {
 // user's real conversation inside a bot profile keeps whatever title the
 // user gave it and is never touched.
 const BOT_MODE_SWEEP_TITLES = new Set(['Bot Chat', 'Agent Inbox'])
+const BOT_MODE_SWEEP_MIN_AGE_SECONDS = 5 * 60
 
 function isBotModeSweepTitle(title) {
   const t = String(title || '').trim()
   return BOT_MODE_SWEEP_TITLES.has(t) || t.startsWith('Group: ')
+}
+
+function isBotModeSweepCandidate(row, nowSeconds = Date.now() / 1000) {
+  const startedAt = Number(row?.started_at)
+  return (
+    row &&
+    row.id &&
+    isBotModeSweepTitle(row.title) &&
+    Number.isFinite(startedAt) &&
+    startedAt > 0 &&
+    nowSeconds - startedAt >= BOT_MODE_SWEEP_MIN_AGE_SECONDS
+  )
 }
 
 /** Ownership-based sweep: the id-based sweep above only covers sessions the
@@ -2106,12 +2128,17 @@ function isBotModeSweepTitle(title) {
  *  profile) — and those ids the plugin never learns. So: enumerate each
  *  roster bot's OWN profile sessions (only bot profiles — a non-bot profile
  *  is never listed, so its sessions are never touched) and hide any VISIBLE
- *  row whose title is Bot Mode plumbing. session.list without include_hidden
- *  returns only visible rows, which keeps the sweep naturally idempotent.
+ *  row whose title is Bot Mode plumbing and whose creation grace period has
+ *  elapsed. The grace period protects a new desktop draft while its first-turn
+ *  title is pending; after five minutes an unchanged plumbing title is treated
+ *  as Bot Mode-owned. session.list supplies epoch seconds; missing, malformed,
+ *  millisecond, or future timestamps fail closed and stay visible. session.list
+ *  without include_hidden returns only visible rows, which keeps the sweep
+ *  naturally idempotent.
  *  Remote-source bots route to their own connection via requestForBot.
  *  Feature-detected + fire-and-forget: older gateways without per-profile
  *  session.list / session.set_hidden simply reject and the sweep no-ops. */
-async function sweepBotProfileSessions() {
+async function sweepBotProfileSessions(nowSeconds = Date.now() / 1000) {
   const cached = $lastRoster.get()
   let roster = Array.isArray(cached) && cached.length ? cached : null
 
@@ -2142,7 +2169,7 @@ async function sweepBotProfileSessions() {
 
         await Promise.all(
           rows
-            .filter(row => row && row.id && isBotModeSweepTitle(row.title))
+            .filter(row => isBotModeSweepCandidate(row, nowSeconds))
             .map(row =>
               Promise.resolve(
                 requestForBot(bot, 'session.set_hidden', { session_id: row.id, hidden: true, profile: name })
@@ -6631,6 +6658,17 @@ async function ensureGroupChatSession(group, member) {
   const known = room.sessions && room.sessions[key]
 
   // Try resuming what we know (stored sid first, then title lookup).
+  //
+  // FAIL CLOSED on a transient lookup failure — mirrors the sibling fix in
+  // findExistingCanonicalChat (87b645f52c). session.resume signals "this
+  // target genuinely doesn't exist" with JSON-RPC code 4007; every other
+  // failure (network blip, the backend still warming up after a restart,
+  // an oversized-resume refusal) means the real session might still be
+  // there and must not be read as "no session, mint a new one" — that
+  // forks the member's real history, and the fork silently overwrites
+  // room.sessions[key] so the old session becomes unreachable from the
+  // room. Only a genuine 4007 on BOTH targets means there truly is nothing
+  // to resume yet, so the loop falls through to session.create below.
   for (const target of [known, title]) {
     if (!target || target === true) {
       continue
@@ -6656,8 +6694,12 @@ async function ensureGroupChatSession(group, member) {
 
         return { runtime: res.session_id, stored }
       }
-    } catch {
-      /* fall through to create */
+    } catch (error) {
+      if (error?.code !== 4007) {
+        const detail = error instanceof Error && error.message ? ` (${error.message})` : ''
+        throw new Error(`Could not check ${member?.name || 'member'}'s group session${detail} — not starting a new one`)
+      }
+      /* genuinely doesn't exist (4007) — try the next target / fall through to create */
     }
   }
 
