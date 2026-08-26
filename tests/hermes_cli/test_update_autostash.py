@@ -7,6 +7,7 @@ import pytest
 
 from hermes_cli import config as hermes_config
 from hermes_cli import main as hermes_main
+from hermes_cli import update_cmd
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +119,7 @@ def _make_update_side_effect(
     reset_fails=False,
     fetch_fails=False,
     fetch_stderr="",
+    local_only_count="0",
 ):
     """Build a subprocess.run side_effect for cmd_update tests."""
     recorded = []
@@ -133,6 +135,10 @@ def _make_update_side_effect(
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if "rev-list" in joined and "..HEAD" in joined:
+            return SimpleNamespace(
+                stdout=f"{local_only_count}\n", stderr="", returncode=0
+            )
         if "rev-list" in joined:
             return SimpleNamespace(stdout=f"{commit_count}\n", stderr="", returncode=0)
         if "--ff-only" in joined:
@@ -150,6 +156,310 @@ def _make_update_side_effect(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     return side_effect, recorded
+
+
+# ---------------------------------------------------------------------------
+# Same-branch local commits must survive divergence fallback
+# ---------------------------------------------------------------------------
+
+
+def test_same_branch_divergence_detects_local_only_commits(monkeypatch, tmp_path):
+    """A positive reachability count authorizes merge-over-reset."""
+    monkeypatch.setattr(
+        update_cmd.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout="1\n",
+            stderr="",
+            returncode=0,
+        ),
+    )
+
+    assert update_cmd._same_branch_has_local_only_commits(
+        ["git"], tmp_path, "origin/main"
+    ) is True
+
+
+def test_same_branch_divergence_distinguishes_remote_rewrite(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        update_cmd.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout="0\n",
+            stderr="",
+            returncode=0,
+        ),
+    )
+
+    assert update_cmd._same_branch_has_local_only_commits(
+        ["git"], tmp_path, "origin/main"
+    ) is False
+
+
+def test_same_branch_divergence_fails_closed_when_reachability_is_unverifiable(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        update_cmd.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout="",
+            stderr="fatal: shallow history",
+            returncode=128,
+        ),
+    )
+
+    assert update_cmd._same_branch_has_local_only_commits(
+        ["git"], tmp_path, "origin/main"
+    ) is None
+
+
+def test_merge_abort_verification_requires_restored_head_and_clean_index(
+    monkeypatch, tmp_path
+):
+    responses = iter(
+        [
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="before-sha\n", stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ]
+    )
+    monkeypatch.setattr(update_cmd.subprocess, "run", lambda *a, **kw: next(responses))
+
+    ok, detail = update_cmd._abort_merge_and_verify(
+        ["git"], tmp_path, "before-sha"
+    )
+
+    assert ok is True
+    assert detail == ""
+
+
+@pytest.mark.parametrize(
+    ("responses", "expected_detail"),
+    [
+        (
+            [SimpleNamespace(returncode=1, stdout="", stderr="abort failed")],
+            "merge_abort_failed",
+        ),
+        (
+            [
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+                SimpleNamespace(returncode=0, stdout="different-sha\n", stderr=""),
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ],
+            "head_not_restored",
+        ),
+        (
+            [
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+                SimpleNamespace(returncode=0, stdout="before-sha\n", stderr=""),
+                SimpleNamespace(returncode=0, stdout="conflicted.py\n", stderr=""),
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ],
+            "unmerged_entries_remain",
+        ),
+        (
+            [
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+                SimpleNamespace(returncode=0, stdout="before-sha\n", stderr=""),
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+                SimpleNamespace(returncode=0, stdout=" M tracked.py\n", stderr=""),
+            ],
+            "tracked_changes_remain",
+        ),
+    ],
+)
+def test_merge_abort_verification_fails_closed(
+    monkeypatch, tmp_path, responses, expected_detail
+):
+    queued = iter(responses)
+    monkeypatch.setattr(update_cmd.subprocess, "run", lambda *a, **kw: next(queued))
+
+    ok, detail = update_cmd._abort_merge_and_verify(
+        ["git"], tmp_path, "before-sha"
+    )
+
+    assert ok is False
+    assert detail == expected_detail
+
+
+def test_same_branch_local_commit_survives_real_git_merge(tmp_path):
+    """Real Git oracle: local fix + remote update both survive the fallback."""
+    import subprocess
+
+    origin = tmp_path / "origin.git"
+    local = tmp_path / "local"
+    peer = tmp_path / "peer"
+
+    def run(*args, cwd=None):
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    run("init", "-q", "--bare", str(origin))
+    run("clone", "-q", str(origin), str(local))
+    run("config", "user.email", "test@example.com", cwd=local)
+    run("config", "user.name", "Test", cwd=local)
+    run("checkout", "-q", "-b", "main", cwd=local)
+    (local / "base.txt").write_text("base\n")
+    run("add", "base.txt", cwd=local)
+    run("commit", "-qm", "base", cwd=local)
+    run("push", "-q", "-u", "origin", "main", cwd=local)
+
+    (local / "desktop-fix.txt").write_text("preserved\n")
+    run("add", "desktop-fix.txt", cwd=local)
+    run("commit", "-qm", "local desktop fix", cwd=local)
+
+    run("clone", "-q", "--branch", "main", str(origin), str(peer))
+    run("config", "user.email", "test@example.com", cwd=peer)
+    run("config", "user.name", "Test", cwd=peer)
+    (peer / "upstream.txt").write_text("update\n")
+    run("add", "upstream.txt", cwd=peer)
+    run("commit", "-qm", "upstream update", cwd=peer)
+    run("push", "-q", cwd=peer)
+
+    run("fetch", "-q", "origin", cwd=local)
+    assert update_cmd._same_branch_has_local_only_commits(
+        ["git"], local, "origin/main"
+    ) is True
+    run("merge", "--no-edit", "origin/main", cwd=local)
+
+    assert (local / "desktop-fix.txt").read_text() == "preserved\n"
+    assert (local / "upstream.txt").read_text() == "update\n"
+
+
+def test_merge_abort_verification_real_git_conflict(tmp_path):
+    """A real conflicted merge must restore HEAD, index, and the local tree."""
+    import subprocess
+
+    origin = tmp_path / "origin.git"
+    local = tmp_path / "local"
+    peer = tmp_path / "peer"
+
+    def run(*args, cwd=None, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    run("init", "-q", "--bare", str(origin))
+    run("clone", "-q", str(origin), str(local))
+    run("config", "user.email", "test@example.com", cwd=local)
+    run("config", "user.name", "Test", cwd=local)
+    run("checkout", "-q", "-b", "main", cwd=local)
+    (local / "conflict.txt").write_text("base\n")
+    run("add", "conflict.txt", cwd=local)
+    run("commit", "-qm", "base", cwd=local)
+    run("push", "-q", "-u", "origin", "main", cwd=local)
+
+    run("clone", "-q", "--branch", "main", str(origin), str(peer))
+    run("config", "user.email", "test@example.com", cwd=peer)
+    run("config", "user.name", "Test", cwd=peer)
+    (peer / "conflict.txt").write_text("remote\n")
+    run("add", "conflict.txt", cwd=peer)
+    run("commit", "-qm", "remote change", cwd=peer)
+    run("push", "-q", cwd=peer)
+
+    (local / "conflict.txt").write_text("local\n")
+    run("add", "conflict.txt", cwd=local)
+    run("commit", "-qm", "local change", cwd=local)
+    pre_merge = run("rev-parse", "HEAD", cwd=local).stdout.strip()
+    run("fetch", "-q", "origin", cwd=local)
+    conflict = run("merge", "--no-edit", "origin/main", cwd=local, check=False)
+    assert conflict.returncode != 0
+    assert run(
+        "diff", "--name-only", "--diff-filter=U", cwd=local
+    ).stdout.strip() == "conflict.txt"
+
+    restored, detail = update_cmd._abort_merge_and_verify(
+        ["git"], local, pre_merge
+    )
+
+    assert restored is True
+    assert detail == ""
+    assert run("rev-parse", "HEAD", cwd=local).stdout.strip() == pre_merge
+    assert run(
+        "status", "--porcelain", "--untracked-files=no", cwd=local
+    ).stdout == ""
+    assert (local / "conflict.txt").read_text() == "local\n"
+
+
+def test_same_branch_local_merge_commit_is_not_invisible(tmp_path):
+    """Regression: `git cherry` omits merges; reachability must preserve them."""
+    import subprocess
+
+    origin = tmp_path / "origin.git"
+    local = tmp_path / "local"
+    peer = tmp_path / "peer"
+
+    def run(*args, cwd=None):
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    run("init", "-q", "--bare", str(origin))
+    run("clone", "-q", str(origin), str(local))
+    run("config", "user.email", "test@example.com", cwd=local)
+    run("config", "user.name", "Test", cwd=local)
+    run("checkout", "-q", "-b", "main", cwd=local)
+    (local / "base.txt").write_text("base\n")
+    run("add", "base.txt", cwd=local)
+    run("commit", "-qm", "base", cwd=local)
+    base = run("rev-parse", "HEAD", cwd=local).stdout.strip()
+    (local / "remote-parent.txt").write_text("parent\n")
+    run("add", "remote-parent.txt", cwd=local)
+    run("commit", "-qm", "remote parent", cwd=local)
+    remote_parent = run("rev-parse", "HEAD", cwd=local).stdout.strip()
+    run("push", "-q", "-u", "origin", "main", cwd=local)
+
+    # Build a local-only merge commit whose parents are both already reachable
+    # from origin/main. Git cherry prints nothing for this commit even though its
+    # tree contains a unique Desktop fix.
+    (local / "desktop-merge-fix.txt").write_text("must survive\n")
+    run("add", "desktop-merge-fix.txt", cwd=local)
+    tree = run("write-tree", cwd=local).stdout.strip()
+    merge_commit = run(
+        "commit-tree",
+        tree,
+        "-p",
+        remote_parent,
+        "-p",
+        base,
+        "-m",
+        "local merge fix",
+        cwd=local,
+    ).stdout.strip()
+    run("update-ref", "refs/heads/main", merge_commit, cwd=local)
+    assert run("cherry", "origin/main", "HEAD", cwd=local).stdout == ""
+
+    run("clone", "-q", "--branch", "main", str(origin), str(peer))
+    run("config", "user.email", "test@example.com", cwd=peer)
+    run("config", "user.name", "Test", cwd=peer)
+    (peer / "upstream-next.txt").write_text("next\n")
+    run("add", "upstream-next.txt", cwd=peer)
+    run("commit", "-qm", "upstream next", cwd=peer)
+    run("push", "-q", cwd=peer)
+    run("fetch", "-q", "origin", cwd=local)
+
+    assert run(
+        "rev-list", "--count", "origin/main..HEAD", cwd=local
+    ).stdout.strip() == "1"
+    assert update_cmd._same_branch_has_local_only_commits(
+        ["git"], local, "origin/main"
+    ) is True
 
 
 # ---------------------------------------------------------------------------

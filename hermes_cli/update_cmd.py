@@ -1983,6 +1983,90 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         logger.debug("Update receipt finalize (zip path) failed: %s", _receipt_exc)
     return desktop_build_ok
 
+def _same_branch_has_local_only_commits(
+    git_cmd: list[str], cwd: Path, remote_ref: str
+) -> Optional[bool]:
+    """Classify same-branch divergence without risking committed local work.
+
+    Reachability is the required oracle: ``git rev-list --count
+    <remote>..HEAD`` includes ordinary and merge commits that are not ancestors
+    of the remote. ``git cherry`` is insufficient because it omits merge
+    commits. A failed or malformed probe is indeterminate and must fail closed.
+    """
+    result = subprocess.run(
+        git_cmd + ["rev-list", "--count", f"{remote_ref}..HEAD"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip()) > 0
+    except (TypeError, ValueError):
+        return None
+
+
+def _abort_merge_and_verify(
+    git_cmd: list[str], cwd: Path, pre_merge_sha: Optional[str]
+) -> tuple[bool, str]:
+    """Abort a failed update merge and prove the repository was restored."""
+    if not pre_merge_sha:
+        return False, "pre_merge_sha_missing"
+
+    abort = subprocess.run(
+        git_cmd + ["merge", "--abort"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if abort.returncode != 0:
+        return False, "merge_abort_failed"
+
+    head = subprocess.run(
+        git_cmd + ["rev-parse", "HEAD"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if head.returncode != 0 or head.stdout.strip() != pre_merge_sha:
+        return False, "head_not_restored"
+
+    unmerged = subprocess.run(
+        git_cmd + ["diff", "--name-only", "--diff-filter=U"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if unmerged.returncode != 0:
+        return False, "repo_state_unverifiable"
+    if unmerged.stdout.strip():
+        return False, "unmerged_entries_remain"
+
+    tracked = subprocess.run(
+        git_cmd + ["status", "--porcelain", "--untracked-files=no"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if tracked.returncode != 0:
+        return False, "repo_state_unverifiable"
+    if tracked.stdout.strip():
+        return False, "tracked_changes_remain"
+
+    return True, ""
+
+
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
@@ -6827,11 +6911,39 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     ).stdout
                     or ""
                 ).strip()
-                if _cur_branch and _cur_branch != branch:
-                    print(
-                        f"  ⚠ Checkout is on custom branch '{_cur_branch}' — "
-                        f"merging origin/{branch} instead of resetting so local commits survive..."
+                _remote_ref = f"origin/{branch}"
+                _same_branch_local_commits: Optional[bool] = False
+                if not _cur_branch or _cur_branch == branch:
+                    _same_branch_local_commits = _same_branch_has_local_only_commits(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        _remote_ref,
                     )
+                    if _same_branch_local_commits is None:
+                        print(
+                            "✗ Could not verify whether the target branch has "
+                            "local-only commits — refusing destructive reset."
+                        )
+                        print(
+                            f"  Inspect manually: git rev-list --count {_remote_ref}..HEAD"
+                        )
+                        sys.exit(1)
+
+                _must_merge = bool(
+                    (_cur_branch and _cur_branch != branch)
+                    or _same_branch_local_commits
+                )
+                if _must_merge:
+                    if _cur_branch and _cur_branch != branch:
+                        print(
+                            f"  ⚠ Checkout is on custom branch '{_cur_branch}' — "
+                            f"merging {_remote_ref} instead of resetting so local commits survive..."
+                        )
+                    else:
+                        print(
+                            f"  ⚠ Target branch '{branch}' has local-only commit(s) — "
+                            f"merging {_remote_ref} instead of resetting so they survive..."
+                        )
                     # Best-effort safety tag; recovery anchor if anything goes wrong.
                     subprocess.run(
                         git_cmd
@@ -6841,49 +6953,62 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         check=False,
                     )
                     merge_result = subprocess.run(
-                        git_cmd + ["merge", "--no-edit", f"origin/{branch}"],
+                        git_cmd + ["merge", "--no-edit", _remote_ref],
                         cwd=_m().PROJECT_ROOT,
                         capture_output=True,
                         text=True, encoding="utf-8", errors="replace",
                     )
                     if merge_result.returncode != 0:
-                        subprocess.run(
-                            git_cmd + ["merge", "--abort"],
-                            cwd=_m().PROJECT_ROOT,
-                            capture_output=True,
-                            check=False,
+                        restored, restore_detail = _abort_merge_and_verify(
+                            git_cmd,
+                            _m().PROJECT_ROOT,
+                            pre_pull_sha,
                         )
-                        print(
-                            "✗ Merge conflict between local commits and upstream — "
-                            "update stopped, nothing was changed."
-                        )
-                        print(
-                            f"  Resolve manually: cd {_m().PROJECT_ROOT} && "
-                            f"git merge origin/{branch}"
-                        )
-                        print(
-                            "  Then re-run the update. Local work is untouched."
-                        )
+                        if restored:
+                            print(
+                                "✗ Merge conflict between local commits and upstream — "
+                                "update stopped; the merge was aborted and HEAD was restored."
+                            )
+                            print(
+                                f"  Resolve manually: cd {_m().PROJECT_ROOT} && "
+                                f"git merge {_remote_ref}"
+                            )
+                            print(
+                                "  Then re-run the update. Local committed work was preserved."
+                            )
+                        else:
+                            print(
+                                "✗ Merge conflict between local commits and upstream, "
+                                "and automatic recovery could not be verified."
+                            )
+                            print(f"  Recovery status: {restore_detail}")
+                            print("  The repository may still contain merge state or conflicts.")
+                            print("  Inspect and recover before running Hermes again:")
+                            print(f"    cd {_m().PROJECT_ROOT}")
+                            print("    git status")
+                            print("    git merge --abort")
+                            if pre_pull_sha:
+                                print(f"    git reset --merge {pre_pull_sha}")
                         sys.exit(1)
                 else:
-                    # Same branch as the update target — a true upstream
-                    # force-push/rebase. Local changes are already stashed;
-                    # reset to match the remote exactly (original behaviour).
+                    # Git proved there are no local-only commits. The same-branch
+                    # divergence is therefore an upstream force-push/rebase, and
+                    # the managed checkout may safely follow the remote exactly.
                     print(
                         "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                     )
                     reset_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        git_cmd + ["reset", "--hard", _remote_ref],
                         cwd=_m().PROJECT_ROOT,
                         capture_output=True,
                         text=True, encoding="utf-8", errors="replace",
                     )
                     if reset_result.returncode != 0:
-                        print(f"✗ Failed to reset to origin/{branch}.")
+                        print(f"✗ Failed to reset to {_remote_ref}.")
                         if reset_result.stderr.strip():
                             print(f"  {reset_result.stderr.strip()}")
                         print(
-                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                            f"  Try manually: git fetch origin && git reset --hard {_remote_ref}"
                         )
                         sys.exit(1)
 
