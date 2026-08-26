@@ -182,6 +182,8 @@ def _fake_ws(
     client_host: str = "127.0.0.1",
     path: str = "/api/pty",
     protocols: tuple[str, ...] = (),
+    host: str = "127.0.0.1:9119",
+    origin: str = "",
 ):
     """Build a stand-in for starlette.WebSocket good enough for _ws_auth_ok."""
 
@@ -192,9 +194,15 @@ def _fake_ws(
         def get(self, k, default=""):
             return self._q.get(k, default)
 
+    headers = {"host": host}
+    if origin:
+        headers["origin"] = origin
+    if protocols:
+        headers["sec-websocket-protocol"] = ", ".join(protocols)
+
     return SimpleNamespace(
         query_params=_QP(query),
-        headers={"sec-websocket-protocol": ", ".join(protocols)} if protocols else {},
+        headers=headers,
         client=SimpleNamespace(host=client_host),
         url=SimpleNamespace(path=path),
     )
@@ -260,11 +268,73 @@ class TestWsAuthOkGated:
         assert web_server._ws_auth_ok(ambiguous) is False
 
 
-    def test_legacy_token_rejected_in_gated_mode(self, gated_app):
+    def test_legacy_token_rejected_in_gated_mode(self, gated_app, monkeypatch):
         """Critical: gated mode must NOT honour the legacy token path
         even when someone has access to the in-process value of
         _SESSION_TOKEN (e.g. a leaked log line)."""
+        monkeypatch.delenv("HERMES_DESKTOP", raising=False)
         ws = _fake_ws(query={"token": web_server._SESSION_TOKEN})
+        assert web_server._ws_auth_ok(ws) is False
+
+    def test_desktop_session_token_accepted_only_for_gateway_ws(
+        self,
+        gated_app,
+        monkeypatch,
+    ):
+        """Desktop's process token may cross only the native loopback seam."""
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_SESSION_TOKEN",
+            web_server._SESSION_TOKEN,
+        )
+
+        gateway_ws = _fake_ws(
+            query={"token": web_server._SESSION_TOKEN},
+            path="/api/ws",
+        )
+        wrong_token = _fake_ws(query={"token": "wrong"}, path="/api/ws")
+        remote_peer = _fake_ws(
+            query={"token": web_server._SESSION_TOKEN},
+            path="/api/ws",
+            client_host="198.51.100.9",
+        )
+        public_proxy_host = _fake_ws(
+            query={"token": web_server._SESSION_TOKEN},
+            path="/api/ws",
+            host="dashboard.example.test:9443",
+            origin="https://dashboard.example.test:9443",
+        )
+        public_proxy_origin = _fake_ws(
+            query={"token": web_server._SESSION_TOKEN},
+            path="/api/ws",
+            origin="https://dashboard.example.test:9443",
+        )
+        pty_ws = _fake_ws(
+            query={"token": web_server._SESSION_TOKEN},
+            path="/api/pty",
+        )
+
+        assert web_server._ws_auth_reason(gateway_ws) == (
+            None,
+            "desktop-token",
+        )
+        assert web_server._ws_auth_ok(wrong_token) is False
+        assert web_server._ws_auth_ok(remote_peer) is False
+        assert web_server._ws_auth_ok(public_proxy_host) is False
+        assert web_server._ws_auth_ok(public_proxy_origin) is False
+        assert web_server._ws_auth_ok(pty_ws) is False
+
+    def test_desktop_marker_rejects_weak_process_token(
+        self,
+        gated_app,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "a")
+        monkeypatch.setattr(web_server, "_SESSION_TOKEN", "a")
+
+        ws = _fake_ws(query={"token": "a"}, path="/api/ws")
+        assert web_server._desktop_session_token_enabled() is False
         assert web_server._ws_auth_ok(ws) is False
 
     def test_rejection_audit_logs(self, gated_app, tmp_path, monkeypatch):
@@ -472,4 +542,3 @@ class TestGatewayWsUrl:
         gw_cred = gw.split("internal=")[1].split("&")[0]
         sc_cred = sc.split("internal=")[1].split("&")[0]
         assert gw_cred == sc_cred
-

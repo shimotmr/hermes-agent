@@ -58,6 +58,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_cli import __version__, __release_date__
+from hermes_cli.dashboard_auth.base import TokenPrincipal as _TokenPrincipal
 from hermes_cli.config import (
     build_cron_model_impact,
     cfg_get,
@@ -543,9 +544,34 @@ def _resolve_session_token() -> str:
 
 _SESSION_TOKEN = _resolve_session_token()
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
+_DESKTOP_TOKEN_PRINCIPAL = _TokenPrincipal(
+    principal="local-desktop",
+    provider="desktop-session-token",
+    scopes=("dashboard:api",),
+)
 _SSH_OWNER_NONCE: Optional[str] = None
 _SSH_RUNTIME_PURELIB: Optional[Tuple[str, int, int]] = None
 _SSH_RUNTIME_MARKER: Optional[str] = None
+
+
+def _desktop_session_token_enabled() -> bool:
+    """True only for Electron's exact 32-byte base64url process token."""
+    token = os.getenv("HERMES_DASHBOARD_SESSION_TOKEN", "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+        return False
+    try:
+        decoded = base64.b64decode(
+            token + "=",
+            altchars=b"-_",
+            validate=True,
+        )
+    except (binascii.Error, ValueError):
+        return False
+    return (
+        len(decoded) == 32
+        and os.getenv("HERMES_DESKTOP") == "1"
+        and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
+    )
 
 
 def _apply_ssh_session_token(token: str) -> None:
@@ -704,6 +730,13 @@ def _require_token(request: Request) -> None:
       endpoints permanently unreachable behind the gate. Defer to the gate.
     """
     if getattr(request.app.state, "auth_required", False):
+        # The native Desktop auth-gate seam validates and marks its exact
+        # process token before protected endpoint handlers run.
+        if (
+            getattr(request.state, "token_principal", None)
+            is _DESKTOP_TOKEN_PRINCIPAL
+        ):
+            return
         # Gate is authoritative. It attaches ``request.state.session`` on
         # success and 401s otherwise, so a request that reached us is already
         # authenticated. Belt-and-braces: confirm the session is present.
@@ -824,6 +857,56 @@ def _host_header_hostname(host_header: str) -> str:
             return ""
         return hostname.lower()
     return value.lower()
+
+
+def _desktop_loopback_boundary_reason(
+    *,
+    client_host: str,
+    host_header: str,
+    origin_header: str,
+    allowed_native_origins: frozenset[str] = frozenset(),
+) -> Optional[str]:
+    """Return why a native Desktop request escaped its loopback boundary."""
+    peer = (client_host or "").strip().lower()
+    if peer not in _LOOPBACK_HOST_VALUES:
+        return "desktop_peer_not_loopback"
+    if _host_header_hostname(host_header) not in _LOOPBACK_HOST_VALUES:
+        return "desktop_host_not_loopback"
+    if origin_header:
+        if origin_header in allowed_native_origins:
+            return None
+        try:
+            parsed = urllib.parse.urlparse(origin_header)
+        except ValueError:
+            return "desktop_origin_not_loopback"
+        if parsed.scheme not in {"http", "https"}:
+            return "desktop_origin_not_loopback"
+        if (
+            not parsed.netloc
+            or _host_header_hostname(parsed.netloc) not in _LOOPBACK_HOST_VALUES
+        ):
+            return "desktop_origin_not_loopback"
+    return None
+
+
+def _desktop_http_token_reason(request: Request) -> Optional[str]:
+    """Accept Electron's process token only on native loopback API requests."""
+    if not request.url.path.startswith("/api/"):
+        return "desktop_path_not_api"
+    if not _desktop_session_token_enabled():
+        return "desktop_token_disabled"
+    token = request.headers.get(_SESSION_HEADER_NAME, "")
+    if not token or not hmac.compare_digest(
+        token.encode(),
+        _SESSION_TOKEN.encode(),
+    ):
+        return "token_mismatch"
+    return _desktop_loopback_boundary_reason(
+        client_host=(request.client.host if request.client else ""),
+        host_header=request.headers.get("host", ""),
+        origin_header=request.headers.get("origin", ""),
+        allowed_native_origins=frozenset({"app://hermes"}),
+    )
 
 
 def _is_accepted_host(
@@ -975,6 +1058,16 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
 
 @app.middleware("http")
 async def _dashboard_auth_gate(request: Request, call_next):
+    # Electron's local REST bridge presents the same process token as its
+    # gateway WebSocket. Preserve the public OAuth gate for browser/proxy
+    # requests and bypass cookie auth only at the validated loopback seam.
+    if (
+        getattr(request.app.state, "auth_required", False)
+        and _desktop_http_token_reason(request) is None
+    ):
+        request.state.token_principal = _DESKTOP_TOKEN_PRINCIPAL
+        return await call_next(request)
+
     from hermes_cli.dashboard_auth.middleware import gated_auth_middleware
     return await gated_auth_middleware(request, call_next)
 
@@ -16461,10 +16554,12 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
 
     ``reason`` is None when the credential is accepted, else a short
     machine-parseable token explaining the rejection (``no_credential``,
-    ``token_mismatch``, ``ticket_invalid``, ``internal_invalid``).
+    ``token_mismatch``, ``desktop_peer_not_loopback``,
+    ``desktop_host_not_loopback``, ``desktop_origin_not_loopback``,
+    ``ticket_invalid``, ``internal_invalid``).
     ``credential`` names which credential type was presented (``ticket``,
-    ``internal``, ``token``, or ``none``) so the accepted path can log *how*
-    a peer authed, not just that it did.
+    ``internal``, ``desktop-token``, ``token``, or ``none``) so the accepted
+    path can log *how* a peer authed, not just that it did.
 
     Loopback / ``--insecure``: legacy ``?token=<_SESSION_TOKEN>`` query
     parameter, constant-time compared.
@@ -16481,15 +16576,48 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
       injected into the SPA — see ``dashboard_auth.ws_tickets`` for the
       threat model.
 
-    The legacy ``?token=`` path is unconditionally rejected in gated mode
-    (the SPA bundle isn't carrying the token any longer, and a leaked
-    ``_SESSION_TOKEN`` must not grant WS access once the gate is engaged).
+    In gated mode the legacy token remains rejected, except for the native
+    Desktop gateway transport at exactly ``/api/ws`` with both a loopback peer
+    and loopback Host authority. Electron mints and holds that high-entropy
+    process-lifetime token; gated SPA HTML never receives it. The Desktop marker
+    scopes the compatibility path, while possession of the token is the
+    credential. Other WS paths and ordinary gated dashboards still require a
+    ticket/internal credential.
 
     Audit-logs the rejection so operators can debug "WS keeps closing"
     issues from the log.
     """
     auth_required = bool(getattr(app.state, "auth_required", False))
     if auth_required:
+        # The native Desktop renderer already receives this process-lifetime
+        # token from Electron. Keep the OAuth gate and its no-token SPA
+        # bootstrap intact; only the exact gateway transport may present the
+        # token directly. A forged HERMES_DESKTOP marker alone grants nothing.
+        desktop_token = ws.query_params.get("token", "")
+        if (
+            _desktop_session_token_enabled()
+            and ws.url.path == "/api/ws"
+            and desktop_token
+        ):
+            if not hmac.compare_digest(
+                desktop_token.encode(),
+                _SESSION_TOKEN.encode(),
+            ):
+                return "token_mismatch", "desktop-token"
+            reason = _desktop_loopback_boundary_reason(
+                client_host=(
+                    str(ws.client.host)
+                    if ws.client and ws.client.host
+                    else ""
+                ),
+                host_header=str(ws.headers.get("host", "") or ""),
+                origin_header=str(ws.headers.get("origin", "") or ""),
+                allowed_native_origins=frozenset(
+                    {"file://", "null", "app://hermes"}
+                ),
+            )
+            return reason, "desktop-token"
+
         # Lazy import — keeps this function importable in test harnesses
         # that don't bring in the dashboard_auth layer.
         from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
@@ -19571,11 +19699,15 @@ def start_server(
         )
 
     if app.state.auth_required:
-        # The gate engages on every non-loopback bind. Require at least one
-        # provider to be registered, else fail closed — there is no longer an
-        # escape hatch that serves the dashboard without authentication.
+        # Require a provider for every browser-facing gated dashboard. The
+        # native Desktop's loopback child may boot without one only when its
+        # env token exactly matches this process: HTTP/SPA stay gated, while
+        # the narrow loopback /api/ws credential above remains usable.
         from hermes_cli.dashboard_auth import list_providers
-        if not list_providers():
+        if not list_providers() and not (
+            host in _LOOPBACK_HOST_VALUES
+            and _desktop_session_token_enabled()
+        ):
             # Surface the *specific* reason any bundled provider declined
             # to register (e.g. missing HERMES_DASHBOARD_OAUTH_CLIENT_ID).
             # Each provider plugin that ships with Hermes Agent exposes a
@@ -19737,16 +19869,16 @@ def start_server(
         except (TypeError, ValueError):
             return default
 
+    _desktop_private_listener = _is_loopback and _desktop_session_token_enabled()
+
     config = uvicorn.Config(
         app, host=host, port=port, log_level="warning",
-        # proxy_headers defaults to False so _ws_client_is_allowed sees
-        # the real connection peer rather than X-Forwarded-For's rewritten
-        # value (which would defeat the loopback gate when behind a reverse
-        # proxy).  When the OAuth gate is active we are explicitly running
-        # behind a TLS terminator (Fly.io) and need X-Forwarded-Proto to
-        # decide cookie Secure flags, so we flip proxy_headers on for that
-        # mode.
-        proxy_headers=bool(app.state.auth_required),
+        # Public OAuth dashboards need proxy headers for TLS/cookie handling.
+        # The native Desktop child is an independent random loopback listener;
+        # never let X-Forwarded-For rewrite the peer used by its token boundary.
+        proxy_headers=bool(
+            app.state.auth_required and not _desktop_private_listener
+        ),
         # Half-open detection for public binds only (see above). Loopback
         # disables the protocol ping (None) so an event-loop stall can never
         # trigger a false disconnect; a genuinely dead local client is still

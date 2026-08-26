@@ -138,6 +138,7 @@ def _stub_uvicorn_run(monkeypatch):
 
     monkeypatch.setattr(uvicorn, "Config", _FakeConfig)
     monkeypatch.setattr(uvicorn, "Server", lambda config: _FakeServer())
+    monkeypatch.setattr(web_server, "_port_bind_conflict", lambda *_args: False)
     return captured
 
 
@@ -255,6 +256,41 @@ def test_public_url_aware_gate_preserves_local_only_mode(monkeypatch):
     assert should_require_dashboard_auth("127.0.0.1") is False
 
 
+def test_start_server_desktop_loopback_preserves_public_host_gate(monkeypatch):
+    """Desktop changes WS credentials, never reverse-proxy trust."""
+    from hermes_cli.dashboard_auth import clear_providers, register_provider
+    from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    clear_providers()
+    register_provider(StubAuthProvider())
+    captured = _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+    try:
+        web_server.start_server(
+            host="127.0.0.1", port=9119,
+            open_browser=False, allow_public=False,
+        )
+        assert web_server.app.state.auth_required is True
+        assert web_server.app.state.trusted_public_hosts == frozenset(
+            {"dashboard.example.test"}
+        )
+        assert captured["kwargs"].get("host") == "127.0.0.1"
+        assert captured["kwargs"].get("proxy_headers") is True
+    finally:
+        clear_providers()
+
+
 def test_start_server_loopback_public_url_enables_gate(monkeypatch):
     """A declared external URL turns a loopback reverse proxy into gated mode."""
     from hermes_cli.dashboard_auth import clear_providers, register_provider
@@ -287,6 +323,165 @@ def test_start_server_loopback_public_url_enables_gate(monkeypatch):
         assert captured["kwargs"].get("proxy_headers") is True
     finally:
         clear_providers()
+
+
+def test_start_server_desktop_loopback_without_provider_stays_gated(
+    monkeypatch,
+):
+    """Desktop token opens only native loopback HTTP/WS; browser HTTP stays gated."""
+    from hermes_cli.dashboard_auth import clear_providers
+
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_SESSION_TOKEN",
+        web_server._SESSION_TOKEN,
+    )
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    clear_providers()
+    captured = _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+
+    web_server.start_server(
+        host="127.0.0.1", port=9119,
+        open_browser=False, allow_public=False,
+    )
+    assert web_server.app.state.auth_required is True
+    assert web_server.app.state.trusted_public_hosts == frozenset(
+        {"dashboard.example.test"}
+    )
+    assert captured["kwargs"].get("host") == "127.0.0.1"
+    client = TestClient(
+        web_server.app,
+        base_url="http://127.0.0.1:9119",
+        client=("127.0.0.1", 50000),
+    )
+    desktop_headers = {
+        "X-Hermes-Session-Token": web_server._SESSION_TOKEN,
+    }
+    assert client.get("/api/sessions", headers=desktop_headers).status_code == 200
+
+    monkeypatch.setattr(web_server, "_SSH_OWNER_NONCE", "desktop-owner")
+    ownership = client.get("/api/ssh/ownership", headers=desktop_headers)
+    assert ownership.status_code == 200
+    assert ownership.json()["sshOwnerNonce"] == "desktop-owner"
+
+    assert client.get("/api/sessions").status_code == 401
+    assert client.get(
+        "/api/sessions",
+        headers={"X-Hermes-Session-Token": "wrong"},
+    ).status_code == 401
+    assert client.get(
+        "/api/sessions",
+        headers={
+            **desktop_headers,
+            "Host": "dashboard.example.test:9443",
+        },
+    ).status_code == 401
+    assert client.get(
+        "/api/sessions",
+        headers={
+            **desktop_headers,
+            "Origin": "https://dashboard.example.test:9443",
+        },
+    ).status_code == 401
+    for rejected_origin in (
+        "https://[::1",
+        "null",
+        "file://",
+        "javascript:alert(1)",
+        "ftp://evil.example",
+        "not a url",
+        "://broken",
+    ):
+        assert client.get(
+            "/api/sessions",
+            headers={
+                **desktop_headers,
+                "Origin": rejected_origin,
+            },
+        ).status_code == 401
+    assert client.get(
+        "/api/sessions",
+        headers={
+            **desktop_headers,
+            "Origin": "app://hermes",
+        },
+    ).status_code == 200
+
+    remote_client = TestClient(
+        web_server.app,
+        base_url="http://127.0.0.1:9119",
+        client=("198.51.100.7", 50000),
+    )
+    assert remote_client.get(
+        "/api/sessions",
+        headers=desktop_headers,
+    ).status_code == 401
+
+
+def test_start_server_desktop_marker_wrong_token_still_fails_closed(monkeypatch):
+    """Marker-only startup cannot impersonate Electron's process token."""
+    from hermes_cli.dashboard_auth import clear_providers
+
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "wrong-token")
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    clear_providers()
+    _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+
+    with pytest.raises(SystemExit, match=r"no auth providers"):
+        web_server.start_server(
+            host="127.0.0.1", port=9119,
+            open_browser=False, allow_public=False,
+        )
+    assert web_server.app.state.auth_required is True
+
+
+def test_start_server_desktop_token_non_loopback_still_requires_provider(
+    monkeypatch,
+):
+    from hermes_cli.dashboard_auth import clear_providers
+
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_SESSION_TOKEN",
+        web_server._SESSION_TOKEN,
+    )
+    clear_providers()
+    _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+
+    with pytest.raises(SystemExit, match=r"no auth providers"):
+        web_server.start_server(
+            host="0.0.0.0", port=9119,
+            open_browser=False, allow_public=False,
+        )
+    assert web_server.app.state.auth_required is True
 
 
 def test_start_server_loopback_public_url_without_provider_fails_closed(monkeypatch):
