@@ -525,6 +525,33 @@ def _make_hermes_provider_class() -> Optional[type]:
                     self._hermes_server_name, exc,
                 )
 
+            # Refresh-token rotation must be coordinated across all Hermes
+            # processes sharing HERMES_HOME.  The SDK's context lock only
+            # protects this provider instance.  Acquire the per-server file
+            # lock before the SDK makes its refresh decision, then force a
+            # storage reload while holding it: a waiter can thereby observe a
+            # winner's freshly persisted token and skip its stale refresh.
+            refresh_lock = None
+            storage = self.context.storage
+            from tools.mcp_oauth import HermesTokenStorage
+
+            needs_refresh_coordination = (
+                hasattr(self, "_initialized")
+                and (
+                    not self._initialized
+                    or (
+                        not self.context.is_token_valid()
+                        and self.context.can_refresh_token()
+                    )
+                )
+            )
+            if isinstance(storage, HermesTokenStorage) and needs_refresh_coordination:
+                refresh_lock = await storage.acquire_refresh_lock()
+                # Reload unconditionally *after* lock acquisition.  mtime alone
+                # is not a safe refresh oracle because another process may have
+                # rotated and atomically replaced the token while we waited.
+                self._initialized = False
+
             # Manually bridge the bidirectional generator protocol. httpx's
             # auth_flow driver (httpx._client._send_handling_auth) calls
             # ``auth_flow.asend(response)`` to feed HTTP responses back into
@@ -545,6 +572,11 @@ def _make_hermes_provider_class() -> Optional[type]:
             retry_after_concurrent_auth = False
             try:
                 outgoing = await inner.__anext__()
+                # If the SDK immediately yielded the original API request, the
+                # reload found a valid token and no refresh is in flight.
+                if refresh_lock is not None and outgoing is request:
+                    refresh_lock.release()
+                    refresh_lock = None
                 while True:
                     # The SDK holds context.lock for its entire generator,
                     # including while HTTPX waits on the actual MCP request.
@@ -581,6 +613,13 @@ def _make_hermes_provider_class() -> Optional[type]:
                     # before handing it back to the SDK (best-effort, GH#36767).
                     await self._maybe_flag_poisoned_client(incoming)
                     outgoing = await inner.asend(incoming)
+                    # A distinct first request is the token refresh.  Once the
+                    # SDK accepts its response and returns the original API
+                    # request, set_tokens() has completed and persistence is
+                    # inside the critical section; normal MCP I/O need not be.
+                    if refresh_lock is not None and outgoing is request:
+                        refresh_lock.release()
+                        refresh_lock = None
             except StopAsyncIteration:
                 # Persist any metadata the SDK discovered lazily during the
                 # 401 branch so a subsequent cold-load skips discovery.
@@ -597,6 +636,8 @@ def _make_hermes_provider_class() -> Optional[type]:
 
                     with anyio.CancelScope(shield=True):
                         await self.context.lock.acquire()
+                if refresh_lock is not None:
+                    refresh_lock.release()
 
             if retry_after_concurrent_auth:
                 yield request

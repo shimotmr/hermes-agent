@@ -44,6 +44,7 @@ Configuration in config.yaml::
 
 import asyncio
 import contextvars
+import errno
 import json
 import logging
 import os
@@ -147,6 +148,10 @@ class OAuthNonInteractiveError(RuntimeError):
     """Raised when OAuth requires browser interaction in a non-interactive env."""
 
 
+class OAuthRefreshLockTimeout(OAuthNonInteractiveError):
+    """Raised when another process holds a server's OAuth refresh lock too long."""
+
+
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
@@ -172,6 +177,12 @@ _oauth_interactive_enabled: "contextvars.ContextVar[bool]" = contextvars.Context
 _oauth_interactive_forced: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "_oauth_interactive_forced", default=False
 )
+
+# A refresh-token request can include a network round trip, so the lock must be
+# long enough for a normal token endpoint while remaining strictly bounded if a
+# holder wedges.  This is intentionally an internal constant, not user config.
+_REFRESH_LOCK_TIMEOUT_SECONDS = 30.0
+_REFRESH_LOCK_POLL_SECONDS = 0.05
 
 
 # Skip tokens accepted at the paste prompt — exit OAuth without auth.
@@ -449,6 +460,98 @@ def _write_json(path: Path, data: dict) -> None:
         raise
 
 
+class _OAuthRefreshLock:
+    """Bounded cross-process advisory lock for one server's token refresh.
+
+    The lock file contains no credentials.  POSIX uses ``flock`` and Windows
+    uses a one-byte ``msvcrt.locking`` region.  Acquisition polls with
+    non-blocking kernel calls so a wedged process cannot deadlock OAuth
+    indefinitely.
+    """
+
+    def __init__(self, path: Path, timeout: float):
+        self._path = path
+        self._timeout = max(0.0, timeout)
+        self._handle = None
+        self._is_windows = sys.platform.startswith("win")
+
+    def _open(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        secure_parent_dir(self._path)
+        fd = os.open(
+            str(self._path),
+            os.O_RDWR | os.O_CREAT,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        self._handle = os.fdopen(fd, "r+b", buffering=0)
+        if self._is_windows:
+            self._handle.seek(0, os.SEEK_END)
+            if self._handle.tell() == 0:
+                self._handle.write(b"\0")
+
+    def _try_acquire(self) -> bool:
+        assert self._handle is not None
+        try:
+            if self._is_windows:
+                import msvcrt
+
+                self._handle.seek(0)
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(
+                    self._handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            return True
+        except OSError as exc:
+            contention_errors = {errno.EACCES, errno.EAGAIN}
+            if hasattr(errno, "EDEADLK"):
+                contention_errors.add(errno.EDEADLK)
+            if exc.errno not in contention_errors:
+                raise
+            return False
+
+    async def acquire(self) -> "_OAuthRefreshLock":
+        try:
+            self._open()
+            deadline = time.monotonic() + self._timeout
+            while not self._try_acquire():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise OAuthRefreshLockTimeout(
+                        "Timed out waiting for the MCP OAuth refresh lock"
+                    )
+                await asyncio.sleep(min(_REFRESH_LOCK_POLL_SECONDS, remaining))
+            return self
+        except BaseException:
+            self._close()
+            raise
+
+    def release(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        try:
+            if self._is_windows:
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._close()
+
+    def _close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            handle.close()
+
+
 # ---------------------------------------------------------------------------
 # HermesTokenStorage -- persistent token/client-info on disk
 # ---------------------------------------------------------------------------
@@ -480,6 +583,17 @@ class HermesTokenStorage:
 
     def _cimd_rejected_path(self) -> Path:
         return _get_token_dir(self._hermes_home) / f"{self._server_name}.cimd-off"
+
+    def _refresh_lock_path(self) -> Path:
+        return _get_token_dir(self._hermes_home) / f"{self._server_name}.refresh.lock"
+
+    async def acquire_refresh_lock(self) -> _OAuthRefreshLock:
+        """Acquire this server's bounded cross-process refresh lock."""
+        lock = _OAuthRefreshLock(
+            self._refresh_lock_path(),
+            _REFRESH_LOCK_TIMEOUT_SECONDS,
+        )
+        return await lock.acquire()
 
     # -- tokens ------------------------------------------------------------
 
