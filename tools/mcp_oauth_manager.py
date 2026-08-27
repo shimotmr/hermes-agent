@@ -207,24 +207,33 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
             await get_manager().invalidate_if_disk_changed(self._hermes_server_name, hermes_home=self._hermes_home)
         except Exception as exc:  # pragma: no cover — defensive
             self._log_nonfatal("pre-flow disk-watch", exc)
+
+        # Coordinate rotating refresh tokens across processes sharing HERMES_HOME. Acquire before
+        # the SDK decides whether to refresh, then force a reload so waiters observe the winner's token.
+        refresh_lock = None
+        storage = self.context.storage
+        from tools.mcp_oauth import HermesTokenStorage
+        needs_refresh_coordination = (
+            hasattr(self, "_initialized")
+            and (not self._initialized or (not self.context.is_token_valid() and self.context.can_refresh_token()))
+        )
+        if isinstance(storage, HermesTokenStorage) and needs_refresh_coordination:
+            refresh_lock = await storage.acquire_refresh_lock()
+            self._initialized = False
+
         # Bridge the bidirectional generator by hand: a naive ``async for item in inner: yield
-        # item`` DISCARDS the responses httpx sends back via ``asend``, and the SDK crashes on None.
-        # Manually bridge the bidirectional generator protocol. httpx's auth_flow driver
-        # (httpx._client._send_handling_auth) calls ``auth_flow.asend(response)`` to feed HTTP responses
-        # back into the generator. A naive wrapper using ``async for item in inner: yield item`` DISCARDS
-        # those .asend(response) values and resumes the inner generator with None, so the SDK's ``response =
-        # yield request`` branch in mcp/client/auth/oauth2.py sees response=None and crashes at ``if
-        # response.status_code == 401`` with AttributeError. The bridge below forwards each .asend() value
-        # into the inner generator via inner.asend(incoming), preserving the bidirectional contract.
-        # Regression from PR #11383 caught by tests/tools/test_mcp_oauth_bidirectional.py.
+        # item`` discards responses httpx sends back via ``asend`` and the SDK crashes on None.
         inner = super().async_auth_flow(request)
         resource_lock_released = retry_after_concurrent_auth = False
         sent_access_token = None
         try:
             outgoing = await inner.__anext__()
+            # A post-lock reload found a valid token; no refresh remains to protect.
+            if refresh_lock is not None and outgoing is request:
+                refresh_lock.release()
+                refresh_lock = None
             while True:
-                # The SDK holds context.lock for its whole generator, even while HTTPX waits on
-                # the MCP request. Release it for that request only; OAuth transitions stay serialized.
+                # Release the SDK context lock only while HTTPX performs normal MCP I/O.
                 if outgoing is request:
                     tokens = self.context.current_tokens
                     sent_access_token = tokens.access_token if tokens is not None else None
@@ -234,8 +243,6 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                 if resource_lock_released:
                     await self.context.lock.acquire()
                     resource_lock_released = False
-                # Another request may have refreshed/authorized while this one was in flight:
-                # retry with that token instead of a duplicate OAuth transition from a stale 401/403.
                 tokens = self.context.current_tokens
                 if (getattr(incoming, "status_code", None) in (401, 403) and self.context.is_token_valid()
                         and tokens is not None and tokens.access_token != sent_access_token):
@@ -243,19 +250,21 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                     await inner.aclose()
                     retry_after_concurrent_auth = True
                     break
-                # Sniff the response for a dead-client-registration signal before handing it back to the SDK
-                # (best-effort, GH#36767).
                 await self._maybe_flag_poisoned_client(incoming)
                 outgoing = await inner.asend(incoming)
+                # set_tokens() has completed before the refreshed resource request is yielded.
+                if refresh_lock is not None and outgoing is request:
+                    refresh_lock.release()
+                    refresh_lock = None
         except StopAsyncIteration:
-            self._persist_oauth_metadata_if_changed()  # metadata discovered lazily in the 401 branch
+            self._persist_oauth_metadata_if_changed()
         finally:
             if resource_lock_released:
-                # Balance the SDK's surrounding ``async with`` even when HTTPX cancels/closes the
-                # flow mid-request; shield only this local bookkeeping.
                 import anyio
                 with anyio.CancelScope(shield=True):
                     await self.context.lock.acquire()
+            if refresh_lock is not None:
+                refresh_lock.release()
         if retry_after_concurrent_auth:
             yield request
             self._persist_oauth_metadata_if_changed()
