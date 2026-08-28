@@ -301,6 +301,29 @@ class TestChatCompletionsBuildKwargs:
         assert kw["extra_body"]["think"] is False
 
 
+    def test_zai_disabled_reasoning_sends_thinking_disabled(self, transport):
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="glm-5.1",
+            messages=msgs,
+            provider_name="zai",
+            base_url="https://api.z.ai/api/coding/paas/v4",
+            reasoning_config={"enabled": False},
+        )
+        assert kw["extra_body"]["thinking"] == {"type": "disabled"}
+
+    def test_gemini_native_without_explicit_reasoning_config_keeps_existing_behavior(self, transport):
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gemini-3-flash-preview",
+            messages=msgs,
+            provider_name="gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+        )
+        assert "thinking_config" not in kw.get("extra_body", {})
+        assert "google" not in kw.get("extra_body", {})
+        assert "extra_body" not in kw.get("extra_body", {})
+
 
     def test_gemini_openai_compat_flash_reasoning_maps_to_nested_google_thinking_config(self, transport):
         msgs = [{"role": "user", "content": "Hi"}]

@@ -766,6 +766,14 @@ def get_container_exec_info() -> Optional[dict]:
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F811,E402
 from utils import atomic_replace, fast_safe_load
+from hermes_cli.openclaw_credentials import (
+    get_all_bridged_env_values as _get_openclaw_bridged_env_values,
+    populate_environment as _populate_openclaw_environment,
+)
+
+# Fill missing env vars from the local OpenClaw credential vault so Hermes can
+# reuse shared secrets without duplicating them into ~/.hermes/.env.
+_populate_openclaw_environment()
 
 def get_config_path() -> Path:
     """Get the main config file path."""
@@ -4168,6 +4176,10 @@ def load_env() -> Dict[str, str]:
     same file on every call was burning ~300ms of CPU per `hermes tools`
     menu paint on top of the OAuth-refresh slowness. The mtime check
     invalidates the cache when the user edits .env mid-process.
+
+    When Hermes-specific keys are missing locally, merge fallback values from
+    the OpenClaw credential vault without writing them into ~/.hermes/.env.
+    Explicit ~/.hermes/.env entries still take precedence.
     """
     global _env_cache
     env_path = get_env_path()
@@ -4207,6 +4219,10 @@ def load_env() -> Dict[str, str]:
                     line = line[7:]
                 key, _, value = line.partition('=')
                 env_vars[key.strip()] = _parse_env_value(value)
+
+    # Merge fallback values from the OpenClaw credential vault.
+    for key, value in _get_openclaw_bridged_env_values().items():
+        env_vars.setdefault(key, value)
 
     if cache_key is not None:
         _env_cache = (cache_key, dict(env_vars))
