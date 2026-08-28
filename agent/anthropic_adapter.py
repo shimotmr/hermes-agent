@@ -382,7 +382,6 @@ def _supports_fast_mode(model: str) -> bool:
 _COMMON_BETAS = [
     "interleaved-thinking-2025-05-14",
     "fine-grained-tool-streaming-2025-05-14",
-    "context-1m-2025-08-07",
 ]
 # MiniMax's Anthropic-compatible endpoints fail tool-use requests when
 # the fine-grained tool streaming beta is present.  Omit it so tool calls
