@@ -26,6 +26,7 @@ import pytest
 
 import hermes_cli.gateway as gateway_cli
 import hermes_cli.update_cmd as update_cmd
+from hermes_cli.gateway_restart_contract import RestartProbe, ServingIdentity
 from hermes_cli.update_cmd import _warn_incomplete_gateway_fleet_restart
 
 LABEL = "ai.hermes.gateway"
@@ -196,6 +197,14 @@ def _patch_launchd_env(
     monkeypatch.setattr(
         gateway_cli, "wait_for_launchd_gateway_supervision", _verify
     )
+    identity = ServingIdentity(
+        9876, 12345, update_cmd.get_hermes_home(), "verified-code"
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_verified_graceful_restart_current_launchd_gateway",
+        lambda: RestartProbe(True, "replacement-healthy", identity),
+    )
     return calls
 
 
@@ -212,6 +221,44 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
     counting a label as restarted.  The invoking profile did not, so the two
     halves of the same function disagreed about what "restarted" means."""
 
+    def test_active_gateway_is_deferred_without_launchd_fallback(
+        self, monkeypatch
+    ):
+        calls = _patch_launchd_env(monkeypatch, supervised=True)
+        identity = ServingIdentity(4321, 9876, update_cmd.get_hermes_home(), "old")
+        monkeypatch.setattr(
+            update_cmd,
+            "_verified_graceful_restart_current_launchd_gateway",
+            lambda: RestartProbe(False, "active-work:1", identity),
+            raising=False,
+        )
+
+        restarted, failed_or_stale = _run_fleet_restart()
+
+        assert restarted == []
+        assert failed_or_stale == [LABEL]
+        assert calls["restart"] == 0
+        assert calls["verify"] == 0
+
+    def test_idle_gateway_uses_verified_contract_without_force_fallback(
+        self, monkeypatch
+    ):
+        calls = _patch_launchd_env(monkeypatch, supervised=True)
+        identity = ServingIdentity(9876, 12345, update_cmd.get_hermes_home(), "new")
+        monkeypatch.setattr(
+            update_cmd,
+            "_verified_graceful_restart_current_launchd_gateway",
+            lambda: RestartProbe(True, "replacement-healthy", identity),
+            raising=False,
+        )
+
+        restarted, failed_or_stale = _run_fleet_restart()
+
+        assert restarted == [LABEL]
+        assert failed_or_stale == []
+        assert calls["restart"] == 0
+        assert calls["verify"] == 1
+
     def test_reports_restarted_only_after_supervision_is_confirmed(
         self, monkeypatch
     ):
@@ -221,7 +268,7 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
 
         assert restarted == [LABEL]
         assert failed_or_stale == []
-        assert calls["restart"] == 1
+        assert calls["restart"] == 0
         assert calls["verify"] == 1
         assert calls["label"] == LABEL
 
@@ -255,23 +302,20 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
         """
         assert gateway_cli.LAUNCHD_SUPERVISION_VERIFY_TIMEOUT >= 15.0
 
-    def test_raised_restart_failure_is_not_verified_and_is_reported(
+    def test_contract_exception_is_not_verified_and_is_reported(
         self, monkeypatch, capsys
     ):
-        """A raised restart is a failed restart, and must not be verified.
+        """A failed contract probe is loud and never reaches supervision."""
+        calls = _patch_launchd_env(monkeypatch)
 
-        Every path in ``launchd_restart`` that can still leave a working
-        gateway - the detached fallback on an unmanageable domain - returns
-        rather than raising, so reaching the handler means neither kickstart
-        nor bootstrap brought the service back.
+        def fail_contract():
+            raise OSError("boom")
 
-        This matters for composition with the open PRs that add verification
-        *inside* ``launchd_restart`` (#63304, #72752): they convert this exact
-        failure from silent to raised, so the caller must keep routing it into
-        ``failed_or_stale_units`` rather than falling through to the verifier.
-        """
-        exc = subprocess.CalledProcessError(1, ["launchctl"], stderr="boom")
-        calls = _patch_launchd_env(monkeypatch, restart=exc)
+        monkeypatch.setattr(
+            update_cmd,
+            "_verified_graceful_restart_current_launchd_gateway",
+            fail_contract,
+        )
 
         restarted, failed_or_stale = _run_fleet_restart()
 
@@ -287,20 +331,18 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
         assert calls["restart"] == 0
         assert calls["verify"] == 0
 
-    def test_unregistered_label_is_restarted_not_skipped(self, monkeypatch):
-        """A booted-out job (plist present, deregistered) must be RESTARTED.
-
-        FLIPPED by the #74973 fix (salvage #75021): this test used to pin
-        'registered=False → nothing to restart', which was precisely the
-        silent-skip bug — launchctl list is session-scoped and non-zero
-        for booted-out jobs whose plist very much still wants a gateway;
-        launchd_restart() owns the bootout/bootstrap ladder for that state.
-        """
+    def test_unregistered_label_is_not_force_bootstrapped(self, monkeypatch):
+        """Missing serving identity fails closed instead of bootstrapping."""
         calls = _patch_launchd_env(monkeypatch, registered=False)
+        monkeypatch.setattr(
+            update_cmd,
+            "_verified_graceful_restart_current_launchd_gateway",
+            lambda: RestartProbe(False, "control-identity-missing", None),
+        )
 
-        assert _run_fleet_restart() == ([LABEL], [])
-        assert calls["restart"] == 1
-        assert calls["verify"] == 1
+        assert _run_fleet_restart() == ([], [LABEL])
+        assert calls["restart"] == 0
+        assert calls["verify"] == 0
 
 
 class TestIncompleteFleetWarningIsPlatformCorrect:

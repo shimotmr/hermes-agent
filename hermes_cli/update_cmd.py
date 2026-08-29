@@ -6363,36 +6363,43 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
         print("    launchctl kickstart -k gui/$UID/<label>   # macOS (or user/$UID)")
 
 
+def _verified_graceful_restart_current_launchd_gateway():
+    """Restart the current profile through the control-socket contract only.
+
+    No launchctl fallback is permitted here. Unknown or active work fails
+    closed, and the replacement must report the checkout's current code SHA.
+    """
+    from hermes_cli.gateway import _get_restart_drain_timeout
+    from hermes_cli.gateway_restart_contract import perform_verified_graceful_restart
+
+    try:
+        port = int(os.environ.get("API_SERVER_PORT", "8642"))
+    except (TypeError, ValueError):
+        port = 8642
+    timeout = max(45.0, float(_get_restart_drain_timeout()))
+    return perform_verified_graceful_restart(
+        get_hermes_home(),
+        port=port,
+        health_url=f"http://127.0.0.1:{port}/health",
+        expected_code_sha=_current_checkout_sha(),
+        timeout=timeout,
+    )
+
+
 def _restart_launchd_gateway_after_update(
     *, supervision_verify: bool = True
 ) -> tuple[list, list]:
-    """Restart the invoking profile's launchd gateway after an update.
+    """Gracefully restart and verify the invoking profile after an update.
 
-    #74973 (salvage #75021 by @jeff-mettel): the restart used to be gated on
-    ``launchctl list <label>`` exiting 0. A *booted-out* job — plist present,
-    definition deregistered from launchd (crashed helper, manual bootout,
-    failed prior update) — fails that check, so the whole branch silently
-    skipped: no restart, no message, ``KeepAlive`` unable to revive a
-    definition launchd no longer knows, and the update still printed
-    "Update complete!". ``launchctl list`` is also session-scoped and can
-    exit non-zero while the job is alive in its gui/user domain, so it is
-    not a reliable classifier at all.
-
-    The fix performs NO list-based classification: when the plist exists,
-    ``launchd_restart()`` always runs — it drains a live PID, kickstarts
-    with ``-k``, and owns the bootout/bootstrap/kickstart ladder for the
-    genuinely unloaded state. Every failure path is loud and names the
-    manual recovery command.
-
-    Returns ``(restarted_labels, failed_labels)``. With
-    ``supervision_verify`` (the update path), success additionally requires
-    launchd reporting a fresh supervised PID (#88848 — "the call returned"
-    is not "the gateway is supervised").
+    A plist only establishes that launchd supervision is expected. It does not
+    identify the serving process. The control-socket contract proves the exact
+    serving PID is idle twice, signals that PID with SIGUSR1, then verifies the
+    old process exited and a healthy replacement owns the listener, platform
+    writers, and expected code SHA. Failure is loud and has no force fallback.
     """
     from hermes_cli.gateway import (
         get_launchd_label,
         get_launchd_plist_path,
-        launchd_restart,
         wait_for_launchd_gateway_supervision,
     )
 
@@ -6400,44 +6407,31 @@ def _restart_launchd_gateway_after_update(
     try:
         if not get_launchd_plist_path().exists():
             return [], []  # not a launchd install — nothing to do or warn
-        try:
-            launchd_restart()
-        except subprocess.CalledProcessError as e:
-            stderr = (getattr(e, "stderr", "") or "").strip()
-            print(
-                f"  ⚠ Gateway restart failed: {stderr}\n"
-                "    The gateway may be DOWN on pre-update code. "
-                "Recover manually: hermes gateway restart"
-            )
-            return [], [current_label]
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        # A plist exists, so a gateway is SUPPOSED to be supervised here —
-        # a broken/missing/wedged launchctl is not proof nothing needs
-        # restarting. The old code `pass`ed here (#74973's second silent
-        # variant); count it and tell the operator.
+        probe = _verified_graceful_restart_current_launchd_gateway()
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired, ValueError) as exc:
         print(
-            "  ⚠ Could not restart the gateway "
-            f"({e.__class__.__name__}: {e}).\n"
-            "    Recover manually: hermes gateway restart"
+            "  ⚠ Could not verify a graceful gateway restart "
+            f"({exc.__class__.__name__}: {exc}).\n"
+            "    No force fallback was attempted. Retry after the gateway is idle."
+        )
+        return [], [current_label]
+
+    if not probe.ready:
+        print(
+            f"  ⚠ Gateway restart deferred: {probe.reason}.\n"
+            "    No force fallback was attempted. Retry after the gateway is idle."
         )
         return [], [current_label]
 
     if not supervision_verify:
         return [current_label], []
 
-    # launchd_restart() returning is only "restart REQUESTED" — the
-    # self-restart branch hands work to the running gateway, a plist reload
-    # to a detached helper; both asynchronous. A helper that dies before its
-    # first bootstrap (#88848), or a bootstrap that exits 0 without
-    # registering (measured on macOS 26.6.1), otherwise reaches "Update
-    # complete!" with nothing supervising the gateway. Verified
-    # domain-agnostically (a domain locate fails on macOS-26 hosts whose
-    # per-user domains reject service management).
     if wait_for_launchd_gateway_supervision(label=current_label):
         return [current_label], []
     print(
-        f"  ✗ {current_label} restarted but launchd is not supervising it.\n"
-        "    Check logs, then: hermes gateway restart"
+        f"  ✗ {current_label} has a verified replacement but launchd is not "
+        "supervising it.\n"
+        "    Check logs; do not force-restart while work is active."
     )
     return [], [current_label]
 
