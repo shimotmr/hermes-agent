@@ -16,6 +16,14 @@ from gateway.session import SessionEntry, SessionStore
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
+@pytest.fixture(autouse=True)
+def _isolate_restart_loop_guard(monkeypatch):
+    """Durability scheduler tests must never mutate the live restart marker."""
+    check = MagicMock(return_value=False)
+    monkeypatch.setattr("gateway.restart_loop_guard.check_and_record", check)
+    return check
+
+
 def _store(tmp_path):
     return SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
 
