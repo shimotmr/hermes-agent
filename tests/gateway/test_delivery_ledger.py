@@ -391,7 +391,8 @@ class TestGatewayRedeliverySweep:
         assert sent["metadata"] == {"thread_id": "171.001"}
         assert _row("ob-1")["state"] == "delivered"
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
+            "agent:main:slack:channel:C1",
+            acknowledge_pending_followup=False,
         )
 
     @pytest.mark.asyncio
@@ -460,7 +461,8 @@ class TestGatewayRedeliverySweep:
 
         assert n == 1
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
+            "agent:main:slack:channel:C1",
+            acknowledge_pending_followup=False,
         )
         assert adapter.send.await_count == 1
         assert adapter.send.call_args.kwargs["content"].startswith(
@@ -581,7 +583,8 @@ class TestGatewayRedeliverySweep:
             await asyncio.sleep(0)
 
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
+            "agent:main:slack:channel:C1",
+            acknowledge_pending_followup=False,
         )
         assert not task.done()
 

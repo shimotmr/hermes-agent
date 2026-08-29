@@ -854,6 +854,14 @@ class SessionEntry:
     resume_pending: bool = False
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
+    # User follow-up dequeued immediately before gateway drain.  Kept on the
+    # routing entry so restart recovery can replay the exact user text instead
+    # of synthesizing an empty continuation turn.
+    pending_followup_text: Optional[str] = None
+    # Ordered, JSON-safe MessageEvent payloads owned by restart recovery.  The
+    # text field above remains as a rolling-downgrade compatibility mirror of
+    # the queue head.
+    pending_followup_events: List[Dict[str, Any]] = field(default_factory=list)
 
     # Durable ownership marker for the agent turn currently executing on this
     # routing entry.  A normal unwind clears it with compare-and-swap semantics;
@@ -898,6 +906,8 @@ class SessionEntry:
                 if self.last_resume_marked_at
                 else None
             ),
+            "pending_followup_text": self.pending_followup_text,
+            "pending_followup_events": self.pending_followup_events,
             "active_turn_token": self.active_turn_token,
             "active_turn_started_at": (
                 self.active_turn_started_at.isoformat()
@@ -953,6 +963,19 @@ class SessionEntry:
             active_turn_token = None
             active_turn_started_at = None
 
+        pending_followup_text = data.get("pending_followup_text")
+        if (
+            not isinstance(pending_followup_text, str)
+            or not pending_followup_text.strip()
+        ):
+            pending_followup_text = None
+        _pending_followup_events = data.get("pending_followup_events")
+        pending_followup_events = (
+            [dict(item) for item in _pending_followup_events if isinstance(item, dict)]
+            if isinstance(_pending_followup_events, list)
+            else []
+        )
+
         session_key = data["session_key"]
         session_id = data["session_id"]
 
@@ -995,6 +1018,8 @@ class SessionEntry:
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
+            pending_followup_text=pending_followup_text,
+            pending_followup_events=pending_followup_events,
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
             is_fresh_reset=data.get("is_fresh_reset", False),
@@ -3285,49 +3310,202 @@ class SessionStore:
         self,
         session_key: str,
         reason: str = "restart_timeout",
+        *,
+        pending_followup_text: Optional[str] = None,
+        pending_followup_events: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
-        """Mark a session as resumable after a restart interruption.
+        """Durably mark a session as resumable after an interruption.
 
-        Unlike ``suspend_session()``, this preserves the existing
-        ``session_id`` and the transcript.  The next call to
-        ``get_or_create_session()`` for this key returns the same entry
-        so the user auto-resumes on the same conversation lane.
-
-        Returns True if the session existed and was marked.
+        ``pending_followup_events`` is an ordered queue of JSON-safe event
+        payloads.  ``pending_followup_text`` mirrors its head for rolling
+        downgrade compatibility.  A different existing queue is never
+        overwritten, and live ownership is published only after persistence.
         """
         with self._lock:
             self._ensure_loaded_locked()
-            if session_key in self._entries:
-                entry = self._entries[session_key]
-                # Never override an explicit ``suspended`` — that is a hard
-                # forced-wipe signal (from /stop or stuck-loop escalation).
-                if entry.suspended:
+            entry = self._entries.get(session_key)
+            if entry is None or entry.suspended:
+                return False
+            if pending_followup_text is not None and (
+                not isinstance(pending_followup_text, str)
+                or not pending_followup_text.strip()
+            ):
+                return False
+            if (
+                pending_followup_text is not None
+                and entry.pending_followup_text is not None
+                and entry.pending_followup_text != pending_followup_text
+            ):
+                return False
+            if pending_followup_events is not None:
+                if not pending_followup_events or not all(
+                    isinstance(item, dict) for item in pending_followup_events
+                ):
                     return False
-                entry.resume_pending = True
-                entry.resume_reason = reason
-                entry.last_resume_marked_at = _now()
-                self._save()
-                return True
-        return False
+                if (
+                    entry.pending_followup_events
+                    and entry.pending_followup_events != pending_followup_events
+                ):
+                    return False
 
-    def clear_resume_pending(self, session_key: str) -> bool:
-        """Clear the resume-pending flag after a successful resumed turn.
+            marked_at = _now()
+            candidate = entry.to_dict()
+            candidate["pending_followup_text"] = (
+                pending_followup_text
+                if pending_followup_text is not None
+                else entry.pending_followup_text
+            )
+            candidate["pending_followup_events"] = (
+                [dict(item) for item in pending_followup_events]
+                if pending_followup_events is not None
+                else entry.pending_followup_events
+            )
+            candidate["resume_pending"] = True
+            candidate["resume_reason"] = reason
+            candidate["last_resume_marked_at"] = marked_at.isoformat()
 
-        Called from the gateway after ``run_conversation()`` returns a
-        final response for a session that had ``resume_pending=True``,
-        signalling that recovery succeeded.
+            self._save_entry(
+                session_key,
+                entry_data=candidate,
+                lock_held=True,
+            )
+            if pending_followup_text is not None:
+                entry.pending_followup_text = pending_followup_text
+            if pending_followup_events is not None:
+                entry.pending_followup_events = [
+                    dict(item) for item in pending_followup_events
+                ]
+            entry.resume_pending = True
+            entry.resume_reason = reason
+            entry.last_resume_marked_at = marked_at
+            return True
 
-        Returns True if a flag was cleared.
+    def clear_resume_pending(
+        self,
+        session_key: str,
+        *,
+        acknowledge_pending_followup: bool = True,
+        expected_followup_event_ids: Optional[List[str]] = None,
+        expected_pending_followup_text: Optional[str] = None,
+    ) -> bool:
+        """Durably acknowledge one recovery turn.
+
+        Delivery-ledger and graceful-drain cleanup pass ``False`` and may not
+        consume a queued user event.  A successful resumed turn consumes only
+        the queue head; remaining events stay resumable in FIFO order.
         """
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None or not entry.resume_pending:
                 return False
-            entry.resume_pending = False
-            entry.resume_reason = None
-            entry.last_resume_marked_at = None
-            self._save()
+            if (
+                (entry.pending_followup_text is not None or entry.pending_followup_events)
+                and not acknowledge_pending_followup
+            ):
+                return False
+
+            if entry.pending_followup_events:
+                expected_ids = expected_followup_event_ids or []
+                if not expected_ids:
+                    return False
+                current_ids = [
+                    item.get("event_id") for item in entry.pending_followup_events
+                ]
+                if current_ids[: len(expected_ids)] != expected_ids:
+                    return False
+            elif entry.pending_followup_text is not None:
+                if expected_pending_followup_text != entry.pending_followup_text:
+                    return False
+
+            acknowledged_count = len(expected_followup_event_ids or [])
+            remaining_events = entry.pending_followup_events[acknowledged_count:]
+            candidate = entry.to_dict()
+            candidate["pending_followup_events"] = remaining_events
+            if remaining_events:
+                next_text = remaining_events[0].get("text")
+                candidate["resume_pending"] = True
+                candidate["resume_reason"] = "shutdown_pending_followup"
+                candidate["pending_followup_text"] = (
+                    next_text if isinstance(next_text, str) and next_text.strip() else None
+                )
+            else:
+                candidate["resume_pending"] = False
+                candidate["resume_reason"] = None
+                candidate["last_resume_marked_at"] = None
+                candidate["pending_followup_text"] = None
+
+            self._save_entry(
+                session_key,
+                entry_data=candidate,
+                lock_held=True,
+            )
+            entry.pending_followup_events = [dict(item) for item in remaining_events]
+            if remaining_events:
+                next_text = remaining_events[0].get("text")
+                entry.resume_pending = True
+                entry.resume_reason = "shutdown_pending_followup"
+                entry.pending_followup_text = (
+                    next_text if isinstance(next_text, str) and next_text.strip() else None
+                )
+            else:
+                entry.resume_pending = False
+                entry.resume_reason = None
+                entry.last_resume_marked_at = None
+                entry.pending_followup_text = None
+            return True
+
+    def append_pending_followup_events(
+        self,
+        session_key: str,
+        pending_followup_events: List[Dict[str, Any]],
+        *,
+        expected_existing_event_ids: List[str],
+    ) -> bool:
+        """Atomically append a restart-owned FIFO suffix."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.suspended or not entry.pending_followup_events:
+                return False
+            if not pending_followup_events or not all(
+                isinstance(item, dict) for item in pending_followup_events
+            ):
+                return False
+
+            existing = [dict(item) for item in entry.pending_followup_events]
+            existing_ids = [item.get("event_id") for item in existing]
+            suffix = [dict(item) for item in pending_followup_events]
+            suffix_ids = [item.get("event_id") for item in suffix]
+            if (
+                not expected_existing_event_ids
+                or any(not isinstance(item, str) or not item for item in existing_ids)
+                or any(not isinstance(item, str) or not item for item in suffix_ids)
+                or len(set(suffix_ids)) != len(suffix_ids)
+            ):
+                return False
+
+            expected = list(expected_existing_event_ids)
+            if existing_ids == expected + suffix_ids:
+                return True
+            if existing_ids != expected or set(existing_ids).intersection(suffix_ids):
+                return False
+
+            combined = existing + suffix
+            candidate = entry.to_dict()
+            candidate["pending_followup_events"] = combined
+            candidate["pending_followup_text"] = entry.pending_followup_text
+            candidate["resume_pending"] = True
+            candidate["resume_reason"] = "shutdown_pending_followup"
+            self._save_entry(
+                session_key,
+                entry_data=candidate,
+                lock_held=True,
+            )
+            entry.pending_followup_events = combined
+            entry.pending_followup_text = candidate["pending_followup_text"]
+            entry.resume_pending = True
+            entry.resume_reason = "shutdown_pending_followup"
             return True
 
     def prune_old_entries(self, max_age_days: int) -> int:
@@ -3678,10 +3856,12 @@ class SessionStore:
             self._transcript_drain_lock = drain_lock
         return drain_lock
 
-    def append_to_transcript(self, session_id: str, message: Dict[str, Any], skip_db: bool = False) -> None:
+    def append_to_transcript(self, session_id: str, message: Dict[str, Any], skip_db: bool = False) -> bool:
         """Serialize transcript draining across queue migration boundaries."""
-        if not self._db or skip_db:
-            return
+        if skip_db:
+            return True
+        if not self._db:
+            return False
         with self._get_transcript_drain_lock():
             reroutes = getattr(self, "_transcript_reroutes", None)
             if reroutes is None:
@@ -3691,11 +3871,11 @@ class SessionStore:
             while session_id in reroutes and session_id not in seen:
                 seen.add(session_id)
                 session_id = reroutes[session_id]
-            self._append_to_transcript_serialized(session_id, message)
+            return self._append_to_transcript_serialized(session_id, message)
 
     def _append_to_transcript_serialized(
         self, session_id: str, message: Dict[str, Any]
-    ) -> None:
+    ) -> bool:
         """Append a message to a session's transcript (SQLite).
 
         Args:
@@ -3809,7 +3989,7 @@ class SessionStore:
                                         entry.session_id = child_id
                                 self._save()
                             if not pending:
-                                return
+                                return True
                             msg = pending[0]
                             session_id = child_id
                             continue
@@ -3828,7 +4008,7 @@ class SessionStore:
                             "%s with no unique live child; not retrying",
                             session_id,
                         )
-                        return
+                        return False
                 if self._is_fts_corruption_error(exc) and self._rebuild_fts_once():
                     try:
                         self._append_transcript_message(session_id, msg)
@@ -3850,7 +4030,7 @@ class SessionStore:
                     "(failure_count=%d, pending=%d); will retry: %s",
                     session_id, failures, len(pending), exc,
                 )
-                return
+                return False
             else:
                 with self._transcript_retry_lock:
                     if pending and pending[0] is msg:
@@ -3867,7 +4047,7 @@ class SessionStore:
                     # clear: replay any cap-dropped messages spooled to disk
                     # for this session (#78182).
                     self._drain_spooled_drops(session_id)
-                    return
+                    return True
                 continue
 
     def _drain_spooled_drops(self, session_id: str) -> None:

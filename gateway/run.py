@@ -41,6 +41,7 @@ import signal
 import threading
 import time
 import traceback
+import uuid
 from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
@@ -4233,6 +4234,30 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     return True
 
 
+def _merge_queued_followup_completion(
+    current_result: Any,
+    followup_result: Any,
+    followup_event_id: Optional[str],
+) -> dict:
+    """Keep each recursive turn's success identity separate from its tail."""
+    merged = dict(followup_result) if isinstance(followup_result, dict) else {}
+    child_succeeded = bool(
+        merged.get(
+            "_direct_turn_succeeded",
+            _should_clear_resume_pending_after_turn(merged),
+        )
+    )
+    if followup_event_id and child_succeeded:
+        merged["_completed_pending_followup_event_ids"] = [
+            followup_event_id,
+            *list(merged.get("_completed_pending_followup_event_ids") or []),
+        ]
+    merged["_direct_turn_succeeded"] = _should_clear_resume_pending_after_turn(
+        current_result
+    )
+    return merged
+
+
 def _preserve_queued_followup_history_offset(
     current_result: dict,
     followup_result: dict,
@@ -6604,6 +6629,7 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            agent._last_session_persisted = False
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -6826,6 +6852,16 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                # Keep the empty-response branch contract-identical to the
+                # normal return below.  Ownership prevents duplicate gateway
+                # writes; only the separate receipt proves durability.
+                "agent_persisted": result.get(
+                    "agent_persisted",
+                    bool(getattr(agent, "_last_session_persisted", False)),
+                ),
+                "agent_persistence_owned": result.get(
+                    "agent_persistence_owned", True
+                ),
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -6910,11 +6946,23 @@ class TurnRunner:
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
-            # Pass through the agent_persisted flag so the persistence block
-            # above can correctly determine whether the codex app-server path
-            # self-persisted (it didn't — see codex_runtime.py).  Default
-            # True preserves the skip-db behaviour for the standard runtime.
-            "agent_persisted": (ctx.result_holder[0].get("agent_persisted", True) if ctx.result_holder[0] else True),
+            # Pass through separate ownership and durability receipts.  A
+            # runtime may own the write (so gateway fallback must skip it) yet
+            # fail to persist it; that state must never acknowledge durable
+            # restart input.
+            "agent_persisted": (
+                ctx.result_holder[0].get(
+                    "agent_persisted",
+                    bool(getattr(agent, "_last_session_persisted", False)),
+                )
+                if ctx.result_holder[0]
+                else bool(getattr(agent, "_last_session_persisted", False))
+            ),
+            "agent_persistence_owned": (
+                ctx.result_holder[0].get("agent_persistence_owned", True)
+                if ctx.result_holder[0]
+                else True
+            ),
         }
 
 
@@ -9241,6 +9289,106 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # it up.  Clearing happens on /new and /reset via
     # _handle_reset_command.
 
+    @staticmethod
+    def _serialize_pending_followup_event(event: "MessageEvent") -> Optional[Dict[str, Any]]:
+        """Return the restart-safe subset of a normalized inbound event."""
+        source = getattr(event, "source", None)
+        if source is None:
+            return None
+        metadata = getattr(event, "metadata", {}) or {}
+        prompt_response = getattr(event, "prompt_response", None)
+        try:
+            metadata = json.loads(json.dumps(metadata))
+            if prompt_response is not None:
+                prompt_response = json.loads(json.dumps(prompt_response))
+        except (TypeError, ValueError):
+            return None
+        timestamp = getattr(event, "timestamp", None)
+        if not isinstance(timestamp, datetime):
+            return None
+        event_id = getattr(event, "_pending_followup_event_id", None)
+        if not isinstance(event_id, str) or not event_id:
+            event_id = uuid.uuid4().hex
+            setattr(event, "_pending_followup_event_id", event_id)
+        try:
+            source_payload = source.to_dict()
+        except Exception:
+            return None
+        message_type = getattr(event, "message_type", MessageType.TEXT)
+        payload = {
+            "event_id": event_id,
+            "text": getattr(event, "text", "") or "",
+            "message_type": getattr(message_type, "value", str(message_type)),
+            "source": source_payload,
+            "user_id": getattr(event, "user_id", None),
+            "user_name": getattr(event, "user_name", None),
+            "message_id": getattr(event, "message_id", None),
+            "platform_update_id": getattr(event, "platform_update_id", None),
+            "media_urls": list(getattr(event, "media_urls", []) or []),
+            "media_types": list(getattr(event, "media_types", []) or []),
+            "reply_to_message_id": getattr(event, "reply_to_message_id", None),
+            "reply_to_text": getattr(event, "reply_to_text", None),
+            "reply_to_author_id": getattr(event, "reply_to_author_id", None),
+            "reply_to_author_name": getattr(event, "reply_to_author_name", None),
+            "reply_to_is_own_message": bool(
+                getattr(event, "reply_to_is_own_message", False)
+            ),
+            "prompt_response": prompt_response,
+            "auto_skill": getattr(event, "auto_skill", None),
+            "channel_prompt": getattr(event, "channel_prompt", None),
+            "channel_context": getattr(event, "channel_context", None),
+            "metadata": metadata,
+            "timestamp": timestamp.isoformat(),
+            "allow_gateway_control": bool(
+                getattr(event, "allow_gateway_control", True)
+            ),
+        }
+        try:
+            json.dumps(payload)
+        except (TypeError, ValueError):
+            return None
+        return payload
+
+    @staticmethod
+    def _deserialize_pending_followup_event(payload: Dict[str, Any]) -> Optional["MessageEvent"]:
+        """Reconstruct a normalized event from a validated durable payload."""
+        try:
+            event_id = payload["event_id"]
+            if not isinstance(event_id, str) or not event_id:
+                return None
+            source = SessionSource.from_dict(payload["source"])
+            timestamp = datetime.fromisoformat(payload["timestamp"])
+            event = MessageEvent(
+                text=str(payload.get("text") or ""),
+                message_type=MessageType(payload.get("message_type", MessageType.TEXT.value)),
+                user_id=payload.get("user_id"),
+                user_name=payload.get("user_name"),
+                source=source,
+                message_id=payload.get("message_id"),
+                platform_update_id=payload.get("platform_update_id"),
+                media_urls=list(payload.get("media_urls") or []),
+                media_types=list(payload.get("media_types") or []),
+                reply_to_message_id=payload.get("reply_to_message_id"),
+                reply_to_text=payload.get("reply_to_text"),
+                reply_to_author_id=payload.get("reply_to_author_id"),
+                reply_to_author_name=payload.get("reply_to_author_name"),
+                reply_to_is_own_message=bool(
+                    payload.get("reply_to_is_own_message", False)
+                ),
+                prompt_response=payload.get("prompt_response"),
+                auto_skill=payload.get("auto_skill"),
+                channel_prompt=payload.get("channel_prompt"),
+                channel_context=payload.get("channel_context"),
+                internal=True,
+                metadata=dict(payload.get("metadata") or {}),
+                timestamp=timestamp,
+                allow_gateway_control=bool(payload.get("allow_gateway_control", True)),
+            )
+            setattr(event, "_pending_followup_event_id", event_id)
+            return event
+        except (KeyError, TypeError, ValueError):
+            return None
+
     def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
         """Append a /queue event to the FIFO chain for a session."""
         if adapter is None:
@@ -9285,6 +9433,220 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # No adapter — push back so we don't silently drop the item.
             overflow.insert(0, next_queued)
         return pending_event
+
+    def _restore_dequeued_followup(
+        self,
+        session_key: str,
+        adapter: Any,
+        pending_event: Optional["MessageEvent"],
+        pending_text: Optional[str],
+        source: Optional[SessionSource] = None,
+    ) -> bool:
+        """Return a follow-up to adapter ownership after durable handoff fails."""
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if pending_event is None and pending_text and source is not None:
+            pending_event = MessageEvent(
+                text=pending_text,
+                message_type=MessageType.TEXT,
+                source=source,
+            )
+        if pending_event is not None and pending_slot is not None:
+            displaced = pending_slot.get(session_key)
+            pending_slot[session_key] = pending_event
+            if displaced is not None and displaced is not pending_event:
+                self._session_state(session_key).conversation.queued_events.insert(
+                    0, displaced
+                )
+            return pending_slot.get(session_key) is pending_event
+        return False
+
+    def _pending_followup_handoff_lock(self, session_key: str) -> asyncio.Lock:
+        locks = getattr(self, "_pending_followup_handoff_locks", None)
+        if locks is None:
+            locks = {}
+            self._pending_followup_handoff_locks = locks
+        lock = locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[session_key] = lock
+        return lock
+
+    async def _preserve_draining_followup(
+        self,
+        session_key: str,
+        pending_text: Optional[str],
+        *,
+        pending_event: Optional["MessageEvent"],
+        adapter: Any,
+        source: Optional[SessionSource] = None,
+    ) -> bool:
+        async with self._pending_followup_handoff_lock(session_key):
+            return await self._preserve_draining_followup_locked(
+                session_key,
+                pending_text,
+                pending_event=pending_event,
+                adapter=adapter,
+                source=source,
+            )
+
+    async def _preserve_draining_followup_locked(
+        self,
+        session_key: str,
+        pending_text: Optional[str],
+        *,
+        pending_event: Optional["MessageEvent"],
+        adapter: Any,
+        source: Optional[SessionSource] = None,
+    ) -> bool:
+        """Atomically transfer the complete local FIFO to restart ownership."""
+        head = pending_event
+        if head is None and pending_text and source is not None:
+            head = MessageEvent(
+                text=pending_text,
+                message_type=MessageType.TEXT,
+                source=source,
+            )
+        if head is None:
+            return False
+
+        local_events = [head]
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        staged = pending_slot.get(session_key) if pending_slot is not None else None
+        if staged is not None and staged is not head:
+            local_events.append(staged)
+        queue_state = self._peek_session_state(session_key)
+        overflow = queue_state.conversation.queued_events if queue_state else []
+        local_events.extend(list(overflow))
+
+        payloads: List[Dict[str, Any]] = []
+        for event in local_events:
+            event_source = getattr(event, "source", None)
+            if event_source is None:
+                self._restore_dequeued_followup(
+                    session_key, adapter, pending_event, pending_text, source
+                )
+                return False
+            # Adapter role grants are transport-local trust and intentionally
+            # excluded from persistence.  Only accept the handoff when another
+            # durable authorization gate independently validates the owner.
+            if getattr(event_source, "role_authorized", False) is True:
+                try:
+                    durably_authorized = self._is_user_authorized(
+                        event_source,
+                        allow_adapter_delegation=False,
+                    )
+                except Exception:
+                    durably_authorized = False
+                if not durably_authorized:
+                    self._restore_dequeued_followup(
+                        session_key, adapter, pending_event, pending_text, source
+                    )
+                    return False
+            payload = self._serialize_pending_followup_event(event)
+            if payload is None:
+                self._restore_dequeued_followup(
+                    session_key, adapter, pending_event, pending_text, source
+                )
+                return False
+            payloads.append(payload)
+
+        # Detach the exact snapshot from mutable adapter containers before the
+        # durable write yields.  New arrivals then occupy a fresh slot/overflow
+        # and cannot mutate an object whose pre-yield form is being persisted.
+        snapshot_tail_ids = {id(event) for event in local_events[1:]}
+        if pending_slot is not None and pending_slot.get(session_key) is staged:
+            pending_slot.pop(session_key, None)
+        if queue_state is not None:
+            queue_state.conversation.queued_events[:] = [
+                event
+                for event in queue_state.conversation.queued_events
+                if id(event) not in snapshot_tail_ids
+            ]
+
+        def restore_detached_snapshot() -> bool:
+            if pending_slot is None:
+                return self._restore_dequeued_followup(
+                    session_key, adapter, pending_event, pending_text, source
+                )
+            late_slot = pending_slot.pop(session_key, None)
+            restore_state = queue_state or self._session_state(session_key)
+            late_overflow = list(restore_state.conversation.queued_events)
+            replay = list(local_events)
+            if late_slot is not None:
+                replay.append(late_slot)
+            replay.extend(late_overflow)
+            pending_slot[session_key] = replay[0]
+            restore_state.conversation.queued_events[:] = replay[1:]
+            return True
+
+        try:
+            current_entry = await self.async_session_store.get(session_key)
+            existing_payloads = list(
+                getattr(current_entry, "pending_followup_events", None) or []
+            )
+            if existing_payloads:
+                expected_ids = [item.get("event_id") for item in existing_payloads]
+                preserved = bool(
+                    await self.async_session_store.append_pending_followup_events(
+                        session_key,
+                        payloads,
+                        expected_existing_event_ids=expected_ids,
+                    )
+                )
+            else:
+                legacy_head_text = str(
+                    payloads[0].get("text") or pending_text or ""
+                )
+                if not legacy_head_text.strip():
+                    legacy_head_text = _build_media_placeholder(local_events[0])
+                preserved = bool(
+                    await self.async_session_store.mark_resume_pending(
+                        session_key,
+                        reason="shutdown_pending_followup",
+                        pending_followup_text=legacy_head_text,
+                        pending_followup_events=payloads,
+                    )
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to persist pending follow-up for %s: %s",
+                session_key,
+                exc,
+            )
+            preserved = False
+
+        if not preserved:
+            restore_detached_snapshot()
+            return False
+
+        # The detached snapshot is now durably owned. Drain-time arrivals use
+        # the same per-session lock and append to this exact durable FIFO.
+        return True
+
+    async def _append_draining_followup_event(
+        self,
+        session_key: str,
+        event: "MessageEvent",
+    ) -> bool:
+        """Accept a drain-time arrival only after it is restart-durable."""
+        adapter = self._adapter_for_source(event.source)
+        if adapter is None:
+            return False
+        async with self._pending_followup_handoff_lock(session_key):
+            self._enqueue_fifo(session_key, event, adapter)
+            pending_slot = getattr(adapter, "_pending_messages", None)
+            if pending_slot is None:
+                return False
+            head = pending_slot.pop(session_key, None)
+            if head is None:
+                return False
+            return await self._preserve_draining_followup_locked(
+                session_key,
+                head.text,
+                pending_event=head,
+                adapter=adapter,
+                source=head.source,
+            )
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
@@ -10442,8 +10804,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled(effective_mode):
-                self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                durably_queued = await self._append_draining_followup_event(
+                    session_key, event
+                )
+                if durably_queued:
+                    message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                else:
+                    message = (
+                        f"⏳ Gateway {self._status_action_gerund()} — this message "
+                        "could not be preserved safely. Please resend it after the gateway returns."
+                    )
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
@@ -12026,10 +12396,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # Drain-timeout reasons set by _stop_impl() when a still-running turn is
     # force-interrupted; "restart_interrupted" is set by
     # SessionStore.suspend_recently_active() on crash recovery (no
-    # .clean_shutdown marker).  All three mean "the agent was mid-turn and
-    # we killed it" — eligible for startup auto-resume.
+    # .clean_shutdown marker); "shutdown_pending_followup" owns a user turn
+    # dequeued immediately before drain. All four require startup replay.
     _AUTO_RESUME_REASONS = frozenset(
-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
+        {
+            "restart_timeout",
+            "shutdown_timeout",
+            "restart_interrupted",
+            "shutdown_pending_followup",
+        }
     )
 
     async def _run_startup_resume_event(
@@ -12277,7 +12652,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 sendable.append(row)
                 continue
             try:
-                await self.async_session_store.clear_resume_pending(session_key)
+                await self.async_session_store.clear_resume_pending(
+                    session_key,
+                    acknowledge_pending_followup=False,
+                )
             except Exception:
                 logger.debug(
                     "clear_resume_pending failed for %s", session_key,
@@ -12531,8 +12909,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ``_is_resume_pending`` branch in ``_handle_message_with_agent``
         injects a reason-aware recovery system note on the next turn.  This
         method closes the UX gap by synthesizing that next turn once
-        adapters are back online — the event text is empty so the existing
-        injection path owns the wording and we never double up.
+        adapters are back online. Ordinary interrupted turns use empty text so
+        the existing injection path owns the wording; a follow-up durably
+        handed off during drain replays its exact original text.
 
         Adapters that are not yet ready (adapter missing from
         ``self.adapters``) are skipped silently; their sessions stay
@@ -12598,6 +12977,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             source = entry.origin
+            if source is None:
+                continue
             adapter = self._adapter_for_source(source)
             if adapter is None:
                 logger.debug(
@@ -12628,25 +13009,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
-            # Claim the session slot *before* spawning the task so that an
-            # inbound message arriving between task creation and the task's
-            # first await (where _process_message_background sets the real
-            # sentinel) sees the slot as occupied and queues behind it
-            # instead of spinning up a duplicate AIAgent (#45456).
+            # Rehydrate the exact normalized event and stage the durable tail
+            # back into the normal FIFO.  Every completed turn acknowledges one
+            # durable head, so a crash at any point can replay the remaining
+            # suffix without losing media/reply/channel semantics.
+            durable_events = [
+                self._deserialize_pending_followup_event(payload)
+                for payload in entry.pending_followup_events
+            ]
+            if entry.pending_followup_events and any(
+                event is None for event in durable_events
+            ):
+                logger.warning(
+                    "Skipping auto-resume for %s: malformed durable follow-up event",
+                    entry.session_key,
+                )
+                continue
+            resolved_durable_events = [
+                event for event in durable_events if event is not None
+            ]
+            durable_events_authorized = True
+            for durable_event in resolved_durable_events:
+                try:
+                    durable_source = durable_event.source
+                    if (
+                        not self._is_user_authorized(durable_source)
+                        or self._session_key_for_source(durable_source)
+                        != entry.session_key
+                    ):
+                        durable_events_authorized = False
+                        break
+                except Exception:
+                    durable_events_authorized = False
+                    break
+            if not durable_events_authorized:
+                logger.warning(
+                    "Skipping auto-resume for %s: durable follow-up source is "
+                    "unauthorized or no longer routes to this session",
+                    entry.session_key,
+                )
+                continue
+            event = resolved_durable_events[0] if resolved_durable_events else None
+            if event is None:
+                event = MessageEvent(
+                    text=entry.pending_followup_text or "",
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    internal=True,
+                )
+                if entry.pending_followup_text is not None:
+                    setattr(
+                        event,
+                        "_pending_followup_legacy_text",
+                        entry.pending_followup_text,
+                    )
+
+            # Claim only after durable payload validation, but before exposing
+            # the rehydrated FIFO tail or spawning the task.  Malformed state
+            # therefore cannot leave a false busy sentinel behind.
             _resume_state = self._session_state(entry.session_key)
             _resume_state.turn.agent = _AGENT_PENDING_SENTINEL
             _resume_state.turn.started_ts = time.time()
             self._persist_active_agents()
+            for queued_event in resolved_durable_events[1:]:
+                self._enqueue_fifo(entry.session_key, queued_event, adapter)
 
-            # Empty-text internal event — the _is_resume_pending branch in
-            # _handle_message_with_agent prepends the proper reason-aware
-            # system note before the turn runs.
-            event = MessageEvent(
-                text="",
-                message_type=MessageType.TEXT,
-                source=source,
-                internal=True,
-            )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
             )
@@ -15557,7 +15984,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for _sk in _pre_drain_keys:
                     if _sk not in self._running_agents:
                         try:
-                            await self.async_session_store.clear_resume_pending(_sk)
+                            await self.async_session_store.clear_resume_pending(
+                                _sk,
+                                acknowledge_pending_followup=False,
+                            )
                         except Exception as _e:
                             logger.debug(
                                 "clear_resume_pending after drain failed for %s: %s",
@@ -21139,6 +21569,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
+            _completed_followup_event_ids = list(
+                agent_result.get("_completed_pending_followup_event_ids") or []
+            )
+            _current_followup_event_id = getattr(
+                event, "_pending_followup_event_id", None
+            )
+            _turn_completed_successfully = bool(
+                agent_result.get(
+                    "_direct_turn_succeeded",
+                    _should_clear_resume_pending_after_turn(agent_result),
+                )
+            )
+            if (
+                isinstance(_current_followup_event_id, str)
+                and _current_followup_event_id
+                and _turn_completed_successfully
+            ):
+                _completed_followup_event_ids.insert(
+                    0, _current_followup_event_id
+                )
+            _completed_legacy_followup_text = (
+                getattr(event, "_pending_followup_legacy_text", None)
+                if _turn_completed_successfully
+                else None
+            )
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
@@ -21233,7 +21688,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
                 await self._clear_restart_failure_count(session_key)
                 try:
-                    await self.async_session_store.clear_resume_pending(session_key)
+                    await self.async_session_store.clear_resume_pending(
+                        session_key,
+                        acknowledge_pending_followup=False,
+                    )
                 except Exception as _e:
                     logger.debug(
                         "clear_resume_pending failed for %s: %s",
@@ -21542,11 +22000,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # for the codex app-server runtime too: although it early-returns
             # and bypasses conversation_loop's per-step flushes, it flushes its
             # own projected assistant/tool messages before returning and
-            # reports agent_persisted=True (see agent/codex_runtime.py). Reading
-            # the flag (default = self._session_db is not None) keeps the
-            # persistence contract explicit and lets any future non-persisting
-            # runtime opt into a gateway-side write by returning False.
-            agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
+            # reports explicit ownership and durability receipts (see
+            # agent/codex_runtime.py). Missing durability fails closed.
+            agent_persisted = agent_result.get("agent_persisted", False)
+            agent_persistence_owned = agent_result.get(
+                "agent_persistence_owned", agent_persisted
+            )
+            _gateway_transcript_write_count = 0
+            _gateway_transcript_writes_durable = True
+
+            async def _append_gateway_transcript(message: Dict[str, Any]) -> None:
+                nonlocal _gateway_transcript_write_count
+                nonlocal _gateway_transcript_writes_durable
+                receipt = await self.async_session_store.append_to_transcript(
+                    session_entry.session_id,
+                    message,
+                    skip_db=agent_persistence_owned,
+                )
+                # A skipped write is an ownership no-op, not a new durability
+                # receipt. Only a real gateway DB append may satisfy this side
+                # of the acknowledgement gate.
+                if not agent_persistence_owned:
+                    _gateway_transcript_write_count += 1
+                    _gateway_transcript_writes_durable = (
+                        _gateway_transcript_writes_durable and bool(receipt)
+                    )
 
             # Find only the NEW messages from this turn (skip history we loaded).
             # Use the filtered history length (history_offset) that was actually
@@ -21595,11 +22073,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         event.message_id, session_entry.session_id,
                     )
                 else:
-                    await self.async_session_store.append_to_transcript(
-                        session_entry.session_id,
-                        _user_entry,
-                        skip_db=agent_persisted,
-                    )
+                    await _append_gateway_transcript(_user_entry)
             else:
                 history_len = agent_result.get("history_offset", len(history))
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
@@ -21623,16 +22097,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _user_entry["display_kind"] = persist_user_display_kind
                     if event.message_id:
                         _user_entry["message_id"] = str(event.message_id)
-                    await self.async_session_store.append_to_transcript(
-                        session_entry.session_id,
-                        _user_entry,
-                        skip_db=agent_persisted,
-                    )
+                    await _append_gateway_transcript(_user_entry)
                     if response:
-                        await self.async_session_store.append_to_transcript(
-                            session_entry.session_id,
-                            {"role": "assistant", "content": response, "timestamp": ts},
-                            skip_db=agent_persisted,
+                        await _append_gateway_transcript(
+                            {"role": "assistant", "content": response, "timestamp": ts}
                         )
                 else:
                     # Attach the inbound platform message_id to the first user
@@ -21654,10 +22122,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         ):
                             entry["message_id"] = str(event.message_id)
                             _user_msg_id_attached = True
-                        await self.async_session_store.append_to_transcript(
-                            session_entry.session_id, entry,
-                            skip_db=agent_persisted,
-                        )
+                        await _append_gateway_transcript(entry)
             
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and
@@ -21667,6 +22132,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
                 touch_activity=not bool(getattr(event, "internal", False)),
             )
+
+            # The transcript write above is the success boundary.  Only now may
+            # this exact replay chain consume the matching durable FIFO prefix.
+            _transcript_durably_persisted = bool(agent_persisted) or (
+                _gateway_transcript_write_count > 0
+                and _gateway_transcript_writes_durable
+            )
+            if session_key and _transcript_durably_persisted and (
+                _completed_followup_event_ids
+                or _completed_legacy_followup_text is not None
+            ):
+                try:
+                    await self.async_session_store.clear_resume_pending(
+                        session_key,
+                        acknowledge_pending_followup=True,
+                        expected_followup_event_ids=(
+                            _completed_followup_event_ids or None
+                        ),
+                        expected_pending_followup_text=(
+                            _completed_legacy_followup_text
+                        ),
+                    )
+                except Exception as _e:
+                    logger.warning(
+                        "Durable follow-up acknowledgement failed for %s; "
+                        "leaving the payload retryable: %s",
+                        session_key,
+                        _e,
+                    )
 
             # Re-baseline the cached agent's message_count snapshot now that
             # ALL of this turn's transcript writes are done — the agent's
@@ -30359,8 +30853,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
 
             if self._draining and (pending_event or pending):
+                _preserved = await self._preserve_draining_followup(
+                    session_key,
+                    pending,
+                    pending_event=pending_event,
+                    adapter=adapter,
+                    source=source,
+                )
+                _pending_slot = getattr(adapter, "_pending_messages", {})
+                _disposition = (
+                    "Persisted"
+                    if _preserved
+                    else "Requeued"
+                    if session_key in _pending_slot
+                    else "Failed to preserve"
+                )
                 logger.info(
-                    "Discarding pending follow-up for session %s during gateway %s",
+                    "%s pending follow-up for session %s during gateway %s",
+                    _disposition,
                     session_key or "?",
                     self._status_action_label(),
                 )
@@ -30586,6 +31096,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                )
+                _followup_event_id = (
+                    getattr(pending_event, "_pending_followup_event_id", None)
+                    if pending_event is not None
+                    else None
+                )
+                followup_result = _merge_queued_followup_completion(
+                    result,
+                    followup_result,
+                    _followup_event_id,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
@@ -30879,7 +31399,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _rpe:
                 logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
 
-        return response
+        if isinstance(response, dict):
+            response = dict(response)
+            response.setdefault(
+                "_direct_turn_succeeded",
+                _should_clear_resume_pending_after_turn(response),
+            )
+        return cast(Dict[str, Any], response)
 
 
 def _run_planned_stop_watcher(

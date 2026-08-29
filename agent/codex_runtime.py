@@ -842,6 +842,7 @@ def run_codex_app_server_turn(
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
     # is exactly what curator.py / sessions DB expect.
+    _codex_flush_ok = False
     if turn.projected_messages:
         from agent.message_metadata import append_message
 
@@ -874,8 +875,9 @@ def run_codex_app_server_turn(
                 # projection — see conversation_loop session_persistence_failed),
                 # codex output has already streamed to the user by the time this
                 # flush runs, so there is nothing left to withhold. We cannot
-                # flip agent_persisted=False either: the gateway fallback write
-                # would re-INSERT the already-flushed user turn (#860/#42039).
+                # let the gateway own the write: its fallback would re-INSERT
+                # the already-flushed user turn (#860/#42039).  The return value
+                # therefore separates write ownership from durability.
                 # Surface the durability gap loudly instead of a silent debug.
                 logger.warning(
                     "codex app-server turn was delivered but could NOT be "
@@ -964,7 +966,12 @@ def run_codex_app_server_turn(
         # skips its own append_to_transcript DB write — writing again there
         # would re-INSERT the already-flushed user turn (append_message has no
         # dedup), reintroducing the #860 / #42039 duplicate-write bug.
-        "agent_persisted": True,
+        # Ownership and durability are separate.  Codex owns this write path
+        # even when its flush fails (gateway fallback would duplicate the
+        # already-flushed user row), but only a successful DB flush is a
+        # durability receipt that may acknowledge restart-owned input.
+        "agent_persistence_owned": True,
+        "agent_persisted": bool(_codex_flush_ok),
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,
         **usage_result,

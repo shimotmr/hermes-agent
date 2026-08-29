@@ -193,6 +193,8 @@ async def test_first_turn_session_meta_is_captured_by_rebaseline(
             "tools": [{"name": "noop"}],
             "history_offset": 0,
             "last_prompt_tokens": 0,
+            "agent_persistence_owned": True,
+            "agent_persisted": True,
         }
     )
 

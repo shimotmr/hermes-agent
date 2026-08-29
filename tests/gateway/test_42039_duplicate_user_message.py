@@ -141,6 +141,8 @@ async def test_agent_failed_early_skip_db_when_agent_has_session_db(
             "messages": [],
             "history_offset": 0,
             "last_prompt_tokens": 0,
+            "agent_persistence_owned": True,
+            "agent_persisted": True,
         }
     )
 
@@ -173,6 +175,8 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
             "tools": [],
             "history_offset": 1,  # equals len(messages) → new_messages=[]
             "last_prompt_tokens": 0,
+            "agent_persistence_owned": True,
+            "agent_persisted": True,
         }
     )
 

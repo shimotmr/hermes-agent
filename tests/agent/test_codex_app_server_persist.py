@@ -10,8 +10,8 @@ blind to real gateway conversations.
 
 The fix has the codex runtime flush its own projected messages via
 ``_flush_messages_to_session_db()`` (idempotent through the intrinsic
-``_DB_PERSISTED_MARKER``) and return ``agent_persisted=True`` so the gateway
-skips its own ``append_to_transcript`` DB write. This is critical: the inbound
+``_DB_PERSISTED_MARKER``), report that it owns the write, and separately return
+the actual durability receipt. This is critical: the inbound
 user turn is already flushed at turn start (``turn_context._persist_session``),
 and ``append_message`` is a raw INSERT with no dedup — a gateway re-write would
 duplicate the user turn (#860 / #42039). This test locks in:
@@ -62,8 +62,8 @@ def _make_agent(session_db=None, session_id="sess-codex"):
 
 
 def test_codex_success_flushes_and_reports_persisted():
-    """Codex success turn must self-persist and return agent_persisted=True."""
-    agent = _make_agent(session_db=None)  # no DB -> flush is a no-op, still True
+    """A Codex success without a DB must not claim durable persistence."""
+    agent = _make_agent(session_db=None)
     result = run_codex_app_server_turn(
         agent,
         user_message="hello",
@@ -73,8 +73,23 @@ def test_codex_success_flushes_and_reports_persisted():
     )
     assert result["completed"] is True
     assert isinstance(result["messages"][-1]["timestamp"], float)
-    # With the agent as sole persister, the gateway must SKIP its DB write.
-    assert result["agent_persisted"] is True
+    assert result["agent_persisted"] is False
+
+
+def test_codex_failed_flush_reports_not_persisted():
+    agent = _make_agent(session_db=MagicMock())
+    agent._flush_messages_to_session_db.return_value = False
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    assert result["completed"] is True
+    assert result["agent_persisted"] is False
 
 
 def test_codex_user_interrupt_is_reported_and_cleared():
@@ -176,10 +191,13 @@ class TestGatewayPersistedResolution:
         return agent_result.get("agent_persisted", session_db_present)
 
     @staticmethod
-    def _resolve_passthrough(result_holder0):
+    def _resolve_passthrough(result_holder0, last_session_persisted=False):
         # gateway/run.py result_holder passthrough:
-        #   result_holder[0].get("agent_persisted", True) if result_holder[0] else True
-        return result_holder0.get("agent_persisted", True) if result_holder0 else True
+        return (
+            result_holder0.get("agent_persisted", last_session_persisted)
+            if result_holder0
+            else last_session_persisted
+        )
 
     def test_codex_result_keeps_gateway_skip(self):
         # Codex now self-persists → gateway must SKIP (agent_persisted True).
@@ -189,11 +207,29 @@ class TestGatewayPersistedResolution:
         assert self._resolve_passthrough(codex) is True
 
     def test_standard_runtime_preserves_skip_db(self):
-        # Standard runtime omits the key → old behaviour: skip iff DB present.
         standard = {"final_response": "ok"}
         assert self._resolve_persistence_block(standard, True) is True
         assert self._resolve_persistence_block(standard, False) is False
-        assert self._resolve_passthrough(standard) is True
+        assert self._resolve_passthrough(standard, True) is True
+        assert self._resolve_passthrough(standard, False) is False
 
-    def test_missing_result_holder_defaults_persisted(self):
-        assert self._resolve_passthrough(None) is True
+    def test_missing_result_holder_fails_closed_without_receipt(self):
+        assert self._resolve_passthrough(None) is False
+
+
+def test_standard_runtime_no_db_persist_receipt_is_false():
+    agent = MagicMock(spec=AIAgent)
+    agent._session_persist_lock = None
+    agent._session_db = None
+    agent._drop_trailing_empty_response_scaffolding = MagicMock()
+    agent._save_session_log = MagicMock()
+    agent._flush_messages_to_session_db = MagicMock(return_value=None)
+
+    receipt = AIAgent._persist_session(
+        agent,
+        [{"role": "user", "content": "hello"}],
+        [],
+    )
+
+    assert receipt is False
+    assert agent._last_session_persisted is False
