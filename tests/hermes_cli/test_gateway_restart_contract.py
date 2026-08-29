@@ -10,6 +10,7 @@ from hermes_cli.gateway_restart_contract import (
     evaluate_replacement,
     main,
     parse_serving_identity,
+    perform_verified_graceful_restart,
     probe_current_gateway,
 )
 
@@ -101,6 +102,38 @@ def test_new_identity_listener_and_platform_readiness_are_success() -> None:
     assert result == RestartProbe(True, "replacement-healthy", NEW)
 
 
+def test_current_verifies_only_platforms_published_by_runtime_inventory() -> None:
+    status = _status()
+    status["platforms"] = {
+        "api_server": {"state": "connected", "writer_pid": NEW.pid}
+    }
+
+    result = evaluate_current(
+        current=NEW,
+        status=status,
+        process_alive=True,
+        listener_pids={NEW.pid},
+        health_ok=True,
+    )
+
+    assert result == RestartProbe(True, "gateway-healthy", NEW)
+
+
+def test_replacement_must_run_expected_code_sha_when_supplied() -> None:
+    result = evaluate_replacement(
+        old=OLD,
+        current=NEW,
+        status=_status(),
+        old_process_alive=False,
+        new_process_alive=True,
+        listener_pids={NEW.pid},
+        health_ok=True,
+        expected_code_sha="expected-after-update",
+    )
+
+    assert result == RestartProbe(False, "replacement-code-sha-mismatch", NEW)
+
+
 def test_same_pid_and_start_time_is_not_a_replacement() -> None:
     result = evaluate_replacement(
         old=OLD,
@@ -177,6 +210,109 @@ def test_probe_uses_control_socket_identity_and_independent_adapters() -> None:
 
     assert result == RestartProbe(True, "gateway-healthy", NEW)
     assert calls == ["pid:94350", "port:8642", "health:http://127.0.0.1:8642/health"]
+
+
+def test_verified_graceful_restart_refuses_active_gateway_without_signal() -> None:
+    signals: list[int] = []
+    adapters = RuntimeAdapters(
+        identify=lambda home: {
+            "protocol": 1,
+            "kind": "hermes-gateway",
+            "pid": OLD.pid,
+            "start_time": OLD.start_time,
+            "hermes_home": str(home),
+            "code_sha": OLD.code_sha,
+        },
+        status=lambda home: _status(pid=OLD.pid, active_agents=1),
+        process_alive=lambda pid: True,
+        listener_owners=lambda port: {OLD.pid},
+        health_ok=lambda url: True,
+    )
+
+    result = perform_verified_graceful_restart(
+        HOME,
+        adapters=adapters,
+        signal_process=signals.append,
+        port=8642,
+        health_url="http://127.0.0.1:8642/health",
+        timeout=1,
+        poll_interval=0,
+    )
+
+    assert result == RestartProbe(False, "active-work:1", OLD)
+    assert signals == []
+
+
+def test_verified_graceful_restart_fails_closed_when_status_is_unavailable() -> None:
+    signals: list[int] = []
+
+    def missing_status(_home):
+        raise OSError("socket unavailable")
+
+    adapters = RuntimeAdapters(
+        identify=lambda _home: {
+            "protocol": 1,
+            "kind": "hermes-gateway",
+            "pid": OLD.pid,
+            "start_time": OLD.start_time,
+            "hermes_home": str(OLD.hermes_home),
+            "code_sha": OLD.code_sha,
+        },
+        status=missing_status,
+        process_alive=lambda _pid: True,
+        listener_owners=lambda _port: {OLD.pid},
+        health_ok=lambda _url: True,
+    )
+
+    result = perform_verified_graceful_restart(
+        HOME,
+        adapters=adapters,
+        signal_process=signals.append,
+    )
+
+    assert result.ready is False
+    assert "socket unavailable" in result.reason
+    assert signals == []
+
+
+def test_verified_graceful_restart_signals_serving_pid_and_verifies_new_sha() -> None:
+    signaled: list[int] = []
+
+    def identity(home: Path) -> dict:
+        current = NEW if signaled else OLD
+        return {
+            "protocol": 1,
+            "kind": "hermes-gateway",
+            "pid": current.pid,
+            "start_time": current.start_time,
+            "hermes_home": str(home),
+            "code_sha": current.code_sha,
+        }
+
+    def status(home: Path) -> dict:
+        return _status(pid=NEW.pid if signaled else OLD.pid)
+
+    adapters = RuntimeAdapters(
+        identify=identity,
+        status=status,
+        process_alive=lambda pid: pid == NEW.pid if signaled else pid == OLD.pid,
+        listener_owners=lambda port: {NEW.pid if signaled else OLD.pid},
+        health_ok=lambda url: True,
+    )
+
+    result = perform_verified_graceful_restart(
+        HOME,
+        adapters=adapters,
+        signal_process=signaled.append,
+        port=8642,
+        health_url="http://127.0.0.1:8642/health",
+        expected_code_sha=NEW.code_sha,
+        timeout=1,
+        poll_interval=0,
+    )
+
+    assert result == RestartProbe(True, "replacement-healthy", NEW)
+    assert signaled == [OLD.pid]
 
 
 def test_cli_ready_prints_only_verified_replacement_identity(capsys) -> None:

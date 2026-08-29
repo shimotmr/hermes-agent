@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Sequence
@@ -22,9 +24,6 @@ if __package__ in (None, ""):
     repo_root = str(Path(__file__).resolve().parents[1])
     if sys.path[0] != repo_root:
         sys.path.insert(0, repo_root)
-
-
-REQUIRED_PLATFORMS = ("api_server", "webhook", "telegram")
 
 
 class ServingIdentity(NamedTuple):
@@ -76,7 +75,7 @@ def _validate_status(
     current: ServingIdentity,
     status: dict[str, Any],
     *,
-    required_platforms: tuple[str, ...] = REQUIRED_PLATFORMS,
+    required_platforms: tuple[str, ...] | None = None,
 ) -> str | None:
     if status.get("gateway_state") != "running":
         return "gateway-not-running"
@@ -85,6 +84,8 @@ def _validate_status(
     platforms = status.get("platforms")
     if not isinstance(platforms, dict):
         return "platform-state-missing"
+    if required_platforms is None:
+        required_platforms = tuple(platforms)
     for name in required_platforms:
         record = platforms.get(name)
         if not isinstance(record, dict) or record.get("state") != "connected":
@@ -102,10 +103,13 @@ def evaluate_current(
     listener_pids: set[int],
     health_ok: bool,
     require_idle: bool = False,
+    required_platforms: tuple[str, ...] | None = None,
 ) -> RestartProbe:
     if not process_alive:
         return RestartProbe(False, "serving-process-not-alive", current)
-    status_error = _validate_status(current, status)
+    status_error = _validate_status(
+        current, status, required_platforms=required_platforms
+    )
     if status_error:
         return RestartProbe(False, status_error, current)
     if listener_pids != {current.pid}:
@@ -130,17 +134,22 @@ def evaluate_replacement(
     new_process_alive: bool,
     listener_pids: set[int],
     health_ok: bool,
+    expected_code_sha: str | None = None,
+    required_platforms: tuple[str, ...] | None = None,
 ) -> RestartProbe:
     if old_process_alive:
         return RestartProbe(False, "old-serving-process-still-alive", current)
     if (current.pid, current.start_time) == (old.pid, old.start_time):
         return RestartProbe(False, "serving-identity-did-not-change", current)
+    if expected_code_sha is not None and current.code_sha != expected_code_sha:
+        return RestartProbe(False, "replacement-code-sha-mismatch", current)
     current_probe = evaluate_current(
         current=current,
         status=status,
         process_alive=new_process_alive,
         listener_pids=listener_pids,
         health_ok=health_ok,
+        required_platforms=required_platforms,
     )
     if not current_probe.ready:
         return current_probe
@@ -158,6 +167,7 @@ def probe_current_gateway(
     port: int,
     health_url: str,
     require_idle: bool = False,
+    required_platforms: tuple[str, ...] | None = None,
 ) -> RestartProbe:
     try:
         current = parse_serving_identity(identify(home), expected_home=home)
@@ -173,7 +183,105 @@ def probe_current_gateway(
         listener_pids=listener_owners(port),
         health_ok=health_ok(health_url),
         require_idle=require_idle,
+        required_platforms=required_platforms,
     )
+
+
+def perform_verified_graceful_restart(
+    home: Path,
+    *,
+    adapters: RuntimeAdapters | None = None,
+    signal_process: Callable[[int], Any] | None = None,
+    port: int = 8642,
+    health_url: str = "http://127.0.0.1:8642/health",
+    expected_code_sha: str | None = None,
+    required_platforms: tuple[str, ...] | None = None,
+    timeout: float = 300.0,
+    poll_interval: float = 2.0,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], Any] = time.sleep,
+) -> RestartProbe:
+    """Request one graceful restart and verify the exact replacement.
+
+    There is deliberately no force fallback. Two preflight snapshots must prove
+    the same serving identity is idle before SIGUSR1 is sent. Unless supplied by
+    the caller, the first status snapshot defines the enabled writer inventory
+    that the replacement must restore.
+    """
+
+    runtime = adapters or default_adapters()
+
+    def snapshot(*, require_idle: bool) -> tuple[RestartProbe, dict[str, Any] | None]:
+        try:
+            identity = parse_serving_identity(runtime.identify(home), expected_home=home)
+            status_payload = runtime.status(home)
+        except (OSError, TypeError, ValueError) as exc:
+            return RestartProbe(False, str(exc), None), None
+        if not isinstance(status_payload, dict):
+            return RestartProbe(False, "control-status-missing", identity), None
+        probe = evaluate_current(
+            current=identity,
+            status=status_payload,
+            process_alive=runtime.process_alive(identity.pid),
+            listener_pids=runtime.listener_owners(port),
+            health_ok=runtime.health_ok(health_url),
+            require_idle=require_idle,
+            required_platforms=required_platforms,
+        )
+        return probe, status_payload
+
+    first, first_status = snapshot(require_idle=True)
+    if not first.ready or first.identity is None or first_status is None:
+        return first
+    effective_platforms = required_platforms
+    if effective_platforms is None:
+        platforms = first_status.get("platforms")
+        effective_platforms = tuple(platforms) if isinstance(platforms, dict) else ()
+
+    second, _ = snapshot(require_idle=True)
+    if not second.ready or second.identity is None:
+        return second
+    if second.identity != first.identity:
+        return RestartProbe(False, "serving-identity-changed-before-signal", second.identity)
+
+    send_signal = signal_process or (lambda pid: os.kill(pid, signal.SIGUSR1))
+    try:
+        send_signal(second.identity.pid)
+    except (OSError, ValueError) as exc:
+        return RestartProbe(
+            False, f"graceful-signal-failed:{type(exc).__name__}", second.identity
+        )
+
+    deadline = monotonic() + max(0.0, timeout)
+    last = RestartProbe(False, "replacement-not-ready", second.identity)
+    while True:
+        try:
+            current = parse_serving_identity(runtime.identify(home), expected_home=home)
+            status_payload = runtime.status(home)
+            if not isinstance(status_payload, dict):
+                last = RestartProbe(False, "control-status-missing", current)
+            else:
+                last = evaluate_replacement(
+                    old=second.identity,
+                    current=current,
+                    status=status_payload,
+                    old_process_alive=runtime.process_alive(second.identity.pid),
+                    new_process_alive=runtime.process_alive(current.pid),
+                    listener_pids=runtime.listener_owners(port),
+                    health_ok=runtime.health_ok(health_url),
+                    expected_code_sha=expected_code_sha,
+                    required_platforms=effective_platforms,
+                )
+                if last.ready:
+                    return last
+        except (OSError, TypeError, ValueError) as exc:
+            last = RestartProbe(False, str(exc), None)
+        now = monotonic()
+        if now >= deadline:
+            return RestartProbe(
+                False, f"graceful-restart-timeout:{last.reason}", last.identity
+            )
+        sleep(min(max(0.0, poll_interval), deadline - now))
 
 
 def _pid_alive(pid: int) -> bool:
@@ -247,6 +355,8 @@ def main(
     parser.add_argument("--old-pid", type=int)
     parser.add_argument("--old-start", type=int)
     parser.add_argument("--require-idle", action="store_true")
+    parser.add_argument("--required-platform", action="append", default=None)
+    parser.add_argument("--expected-code-sha")
     args = parser.parse_args(argv)
     runtime = adapters or default_adapters()
 
@@ -271,6 +381,9 @@ def main(
                 listener_pids=runtime.listener_owners(args.port),
                 health_ok=runtime.health_ok(args.health_url),
                 require_idle=args.require_idle,
+                required_platforms=(
+                    tuple(args.required_platform) if args.required_platform is not None else None
+                ),
             )
         )
 
@@ -286,6 +399,10 @@ def main(
             new_process_alive=runtime.process_alive(current.pid),
             listener_pids=runtime.listener_owners(args.port),
             health_ok=runtime.health_ok(args.health_url),
+            expected_code_sha=args.expected_code_sha,
+            required_platforms=(
+                tuple(args.required_platform) if args.required_platform is not None else None
+            ),
         )
     )
 
