@@ -659,6 +659,7 @@ When a session expires:
 | `thread_sessions_per_user` | `bool` | `false` | Isolate thread sessions per user |
 | `session_store_max_age_days` | `int` | `0` | Prune sessions older than N days (0=disabled) |
 | `agent.gateway_auto_continue_freshness` | `int` | `3600` | Seconds for resume freshness window |
+| `agent.gateway_auto_resume_max_prompt_tokens` | `int` | `200000` | Defer synthetic startup resume above this last prompt size so fresh inbound is not blocked; `0` disables the size gate, and durable queued follow-ups remain eligible |
 | `agent.gateway_timeout` | `int` | `1800` | Agent turn timeout (30 min default) |
 | `agent.agent_cache.max_size` | `int` | `128` | LRU entry cap on cached AIAgents |
 | `agent.agent_cache.idle_ttl_secs` | `int` | `3600` | Evict agents idle this long |

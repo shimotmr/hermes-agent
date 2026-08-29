@@ -6166,16 +6166,61 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
-    async def handle_message(self, event: MessageEvent) -> None:
+    @staticmethod
+    def _mark_message_accepted(event: MessageEvent) -> bool:
+        """Publish an exact-event receipt for the current dispatch attempt."""
+        nonce = getattr(event, "_hermes_adapter_acceptance_probe", None)
+        if nonce is not None:
+            setattr(event, "_hermes_adapter_acceptance_receipt", nonce)
+        return True
+
+    async def dispatch_message_with_acceptance(self, event: MessageEvent) -> bool:
+        """Dispatch with an explicit receipt tied to this exact event attempt.
+
+        Platform overrides may perform small post-dispatch work after delegating
+        to :meth:`handle_message`. If that work raises after the base adapter
+        accepted this exact event, the nonce receipt prevents a recovery caller
+        from creating a second durable owner. Pre-existing session state cannot
+        satisfy the nonce and therefore cannot mask a pre-acceptance failure.
+        """
+        nonce = object()
+        setattr(event, "_hermes_adapter_acceptance_probe", nonce)
+        try:
+            return await self.handle_message(event) is True
+        except Exception:
+            if getattr(event, "_hermes_adapter_acceptance_receipt", None) is nonce:
+                logger.warning(
+                    "[%s] Message dispatch raised after exact-event acceptance",
+                    self.name,
+                    exc_info=True,
+                )
+                return True
+            raise
+        finally:
+            for attr in (
+                "_hermes_adapter_acceptance_probe",
+                "_hermes_adapter_acceptance_receipt",
+            ):
+                try:
+                    delattr(event, attr)
+                except AttributeError:
+                    pass
+
+    async def handle_message(self, event: MessageEvent) -> bool:
         """
         Process an incoming message.
-        
+
         This method returns quickly by spawning background tasks.
         This allows new messages to be processed even while an agent is running,
         enabling interruption support.
+
+        Returns ``True`` only after this adapter has synchronously accepted
+        ownership of the event (inline handling, a pending queue, or a
+        background session task). ``False`` means no owner was installed and
+        the caller must retain or durably hand off the event.
         """
         if not self._message_handler:
-            return
+            return False
 
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
@@ -6206,7 +6251,7 @@ class BasePlatformAdapter(ABC):
                 expected_session_key,
                 session_key,
             )
-            return
+            return False
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
@@ -6249,7 +6294,7 @@ class BasePlatformAdapter(ABC):
                             "[%s] Command '/%s' dispatch failed: %s",
                             self.name, cmd, e, exc_info=True,
                         )
-                    return
+                    return self._mark_message_accepted(event)
 
                 # Other bypass commands (/approve, /deny, /status,
                 # /background, /restart) just need direct dispatch — they
@@ -6277,7 +6322,7 @@ class BasePlatformAdapter(ABC):
                             )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
-                return
+                return self._mark_message_accepted(event)
 
             # Clarify reply bypass: if the agent is blocked on a
             # clarify_tool call, the next non-command message in this
@@ -6333,12 +6378,12 @@ class BasePlatformAdapter(ABC):
                             "[%s] Clarify text-intercept dispatch failed: %s",
                             self.name, e, exc_info=True,
                         )
-                    return
+                    return self._mark_message_accepted(event)
 
             if self._busy_session_handler is not None:
                 try:
                     if await self._busy_session_handler(event, session_key):
-                        return
+                        return self._mark_message_accepted(event)
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
 
@@ -6348,7 +6393,7 @@ class BasePlatformAdapter(ABC):
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
                 merge_pending_message_event(self._pending_messages, session_key, event)
-                return  # Don't interrupt now - will run after current task completes
+                return self._mark_message_accepted(event)  # Processed after current task.
 
             if self._is_queue_text_debounce_candidate(event):
                 logger.debug(
@@ -6372,8 +6417,8 @@ class BasePlatformAdapter(ABC):
                     event,
                     merge_text=event.message_type == MessageType.TEXT,
                 )
-            return  # Don't process now - will be handled after current task finishes
-        
+            return self._mark_message_accepted(event)  # Processed after current task.
+
         # Mark session as active BEFORE spawning background task to close
         # the race window where a second message arriving before the task
         # starts would also pass the _active_sessions check and spawn a
@@ -6381,8 +6426,10 @@ class BasePlatformAdapter(ABC):
         # pattern — set the guard synchronously, not inside the task.)
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
-        self._start_session_processing(event, session_key)
-    
+        if self._start_session_processing(event, session_key):
+            return self._mark_message_accepted(event)
+        return False
+
     @staticmethod
     def _get_human_delay() -> float:
         """

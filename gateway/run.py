@@ -1122,6 +1122,12 @@ _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
 # Override via ``config.yaml`` ``agent.gateway_startup_restore_drain_timeout``.
 _STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT = 30.0
 
+# Synthetic startup continuation is convenience, not permission to let a huge
+# interrupted transcript monopolize the boot-time inbound gate.  Sessions over
+# this last-observed prompt size wait for a real user message instead.  Durable
+# follow-up payloads are exempt because restart replay is their only owner.
+_AUTO_RESUME_MAX_PROMPT_TOKENS_DEFAULT = 200_000
+
 
 def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
     """Best-effort conversion of stored gateway timestamps to epoch seconds.
@@ -1206,6 +1212,35 @@ def _startup_restore_drain_timeout_secs() -> float:
         return float(raw)
     except (TypeError, ValueError):
         return float(_STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT)
+
+
+def _auto_resume_max_prompt_tokens() -> int:
+    """Largest transcript eligible for synthetic startup continuation.
+
+    Reads ``HERMES_AUTO_RESUME_MAX_PROMPT_TOKENS`` (bridged from
+    ``agent.gateway_auto_resume_max_prompt_tokens``).  Non-positive values
+    disable the size gate; malformed values fall back to the safe default.
+    """
+    raw = os.environ.get("HERMES_AUTO_RESUME_MAX_PROMPT_TOKENS")
+    if raw is None or raw == "":
+        return _AUTO_RESUME_MAX_PROMPT_TOKENS_DEFAULT
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return _AUTO_RESUME_MAX_PROMPT_TOKENS_DEFAULT
+
+
+def _bridge_auto_resume_max_prompt_tokens(agent_cfg: Any) -> None:
+    """Publish the config-authoritative startup-resume size limit.
+
+    This is intentionally presence-sensitive: removing the config key resets
+    the internal env bridge to the canonical default instead of retaining a
+    value exported by an earlier in-process config load.
+    """
+    value: Any = _AUTO_RESUME_MAX_PROMPT_TOKENS_DEFAULT
+    if isinstance(agent_cfg, dict) and "gateway_auto_resume_max_prompt_tokens" in agent_cfg:
+        value = agent_cfg["gateway_auto_resume_max_prompt_tokens"]
+    os.environ["HERMES_AUTO_RESUME_MAX_PROMPT_TOKENS"] = str(value)
 
 
 def _as_thread_info(info: Any) -> Optional[Tuple[str, str]]:
@@ -2386,6 +2421,7 @@ from hermes_cli.config_defaults import DEFAULT_CONFIG as _DEFAULT_CONFIG
 os.environ["HERMES_TURN_LEASE_TIMEOUT"] = str(
     _DEFAULT_CONFIG["agent"]["gateway_turn_lease_timeout"]
 )
+_bridge_auto_resume_max_prompt_tokens(None)
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
@@ -2527,6 +2563,7 @@ if _config_path.exists():
         # `hermes setup` run) silently shadow the user's current config.
         # See PR #18413 / the 60-vs-500 max_turns incident.
         _agent_cfg = _cfg.get("agent", {})
+        _bridge_auto_resume_max_prompt_tokens(_agent_cfg)
         if _agent_cfg and isinstance(_agent_cfg, dict):
             if "max_turns" in _agent_cfg:
                 _raw_mt = _agent_cfg["max_turns"]
@@ -2568,6 +2605,7 @@ if _config_path.exists():
                 os.environ["HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT"] = str(
                     _agent_cfg["gateway_startup_restore_drain_timeout"]
                 )
+
         # config-authoritative knobs for the session-search index; same
         # bridge semantics as the agent settings above.
         _sessions_cfg = _cfg.get("sessions", {})
@@ -9479,6 +9517,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         pending_event: Optional["MessageEvent"],
         adapter: Any,
         source: Optional[SessionSource] = None,
+        restore_head_on_failure: bool = True,
     ) -> bool:
         async with self._pending_followup_handoff_lock(session_key):
             return await self._preserve_draining_followup_locked(
@@ -9487,6 +9526,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pending_event=pending_event,
                 adapter=adapter,
                 source=source,
+                restore_head_on_failure=restore_head_on_failure,
             )
 
     async def _preserve_draining_followup_locked(
@@ -9497,6 +9537,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         pending_event: Optional["MessageEvent"],
         adapter: Any,
         source: Optional[SessionSource] = None,
+        restore_head_on_failure: bool = True,
     ) -> bool:
         """Atomically transfer the complete local FIFO to restart ownership."""
         head = pending_event
@@ -9522,9 +9563,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for event in local_events:
             event_source = getattr(event, "source", None)
             if event_source is None:
-                self._restore_dequeued_followup(
-                    session_key, adapter, pending_event, pending_text, source
-                )
+                if restore_head_on_failure:
+                    self._restore_dequeued_followup(
+                        session_key, adapter, pending_event, pending_text, source
+                    )
                 return False
             # Adapter role grants are transport-local trust and intentionally
             # excluded from persistence.  Only accept the handoff when another
@@ -9538,15 +9580,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     durably_authorized = False
                 if not durably_authorized:
-                    self._restore_dequeued_followup(
-                        session_key, adapter, pending_event, pending_text, source
-                    )
+                    if restore_head_on_failure:
+                        self._restore_dequeued_followup(
+                            session_key, adapter, pending_event, pending_text, source
+                        )
                     return False
             payload = self._serialize_pending_followup_event(event)
             if payload is None:
-                self._restore_dequeued_followup(
-                    session_key, adapter, pending_event, pending_text, source
-                )
+                if restore_head_on_failure:
+                    self._restore_dequeued_followup(
+                        session_key, adapter, pending_event, pending_text, source
+                    )
                 return False
             payloads.append(payload)
 
@@ -9564,20 +9608,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ]
 
         def restore_detached_snapshot() -> bool:
-            if pending_slot is None:
-                return self._restore_dequeued_followup(
-                    session_key, adapter, pending_event, pending_text, source
-                )
-            late_slot = pending_slot.pop(session_key, None)
             restore_state = queue_state or self._session_state(session_key)
             late_overflow = list(restore_state.conversation.queued_events)
-            replay = list(local_events)
+            replay = list(
+                local_events if restore_head_on_failure else local_events[1:]
+            )
+            if pending_slot is None:
+                # There is no adapter slot to receive the restored snapshot.
+                # Keep every locally-owned event in conversation overflow; for
+                # startup handoff the exact head is intentionally excluded
+                # because _startup_restore_queue still owns it.
+                replay.extend(late_overflow)
+                restore_state.conversation.queued_events[:] = replay
+                return bool(replay)
+            late_slot = pending_slot.pop(session_key, None)
             if late_slot is not None:
                 replay.append(late_slot)
             replay.extend(late_overflow)
-            pending_slot[session_key] = replay[0]
-            restore_state.conversation.queued_events[:] = replay[1:]
-            return True
+            if replay:
+                pending_slot[session_key] = replay[0]
+                restore_state.conversation.queued_events[:] = replay[1:]
+                return True
+            restore_state.conversation.queued_events[:] = []
+            return False
 
         try:
             current_entry = await self.async_session_store.get(session_key)
@@ -12453,29 +12506,100 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    async def _durably_preserve_startup_restore_event(
+        self,
+        event: MessageEvent,
+        adapter: Optional[BasePlatformAdapter],
+    ) -> bool:
+        """Transfer a failed startup replay to restart-executable ownership."""
+        source = getattr(event, "source", None)
+        if source is None:
+            return False
+        try:
+            session_key = self._session_key_for_source(source)
+            return await self._preserve_draining_followup(
+                session_key,
+                event.text,
+                pending_event=event,
+                adapter=adapter,
+                source=source,
+                # The startup FIFO retains this exact head until the durable
+                # transfer succeeds.  Failed persistence may restore detached
+                # adapter tail/late arrivals, but must not create a second head.
+                restore_head_on_failure=False,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to durably preserve startup-restore queued message",
+                exc_info=True,
+            )
+            return False
+
     async def _drain_startup_restore_queue(self) -> int:
+        """Replay startup FIFO exactly once across finish/reconnect callers."""
+        lock = getattr(self, "_startup_restore_drain_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._startup_restore_drain_lock = lock
+        async with lock:
+            return await self._drain_startup_restore_queue_locked()
+
+    async def _drain_startup_restore_queue_locked(self) -> int:
         """Replay inbound messages queued while startup auto-resume ran."""
         drained = 0
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
             return 0
         while queue:
-            event = queue.pop(0)
+            # Peek first.  The startup queue remains the sole owner until the
+            # adapter has accepted the event; popping before an awaited
+            # dispatch loses it on adapter failure or disconnect.
+            event = queue[0]
             source = getattr(event, "source", None)
-            adapter = self._adapter_for_source(source)
+            adapter = cast(
+                Optional[BasePlatformAdapter], self._adapter_for_source(source)
+            )
             if adapter is None:
-                logger.debug(
-                    "Dropping startup-restore queued message: adapter unavailable for %s",
+                logger.warning(
+                    "Retaining startup-restore queued message: adapter unavailable for %s",
                     getattr(getattr(source, "platform", None), "value", None),
                 )
-                continue
+                if await self._durably_preserve_startup_restore_event(event, None):
+                    queue.pop(0)
+                    continue
+                break
+            # This event crossed normal ingress hooks, authorization, and
+            # emergency-stop policy before entering the startup FIFO. Replay it
+            # as internal so those side-effecting gates are not run twice.
+            event.internal = True
             # Mark this replay so _handle_message does not queue it again while
             # the restore gate remains closed for any fresh inbound arrivals.
             try:
                 setattr(event, "_hermes_startup_restore_replay", True)
             except Exception:
                 pass
-            await adapter.handle_message(event)
+            try:
+                accepted = await adapter.dispatch_message_with_acceptance(event)
+            except Exception as exc:
+                logger.warning(
+                    "Retaining startup-restore queued message after dispatch "
+                    "failure: %s",
+                    exc,
+                )
+                if await self._durably_preserve_startup_restore_event(event, adapter):
+                    queue.pop(0)
+                    continue
+                break
+            if accepted is not True:
+                logger.warning(
+                    "Retaining startup-restore queued message: adapter did not "
+                    "return an explicit acceptance receipt"
+                )
+                if await self._durably_preserve_startup_restore_event(event, adapter):
+                    queue.pop(0)
+                    continue
+                break
+            queue.pop(0)
             drained += 1
         return drained
 
@@ -12532,8 +12656,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=(type(exc), exc, exc.__traceback__),
                     )
         self._startup_restore_tasks = []
-        drained = await self._drain_startup_restore_queue()
-        self._startup_restore_in_progress = False
+        drained = 0
+        try:
+            drained = await self._drain_startup_restore_queue()
+        finally:
+            # Never leave every inbound path behind a permanently closed gate,
+            # even if queue replay encounters an unexpected adapter failure.
+            self._startup_restore_in_progress = False
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
@@ -12966,10 +13095,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         now = datetime.now()
         scheduled = 0
+        max_prompt_tokens = _auto_resume_max_prompt_tokens()
+        size_deferred = getattr(self, "_auto_resume_size_deferred_sessions", None)
+        if size_deferred is None:
+            size_deferred = set()
+            self._auto_resume_size_deferred_sessions = size_deferred
         for entry in candidates:
             marker = entry.last_resume_marked_at or entry.updated_at
             if marker is not None and (now - marker).total_seconds() > window:
                 continue
+
+            has_durable_followup = bool(entry.pending_followup_events) or bool(
+                isinstance(entry.pending_followup_text, str)
+                and entry.pending_followup_text.strip()
+            )
+            try:
+                prompt_tokens = max(0, int(entry.last_prompt_tokens or 0))
+            except (TypeError, ValueError, OverflowError):
+                # Legacy/corrupt metadata is unknown, not proof that a session
+                # is oversized.  Do not let one bad entry abort all startup
+                # recovery candidates.
+                prompt_tokens = 0
+            if (
+                max_prompt_tokens > 0
+                and prompt_tokens > max_prompt_tokens
+                and not has_durable_followup
+            ):
+                log = logger.warning if entry.session_key not in size_deferred else logger.debug
+                log(
+                    "Deferring synthetic auto-resume for %s: last prompt size "
+                    "%d exceeds startup limit %d; waiting for real inbound",
+                    entry.session_key, prompt_tokens, max_prompt_tokens,
+                )
+                size_deferred.add(entry.session_key)
+                continue
+            size_deferred.discard(entry.session_key)
 
             # Already being resumed (e.g. scheduled at startup and still
             # in-flight) — don't synthesize a second continuation turn.
@@ -12995,10 +13155,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # receive a full agent response on gateway restart just
             # because it has a resume-pending marker (issue #23778).
             try:
-                if not self._is_user_authorized(source):
+                if (
+                    not self._is_user_authorized(source)
+                    or self._session_key_for_source(source) != entry.session_key
+                ):
                     logger.warning(
-                        "Skipping auto-resume for %s: session owner is no "
-                        "longer authorized under the current allowlist",
+                        "Skipping auto-resume for %s: session owner is no longer "
+                        "authorized or no longer routes to this session",
                         entry.session_key,
                     )
                     continue
@@ -15590,6 +15753,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             pass
 
+                        # Inbound accepted while startup restore was gated may
+                        # still be owned by the startup FIFO if this platform
+                        # was unavailable or rejected dispatch.  Retry that
+                        # exact FIFO now; peek-before-pop keeps failures owned.
+                        try:
+                            await self._drain_startup_restore_queue()
+                        except Exception:
+                            logger.debug(
+                                "startup-restore queue retry after %s reconnect failed",
+                                platform.value,
+                                exc_info=True,
+                            )
+
                         # A platform that was offline at gateway startup never
                         # got its restart-interrupted sessions auto-resumed —
                         # the startup pass skips sessions whose adapter isn't
@@ -17915,14 +18091,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
 
-        if (
-            getattr(self, "_startup_restore_in_progress", False)
-            and not is_internal
-            and not getattr(event, "_hermes_startup_restore_replay", False)
-        ):
-            self._queue_startup_restore_event(event)
-            return None
-
         # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
         # clock for real (user-originated) inbound only. Internal/system events
         # (background-process completions, startup-restore replays) are NOT
@@ -18115,6 +18283,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         getattr(source, "chat_id", None) or "unknown",
                     )
                     return _paused_notice
+
+        # Startup restore may retain or durably hand off this event, so the
+        # queue boundary must sit after every ingress trust/policy gate above.
+        # Replays are internal only because hooks, authorization, and e-stop
+        # have already evaluated this exact normalized event once.
+        if (
+            getattr(self, "_startup_restore_in_progress", False)
+            and not is_internal
+            and not getattr(event, "_hermes_startup_restore_replay", False)
+        ):
+            self._queue_startup_restore_event(event)
+            return None
 
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher

@@ -37,6 +37,8 @@ from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
+    _auto_resume_max_prompt_tokens,
+    _bridge_auto_resume_max_prompt_tokens,
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
@@ -49,6 +51,14 @@ from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_restart_loop_guard(monkeypatch):
+    """Scheduler tests must never mutate the live restart-loop marker."""
+    check = MagicMock(return_value=False)
+    monkeypatch.setattr("gateway.restart_loop_guard.check_and_record", check)
+    return check
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +624,201 @@ async def test_drain_timeout_marks_resume_pending():
 
 
 @pytest.mark.asyncio
+async def test_startup_auto_resume_defers_oversized_interrupted_session(
+    monkeypatch,
+):
+    """A huge transcript must not claim startup priority over fresh inbound.
+
+    The durable marker remains intact so the next real user message can resume
+    the session deliberately.  This gate applies only to synthetic restart
+    continuation; it must not suspend, reset, or acknowledge the session.
+    """
+    monkeypatch.setenv("HERMES_AUTO_RESUME_MAX_PROMPT_TOKENS", "200000")
+    runner, adapter = make_restart_runner()
+    runner._persist_active_agents = MagicMock()
+    source = make_restart_source(chat_id="oversized-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:oversized-chat",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+        last_prompt_tokens=270_000,
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    assert runner._schedule_resume_pending_sessions() == 0
+    await asyncio.sleep(0)
+
+    adapter.handle_message.assert_not_awaited()
+    assert pending_entry.resume_pending is True
+    assert pending_entry.session_key not in runner._running_agents
+    runner._persist_active_agents.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_does_not_defer_oversized_durable_followup(
+    monkeypatch,
+):
+    """A restart-owned user event remains executable regardless of transcript size."""
+    monkeypatch.setenv("HERMES_AUTO_RESUME_MAX_PROMPT_TOKENS", "200000")
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="oversized-followup-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:oversized-followup-chat",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="shutdown_pending_followup",
+        last_resume_marked_at=datetime.now(),
+        last_prompt_tokens=270_000,
+        pending_followup_text="queued user message",
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+
+    adapter.handle_message.assert_awaited_once()
+    call = adapter.handle_message.await_args
+    assert call is not None
+    assert call.args[0].text == "queued user message"
+
+
+@pytest.mark.asyncio
+async def test_legacy_durable_followup_rejects_stale_route_identity():
+    """Legacy text may replay only when its origin still derives the stored key."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="legacy-route-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:DIFFERENT",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="shutdown_pending_followup",
+        last_resume_marked_at=datetime.now(),
+        pending_followup_text="must not cross routes",
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock(return_value=True)
+
+    assert runner._schedule_resume_pending_sessions() == 0
+    await asyncio.sleep(0)
+
+    adapter.handle_message.assert_not_awaited()
+    assert pending_entry.resume_pending is True
+    assert pending_entry.session_key not in runner._running_agents
+
+
+def test_auto_resume_size_gate_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("HERMES_AUTO_RESUME_MAX_PROMPT_TOKENS", "0")
+    assert _auto_resume_max_prompt_tokens() == 0
+
+
+def test_auto_resume_config_removal_resets_internal_bridge(monkeypatch):
+    monkeypatch.setenv("HERMES_AUTO_RESUME_MAX_PROMPT_TOKENS", "17")
+
+    _bridge_auto_resume_max_prompt_tokens(
+        {"gateway_auto_resume_max_prompt_tokens": 123456}
+    )
+    assert _auto_resume_max_prompt_tokens() == 123456
+
+    _bridge_auto_resume_max_prompt_tokens({})
+    assert _auto_resume_max_prompt_tokens() == 200000
+
+
+def test_auto_resume_limit_is_present_in_canonical_config_defaults():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["agent"]["gateway_auto_resume_max_prompt_tokens"] == 200000
+
+
+@pytest.mark.asyncio
+async def test_malformed_prompt_size_does_not_abort_startup_resume(monkeypatch):
+    monkeypatch.setenv("HERMES_AUTO_RESUME_MAX_PROMPT_TOKENS", "200000")
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="unknown-size-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:unknown-size-chat",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    pending_entry.last_prompt_tokens = "not-an-integer"  # type: ignore[assignment]
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_infinite_prompt_size_does_not_abort_later_startup_candidate(monkeypatch):
+    monkeypatch.setenv("HERMES_AUTO_RESUME_MAX_PROMPT_TOKENS", "200000")
+    runner, adapter = make_restart_runner()
+    now = datetime.now()
+    infinite_source = make_restart_source(chat_id="infinite-size-chat")
+    valid_source = make_restart_source(chat_id="valid-after-infinite-chat")
+    infinite_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:infinite-size-chat",
+        session_id="sid-infinite",
+        created_at=now,
+        updated_at=now,
+        origin=infinite_source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=now,
+    )
+    infinite_entry.last_prompt_tokens = float("inf")  # type: ignore[assignment]
+    valid_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:valid-after-infinite-chat",
+        session_id="sid-valid",
+        created_at=now,
+        updated_at=now,
+        origin=valid_source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=now,
+        last_prompt_tokens=1,
+    )
+    runner.session_store._entries = {
+        infinite_entry.session_key: infinite_entry,
+        valid_entry.session_key: valid_entry,
+    }
+    adapter.handle_message = AsyncMock()
+
+    assert runner._schedule_resume_pending_sessions() == 2
+    await asyncio.sleep(0)
+    assert adapter.handle_message.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_startup_auto_resume_skips_unauthorized_owner():
     """A resume-pending session whose owner is no longer authorized under the
     current allowlist must not receive a synthesized agent turn on restart.
@@ -730,13 +935,16 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     resume_done = asyncio.Event()
     seen: list[str] = []
 
-    async def fake_handle_message(event: MessageEvent) -> None:
-        if event.internal:
+    async def fake_handle_message(event: MessageEvent) -> bool:
+        if event.internal and not getattr(
+            event, "_hermes_startup_restore_replay", False
+        ):
             seen.append("resume-start")
             task = asyncio.create_task(resume_done.wait())
             adapter._session_tasks[pending_entry.session_key] = task
-            return
+            return True
         seen.append(f"inbound:{event.text}")
+        return True
 
     adapter.handle_message = fake_handle_message
 
@@ -1019,6 +1227,296 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
 
 
 @pytest.mark.asyncio
+async def test_startup_restore_dispatch_failure_retains_fifo_and_releases_gate():
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_tasks = []
+    inbound = MessageEvent(
+        text="must survive",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="restore-failure-chat"),
+    )
+    runner._startup_restore_queue = [inbound]
+    adapter.handle_message = AsyncMock(side_effect=RuntimeError("forced dispatch failure"))
+    runner._durably_preserve_startup_restore_event = AsyncMock(return_value=False)
+
+    await runner._finish_startup_restore()
+
+    assert runner._startup_restore_in_progress is False
+    assert runner._startup_restore_queue == [inbound]
+
+
+@pytest.mark.asyncio
+async def test_startup_restore_missing_adapter_retains_fifo():
+    runner, _adapter = make_restart_runner()
+    inbound = MessageEvent(
+        text="wait for reconnect",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="restore-no-adapter-chat"),
+    )
+    runner._startup_restore_queue = [inbound]
+    runner._adapter_for_source = MagicMock(return_value=None)
+    runner._durably_preserve_startup_restore_event = AsyncMock(return_value=False)
+
+    assert await runner._drain_startup_restore_queue() == 0
+    assert runner._startup_restore_queue == [inbound]
+
+
+@pytest.mark.asyncio
+async def test_startup_restore_requires_explicit_adapter_acceptance_receipt():
+    runner, adapter = make_restart_runner()
+    inbound = MessageEvent(
+        text="no silent drop",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="restore-no-receipt-chat"),
+    )
+    runner._startup_restore_queue = [inbound]
+    adapter.handle_message = AsyncMock(return_value=None)
+    runner._durably_preserve_startup_restore_event = AsyncMock(return_value=False)
+
+    assert await runner._drain_startup_restore_queue() == 0
+    assert runner._startup_restore_queue == [inbound]
+
+
+@pytest.mark.asyncio
+async def test_base_adapter_reports_rejection_when_message_handler_is_missing():
+    _runner, adapter = make_restart_runner()
+    adapter._message_handler = None
+    inbound = MessageEvent(
+        text="no handler",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="restore-base-no-handler-chat"),
+    )
+
+    assert await adapter.handle_message(inbound) is False
+
+
+@pytest.mark.asyncio
+async def test_startup_restore_does_not_duplicate_after_adapter_accepts_then_raises():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="restore-accepted-then-raised-chat")
+    inbound = MessageEvent(
+        text="one owner",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    runner._startup_restore_queue = [inbound]
+    runner._durably_preserve_startup_restore_event = AsyncMock(return_value=True)
+
+    original_handle_message = adapter.handle_message
+
+    async def accept_then_raise(event: MessageEvent) -> bool:
+        assert await original_handle_message(event) is True
+        raise RuntimeError("raised after exact event acceptance")
+
+    adapter._active_sessions[runner._session_key_for_source(source)] = asyncio.Event()
+    adapter.handle_message = accept_then_raise
+
+    assert await runner._drain_startup_restore_queue() == 1
+    assert runner._startup_restore_queue == []
+    assert runner._session_key_for_source(source) in adapter._pending_messages
+    runner._durably_preserve_startup_restore_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preexisting_owner_cannot_mask_failure_before_exact_event_acceptance():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="restore-old-owner-chat")
+    inbound = MessageEvent(
+        text="still unowned",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    session_key = runner._session_key_for_source(source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    runner._startup_restore_queue = [inbound]
+    runner._durably_preserve_startup_restore_event = AsyncMock(return_value=False)
+    adapter.handle_message = AsyncMock(side_effect=RuntimeError("before acceptance"))
+
+    assert await runner._drain_startup_restore_queue() == 0
+    assert runner._startup_restore_queue == [inbound]
+    assert session_key not in adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_startup_restore_dispatch_failure_transfers_exact_event_to_durable_owner():
+    runner, adapter = make_restart_runner()
+    inbound = MessageEvent(
+        text="durable fallback",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="restore-durable-chat"),
+    )
+    runner._startup_restore_queue = [inbound]
+    adapter.handle_message = AsyncMock(side_effect=RuntimeError("forced dispatch failure"))
+    runner._durably_preserve_startup_restore_event = AsyncMock(return_value=True)
+
+    assert await runner._drain_startup_restore_queue() == 0
+
+    assert runner._startup_restore_queue == []
+    runner._durably_preserve_startup_restore_event.assert_awaited_once_with(
+        inbound, adapter
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_restore_dispatch_failure_persists_real_restart_owner(tmp_path):
+    runner, adapter = make_restart_runner()
+    store = _make_store(tmp_path)
+    source = make_restart_source(chat_id="restore-real-durable-chat")
+    entry = store.get_or_create_session(source)
+    runner.session_store = store
+    inbound = MessageEvent(
+        text="",
+        message_type=MessageType.PHOTO,
+        source=source,
+        media_urls=["/tmp/startup-photo.jpg"],
+        media_types=["image/jpeg"],
+        reply_to_message_id="reply-startup",
+        metadata={"album": "startup"},
+    )
+    runner._startup_restore_queue = [inbound]
+    adapter.handle_message = AsyncMock(side_effect=RuntimeError("forced dispatch failure"))
+
+    assert await runner._drain_startup_restore_queue() == 0
+
+    assert runner._startup_restore_queue == []
+    durable = store._entries[entry.session_key]
+    assert durable.resume_pending is True
+    assert len(durable.pending_followup_events) == 1
+    payload = durable.pending_followup_events[0]
+    assert payload["text"] == ""
+    assert payload["message_type"] == "photo"
+    assert payload["media_urls"] == ["/tmp/startup-photo.jpg"]
+    assert payload["media_types"] == ["image/jpeg"]
+    assert payload["reply_to_message_id"] == "reply-startup"
+    assert payload["metadata"] == {"album": "startup"}
+
+
+@pytest.mark.asyncio
+async def test_startup_restore_durable_save_failure_keeps_only_fifo_owner(tmp_path):
+    """A failed durable handoff must not copy the FIFO head into the adapter."""
+    runner, adapter = make_restart_runner()
+    store = _make_store(tmp_path)
+    source = make_restart_source(chat_id="restore-save-failure-chat")
+    store.get_or_create_session(source)
+    store.mark_resume_pending = MagicMock(return_value=False)
+    runner.session_store = store
+    inbound = MessageEvent(
+        text="one recoverable owner",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    session_key = runner._session_key_for_source(source)
+    runner._startup_restore_queue = [inbound]
+    adapter.handle_message = AsyncMock(side_effect=RuntimeError("before acceptance"))
+
+    assert await runner._drain_startup_restore_queue() == 0
+
+    assert runner._startup_restore_queue == [inbound]
+    assert session_key not in adapter._pending_messages
+    assert store._entries[session_key].resume_pending is False
+
+
+@pytest.mark.asyncio
+async def test_adapterless_startup_save_failure_restores_overflow_tail(tmp_path):
+    """Adapter loss during durable save must not discard detached FIFO tails."""
+    runner, _adapter = make_restart_runner()
+    store = _make_store(tmp_path)
+    source = make_restart_source(chat_id="restore-adapterless-tail-chat")
+    store.get_or_create_session(source)
+    store.mark_resume_pending = MagicMock(return_value=False)
+    runner.session_store = store
+    head = MessageEvent(
+        text="startup-owned head",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    tail = MessageEvent(
+        text="existing overflow tail",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    session_key = runner._session_key_for_source(source)
+    runner._startup_restore_queue = [head]
+    runner._session_state(session_key).conversation.queued_events[:] = [tail]
+
+    assert await runner._durably_preserve_startup_restore_event(head, None) is False
+
+    assert runner._startup_restore_queue == [head]
+    assert runner._session_state(session_key).conversation.queued_events == [tail]
+    assert store._entries[session_key].resume_pending is False
+
+
+@pytest.mark.asyncio
+async def test_startup_gate_rejects_unauthorized_before_queue_or_durable_handoff():
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="restore-pre-auth-chat")
+    inbound = MessageEvent(
+        text="must not become trusted",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._is_user_authorized_for_source = MagicMock(return_value=False)
+    runner._get_unauthorized_dm_behavior = MagicMock(return_value="ignore")
+    runner._durably_preserve_startup_restore_event = AsyncMock(return_value=True)
+
+    assert await runner._handle_message(inbound) is None
+    assert runner._startup_restore_queue == []
+    runner._durably_preserve_startup_restore_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_gate_applies_plugin_skip_before_queueing(monkeypatch):
+    runner, _adapter = make_restart_runner()
+    inbound = MessageEvent(
+        text="plugin-owned",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="restore-plugin-policy-chat"),
+    )
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    hook = MagicMock(return_value=[{"action": "skip", "reason": "policy"}])
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", hook)
+
+    assert await runner._handle_message(inbound) is None
+    assert runner._startup_restore_queue == []
+    hook.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_startup_queue_drains_dispatch_head_exactly_once():
+    runner, adapter = make_restart_runner()
+    inbound = MessageEvent(
+        text="once",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="restore-concurrent-chat"),
+    )
+    runner._startup_restore_queue = [inbound]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    seen: list[MessageEvent] = []
+
+    async def slow_dispatch(event):
+        seen.append(event)
+        entered.set()
+        await release.wait()
+        return True
+
+    adapter.handle_message = slow_dispatch
+    first = asyncio.create_task(runner._drain_startup_restore_queue())
+    await entered.wait()
+    second = asyncio.create_task(runner._drain_startup_restore_queue())
+    await asyncio.sleep(0)
+
+    assert seen == [inbound]
+    release.set()
+    assert await asyncio.gather(first, second) == [1, 0]
+    assert runner._startup_restore_queue == []
+
+
+@pytest.mark.asyncio
 async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
     monkeypatch,
 ):
@@ -1044,8 +1542,9 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
     async def slow_resume_turn() -> None:
         await never_finishes.wait()
 
-    async def fake_handle_message(event: MessageEvent) -> None:
+    async def fake_handle_message(event: MessageEvent) -> bool:
         seen.append(f"inbound:{event.text}")
+        return True
 
     adapter.handle_message = fake_handle_message
 
@@ -1107,8 +1606,9 @@ async def test_startup_restore_gate_releases_when_boot_path_send_hangs(
 
     seen: list[str] = []
 
-    async def fake_handle_message(event: MessageEvent) -> None:
+    async def fake_handle_message(event: MessageEvent) -> bool:
         seen.append(f"inbound:{event.text}")
+        return True
 
     adapter.handle_message = fake_handle_message
 

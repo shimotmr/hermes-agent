@@ -228,6 +228,7 @@ class TestPlatformReconnectWatcher:
         runner = _make_runner()
         runner._sync_voice_mode_state_to_adapter = MagicMock()
         runner._redeliver_failed_obligations_for_platform = AsyncMock(return_value=1)
+        runner._drain_startup_restore_queue = AsyncMock(return_value=1)
         runner._schedule_resume_pending_sessions = MagicMock(return_value=1)
 
         platform_config = PlatformConfig(enabled=True, token="test")
@@ -262,6 +263,7 @@ class TestPlatformReconnectWatcher:
         runner._redeliver_failed_obligations_for_platform.assert_awaited_once_with(
             Platform.TELEGRAM
         )
+        runner._drain_startup_restore_queue.assert_awaited_once_with()
         runner._schedule_resume_pending_sessions.assert_called_once_with(
             platform=Platform.TELEGRAM
         )

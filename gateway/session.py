@@ -3306,6 +3306,12 @@ class SessionStore:
                 self._save()
         return cleared
 
+    def get(self, session_key: str) -> Optional[SessionEntry]:
+        """Return the current routing entry under the store's load/read lock."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            return self._entries.get(session_key)
+
     def mark_resume_pending(
         self,
         session_key: str,

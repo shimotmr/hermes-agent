@@ -327,6 +327,11 @@ DEFAULT_CONFIG = {
         # synchronously before the gate runs.  Set to 0 to disable the bound
         # (historical "wait forever" behaviour).
         "gateway_startup_restore_drain_timeout": 30,
+        # Maximum last-turn prompt size eligible for synthetic startup resume.
+        # Oversized interrupted sessions retain resume_pending and wait for
+        # real inbound so they cannot monopolize the startup gate. Durable
+        # queued user events remain eligible regardless of size. 0 disables.
+        "gateway_auto_resume_max_prompt_tokens": 200000,
         # Stale-stream ceiling for local providers (Ollama, oMLX, llama-cpp) in
         # seconds. When the base stale timeout is at its default (180s) and a
         # local endpoint is detected, this finite ceiling replaces the former
