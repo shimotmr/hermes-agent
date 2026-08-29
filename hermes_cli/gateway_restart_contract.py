@@ -16,6 +16,14 @@ from pathlib import Path
 from typing import Any, Callable, NamedTuple, Sequence
 
 
+# When executed by absolute path, Python puts ``hermes_cli/`` first on sys.path;
+# that would make ``hermes_cli/gateway.py`` shadow the top-level gateway package.
+if __package__ in (None, ""):
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if sys.path[0] != repo_root:
+        sys.path.insert(0, repo_root)
+
+
 REQUIRED_PLATFORMS = ("api_server", "webhook", "telegram")
 
 

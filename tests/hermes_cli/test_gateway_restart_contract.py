@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from pathlib import Path
 
 from hermes_cli.gateway_restart_contract import (
@@ -210,3 +212,19 @@ def test_cli_ready_prints_only_verified_replacement_identity(capsys) -> None:
     assert exit_code == 0
     assert captured.out == "94350 22345\n"
     assert captured.err == ""
+
+
+def test_direct_script_invocation_imports_top_level_gateway_package(tmp_path: Path) -> None:
+    script = Path(__file__).parents[2] / "hermes_cli" / "gateway_restart_contract.py"
+
+    result = subprocess.run(
+        [sys.executable, str(script), "identity", "--home", str(tmp_path)],
+        cwd=script.parents[1],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 1
+    assert "control-identity-missing" in result.stderr
+    assert "'gateway' is not a package" not in result.stderr
