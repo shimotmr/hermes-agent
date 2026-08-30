@@ -6605,6 +6605,55 @@ def _verified_graceful_restart_current_launchd_gateway():
     return _verified_graceful_restart_launchd_target(target)
 
 
+def _schedule_deferred_launchd_restart(label: str, probe) -> None:
+    """Best-effort durable handoff for a verified active launchd Gateway."""
+    from hermes_cli.deferred_gateway_restart import (
+        deferred_restart_receipt_path,
+        schedule_deferred_restart,
+    )
+    from hermes_cli.update_receipt import record_deferred_gateway_restart
+
+    identity = getattr(probe, "identity", None)
+    target = _resolve_launchd_gateway_contract_target(label)
+    expected_sha = _current_checkout_sha()
+    if target is None or identity is None or not expected_sha:
+        record_deferred_gateway_restart(
+            profile=label,
+            scheduled=False,
+            reason="deferred-target-unavailable",
+        )
+        return
+    result = schedule_deferred_restart(
+        home=target.home,
+        port=target.port,
+        expected_sha=expected_sha,
+        old_identity=identity,
+        reason=probe.reason,
+    )
+    record_deferred_gateway_restart(
+        profile=label,
+        scheduled=result.scheduled,
+        reason=result.reason,
+        intent_path=result.path,
+        receipt_path=(
+            deferred_restart_receipt_path(target.home) if result.scheduled else None
+        ),
+    )
+    if result.scheduled:
+        print(
+            "    Durable idle retry scheduled; receipt will be written to "
+            f"{deferred_restart_receipt_path(target.home)}"
+        )
+
+
+def _try_schedule_deferred_launchd_restart(label: str, probe) -> None:
+    """Keep optional durable handoff failures from masking restart authority."""
+    try:
+        _schedule_deferred_launchd_restart(label, probe)
+    except Exception as exc:
+        logger.debug("Could not schedule deferred Gateway restart for %s: %s", label, exc)
+
+
 def _restart_launchd_gateway_after_update(
     *, supervision_verify: bool = True
 ) -> tuple[list, list]:
@@ -6649,6 +6698,12 @@ def _restart_launchd_gateway_after_update(
         return [], [current_label]
 
     if not probe.ready:
+        from hermes_cli.deferred_gateway_restart import (
+            is_schedulable_active_work_reason,
+        )
+
+        if is_schedulable_active_work_reason(probe.reason):
+            _try_schedule_deferred_launchd_restart(current_label, probe)
         print(
             f"  ⚠ Gateway restart deferred: {probe.reason}.\n"
             "    No force fallback was attempted. Retry after the gateway is idle."
@@ -6744,6 +6799,12 @@ def _restart_macos_launchd_gateways(
                 target, timeout=drain_budget
             )
             if not probe.ready:
+                from hermes_cli.deferred_gateway_restart import (
+                    is_schedulable_active_work_reason,
+                )
+
+                if is_schedulable_active_work_reason(probe.reason):
+                    _try_schedule_deferred_launchd_restart(label, probe)
                 failed_or_stale_units.append(label)
                 print(
                     f"  ⚠ {label}: restart deferred: {probe.reason}.\n"

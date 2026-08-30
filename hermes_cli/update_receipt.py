@@ -69,6 +69,7 @@ class UpdateReceipt:
             "steps": [],
             "skips": [],
             "gateway_restart": {},
+            "deferred_restarts": [],
             "fleet": [],
         }
         try:
@@ -135,6 +136,25 @@ class UpdateReceipt:
             result["fresh_recovery"] = persisted
         self.data["gateway_restart"] = result
 
+    def deferred_gateway_restart_result(
+        self,
+        *,
+        profile: str,
+        scheduled: bool,
+        reason: str,
+        intent_path: Path | None = None,
+        receipt_path: Path | None = None,
+    ) -> None:
+        self.data["deferred_restarts"].append(
+            {
+                "profile": str(profile),
+                "scheduled": bool(scheduled),
+                "reason": str(reason),
+                "intent_path": str(intent_path) if intent_path is not None else None,
+                "receipt_path": str(receipt_path) if receipt_path is not None else None,
+            }
+        )
+
     def finalize(self, outcome: str) -> None:
         self.data["outcome"] = outcome
         self.data["finished_at"] = _utc_now_iso()
@@ -187,6 +207,15 @@ def record_gateway_restart(**kwargs: Any) -> None:
             _current.gateway_restart_result(**kwargs)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not record gateway restart result: %s", exc)
+
+
+def record_deferred_gateway_restart(**kwargs: Any) -> None:
+    """Append one durable deferred-restart scheduling result."""
+    try:
+        if _current is not None:
+            _current.deferred_gateway_restart_result(**kwargs)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not record deferred gateway restart result: %s", exc)
 
 
 def finalize_update_receipt(
