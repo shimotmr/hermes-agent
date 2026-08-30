@@ -108,7 +108,16 @@ class TestDetectDangerousRm:
                     None,
                 )
 
-    def test_symlinked_temp_dir_only_exempts_canonical_target(self, tmp_path):
+    @pytest.mark.macos_only
+    def test_macos_var_temp_alias_is_not_dangerous(self):
+        declared_temp = "/var/folders/hermes-test-temp"
+        for operand_dir in (declared_temp, f"/private{declared_temp}"):
+            with mock_patch("tempfile.gettempdir", return_value=declared_temp):
+                assert detect_dangerous_command(
+                    f"rm -f {operand_dir}/hermes-verify-example.py"
+                ) == (False, None, None)
+
+    def test_arbitrary_symlinked_temp_dir_has_no_cleanup_exemption(self, tmp_path):
         real_temp = tmp_path / "real-temp"
         real_temp.mkdir()
         linked_temp = tmp_path / "linked-temp"
@@ -117,11 +126,7 @@ class TestDetectDangerousRm:
 
         with mock_patch("tempfile.gettempdir", return_value=str(linked_temp)):
             assert detect_dangerous_command(f"rm -f {linked_temp / basename}")[0] is True
-            assert detect_dangerous_command(f"rm -f {real_temp / basename}") == (
-                False,
-                None,
-                None,
-            )
+            assert detect_dangerous_command(f"rm -f {real_temp / basename}")[0] is True
 
     def test_verification_cleanup_exemption_rejects_broader_deletions(self):
         commands = (
