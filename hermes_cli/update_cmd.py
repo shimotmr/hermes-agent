@@ -2633,19 +2633,13 @@ def _drop_owned_stash(git_cmd: list[str], cwd: Path, stash_ref: str) -> bool:
     return gone.returncode == 1
 
 
-def _print_stash_cleanup_guidance(
-    stash_ref: str, stash_selector: Optional[str] = None
-) -> None:
+def _print_stash_cleanup_guidance(stash_ref: str) -> None:
     print(
         "  Check `git status` first so you don't accidentally reapply the same change twice."
     )
     print("  Find the saved entry with: git stash list --format='%gd %H %s'")
-    if stash_selector:
-        print(f"  Remove it with: git stash drop {stash_selector}")
-    else:
-        print(
-            f"  Look for commit {stash_ref}, then drop its selector with: git stash drop stash@{{N}}"
-        )
+    print(f"  Your saved entry has immutable commit ID: {stash_ref}")
+    print("  Hermes did not print a drop command because stash selectors can change concurrently.")
 
 def _stash_apply_failed_only_on_existing_untracked(stderr: str) -> bool:
     """True when a ``git stash apply`` failure is ONLY about untracked files
@@ -2801,7 +2795,7 @@ def _restore_stashed_changes(
             print(
                 "  The stash was left in place. You can remove it manually after checking the result."
             )
-            _print_stash_cleanup_guidance(stash_ref, stash_selector)
+            _print_stash_cleanup_guidance(stash_ref)
 
     print("⚠ Local changes were restored on top of the updated codebase.")
     print("  Review `git diff` / `git status` if Hermes behaves unexpectedly.")
@@ -2840,7 +2834,7 @@ def _discard_stashed_changes(
             "⚠ Configured to discard local changes, but Hermes couldn't drop "
             "the saved stash entry."
         )
-        _print_stash_cleanup_guidance(stash_ref, stash_selector)
+        _print_stash_cleanup_guidance(stash_ref)
         return False
 
     print("→ Discarded local source changes (updates.non_interactive_local_changes=discard).")

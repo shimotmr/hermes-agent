@@ -135,6 +135,48 @@ def test_drop_owned_stash_fails_closed_when_refs_stash_changes_before_mutation(
     assert len(remaining.splitlines()) == 2
 
 
+def test_restore_guidance_never_emits_mutable_selector_after_concurrent_push(
+    monkeypatch, tmp_path, capsys
+):
+    """CAS failure guidance must identify our stash only by immutable OID."""
+    real_run = subprocess.run
+
+    def git(*args):
+        return real_run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "Updater Test")
+    git("config", "user.email", "updater@example.invalid")
+    (tmp_path / "tracked.txt").write_text("base\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "base")
+    (tmp_path / "tracked.txt").write_text("owned\n", encoding="utf-8")
+    git("stash", "push", "-qm", "owned")
+    owned = git("rev-parse", "refs/stash")
+    injected = False
+
+    def push_before_cas(command, **kwargs):
+        nonlocal injected
+        if not injected and command[-4:-3] == ["update-ref"] and "-d" in command:
+            injected = True
+            (tmp_path / "foreign.txt").write_text("foreign\n", encoding="utf-8")
+            git("stash", "push", "-uqm", "foreign")
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", push_before_cas)
+
+    assert update_cmd._restore_stashed_changes(["git"], tmp_path, owned) is True
+
+    output = capsys.readouterr().out
+    assert owned in output
+    assert "stash@{" not in output
+    assert "git stash drop" not in output
+    assert git("rev-parse", "refs/stash") != owned
+    assert owned in git("stash", "list", "--format=%H").splitlines()
+
+
 
 
 def test_refresh_active_memory_provider_dependencies_reinstalls_active_provider(monkeypatch):
