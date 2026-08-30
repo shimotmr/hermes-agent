@@ -342,6 +342,49 @@ def test_evidence_append_binds_real_commits_snapshot_trees_and_ancestry(
     assert validate_evidence(manifest, repo=repo) == [first, second]
 
 
+@pytest.mark.require_symlinks
+def test_evidence_append_rejects_symlink_manifest(repo: Path, tmp_path: Path) -> None:
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text("do not append\n", encoding="utf-8")
+    manifest = tmp_path / "evidence.jsonl"
+    manifest.symlink_to(outside)
+    frozen = git(repo, "rev-parse", "HEAD")
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
+
+    with pytest.raises(ValueError, match="evidence-target-symlink"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=frozen,
+            command="tests",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+    assert outside.read_text(encoding="utf-8") == "do not append\n"
+
+
+def test_evidence_append_rejects_non_regular_manifest(repo: Path, tmp_path: Path) -> None:
+    manifest = tmp_path / "evidence.jsonl"
+    manifest.mkdir()
+    frozen = git(repo, "rev-parse", "HEAD")
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
+
+    with pytest.raises(ValueError, match="evidence-target-not-regular"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=frozen,
+            command="tests",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+
 def test_release_evidence_rejects_a_failed_required_gate(repo: Path, tmp_path: Path) -> None:
     from scripts import release_gate
 

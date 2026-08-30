@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import subprocess
 from datetime import datetime
 from dataclasses import asdict, dataclass
@@ -646,8 +647,32 @@ def append_evidence(
         raise ValueError("snapshot-tree-mismatch")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(target, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
     try:
+        target_status = target.lstat()
+    except FileNotFoundError:
+        target_status = None
+    if target_status is not None:
+        if stat.S_ISLNK(target_status.st_mode):
+            raise ValueError("evidence-target-symlink")
+        if not stat.S_ISREG(target_status.st_mode):
+            raise ValueError("evidence-target-not-regular")
+    open_flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+    open_flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, open_flags, 0o600)
+    except OSError as exc:
+        if target.is_symlink():
+            raise ValueError("evidence-target-symlink") from exc
+        raise
+    try:
+        opened_status = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_status.st_mode):
+            raise ValueError("evidence-target-not-regular")
+        if target_status is not None and (
+            opened_status.st_dev != target_status.st_dev
+            or opened_status.st_ino != target_status.st_ino
+        ):
+            raise ValueError("evidence-target-replaced")
         fchmod = getattr(os, "fchmod", None)
         if fchmod is not None:
             fchmod(descriptor, 0o600)
