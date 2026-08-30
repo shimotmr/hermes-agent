@@ -529,6 +529,7 @@ def validate_release_evidence(
     expected_candidate_sha: str | None = None,
     expected_frozen_sha: str | None = None,
     expected_candidate_tree_sha: str | None = None,
+    expected_critical_paths: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Validate one complete, successful release authority chain."""
     required = tuple(dict.fromkeys((*REQUIRED_RELEASE_GATE_IDS, *required_gate_ids)))
@@ -574,6 +575,10 @@ def validate_release_evidence(
     critical_paths = freeze_event.get("overlap_critical_paths")
     if not isinstance(overlap_payload, dict) or not isinstance(critical_paths, list):
         raise EvidenceCorrupt("release-overlap-authority-missing")
+    if expected_critical_paths is None:
+        raise EvidenceCorrupt("release-overlap-critical-paths-required")
+    if tuple(critical_paths) != tuple(expected_critical_paths):
+        raise EvidenceCorrupt("release-overlap-critical-paths-mismatch")
     try:
         expected_overlap = OverlapReport(
             schema_version=overlap_payload["schema_version"],
@@ -592,6 +597,8 @@ def validate_release_evidence(
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise EvidenceCorrupt("release-overlap-authority-invalid") from exc
+    if expected_overlap.latest_sha != expected_frozen_sha:
+        raise EvidenceCorrupt("release-overlap-frozen-mismatch")
     if asdict(expected_overlap) != asdict(recomputed):
         raise EvidenceCorrupt("release-overlap-authority-mismatch")
     if expected_overlap.classification == "indeterminate":
@@ -668,6 +675,17 @@ def append_evidence(
         opened_status = os.fstat(descriptor)
         if not stat.S_ISREG(opened_status.st_mode):
             raise ValueError("evidence-target-not-regular")
+        try:
+            current_status = target.lstat()
+        except OSError as exc:
+            raise ValueError("evidence-target-replaced") from exc
+        if stat.S_ISLNK(current_status.st_mode):
+            raise ValueError("evidence-target-symlink")
+        if (
+            current_status.st_dev != opened_status.st_dev
+            or current_status.st_ino != opened_status.st_ino
+        ):
+            raise ValueError("evidence-target-replaced")
         if target_status is not None and (
             opened_status.st_dev != target_status.st_dev
             or opened_status.st_ino != target_status.st_ino
@@ -794,6 +812,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     validate.add_argument("--expected-candidate-sha", required=True)
     validate.add_argument("--expected-frozen-sha", required=True)
     validate.add_argument("--expected-candidate-tree-sha", required=True)
+    validate.add_argument("--policy", type=Path, required=True)
 
     args = parser.parse_args(argv)
     if args.command == "freeze":
@@ -839,6 +858,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_candidate_sha=args.expected_candidate_sha,
             expected_frozen_sha=args.expected_frozen_sha,
             expected_candidate_tree_sha=args.expected_candidate_tree_sha,
+            expected_critical_paths=load_critical_paths(args.policy),
         )
     )
     return 0

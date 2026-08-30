@@ -2589,9 +2589,16 @@ def _resolve_stash_selector(
 
 
 def _drop_owned_stash(git_cmd: list[str], cwd: Path, stash_ref: str) -> bool:
-    """Drop only the selector that still resolves to our immutable stash OID."""
+    """Atomically remove our sole top-level stash, or preserve it fail-closed.
+
+    ``git stash drop stash@{N}`` resolves a mutable reflog selector before it
+    mutates the ref. A concurrent stash push can therefore redirect the same
+    selector at another user's entry. We only auto-remove when our immutable
+    OID is the sole entry, using ``update-ref``'s old-OID compare-and-swap.
+    Existing or concurrently-created entries are preserved for manual cleanup.
+    """
     stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
-    if stash_selector is None:
+    if stash_selector != "stash@{0}":
         return False
     ownership = subprocess.run(
         git_cmd + ["rev-parse", stash_selector],
@@ -2601,13 +2608,29 @@ def _drop_owned_stash(git_cmd: list[str], cwd: Path, stash_ref: str) -> bool:
     )
     if ownership.returncode != 0 or ownership.stdout.strip() != stash_ref:
         return False
-    drop = subprocess.run(
-        git_cmd + ["stash", "drop", stash_selector],
+    stash_list = subprocess.run(
+        git_cmd + ["stash", "list", "--format=%H"],
         cwd=cwd,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
     )
-    return drop.returncode == 0
+    entries = [line.strip() for line in stash_list.stdout.splitlines() if line.strip()]
+    if stash_list.returncode != 0 or entries != [stash_ref]:
+        return False
+    drop = subprocess.run(
+        git_cmd + ["update-ref", "-d", "refs/stash", stash_ref],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if drop.returncode != 0:
+        return False
+    gone = subprocess.run(
+        git_cmd + ["show-ref", "--verify", "--quiet", "refs/stash"],
+        cwd=cwd,
+        capture_output=True,
+    )
+    return gone.returncode == 1
 
 
 def _print_stash_cleanup_guidance(

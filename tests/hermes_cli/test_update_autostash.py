@@ -95,6 +95,46 @@ def test_drop_owned_stash_revalidates_selector_before_mutation(monkeypatch, tmp_
     assert not any(command[-2:] == ["drop", "stash@{0}"] for command in calls)
 
 
+def test_drop_owned_stash_fails_closed_when_refs_stash_changes_before_mutation(
+    monkeypatch, tmp_path
+):
+    """A concurrent stash must never be deleted through selector drift."""
+    real_run = subprocess.run
+
+    def git(*args):
+        return real_run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "Release Gate Test")
+    git("config", "user.email", "release-gate@example.invalid")
+    (tmp_path / "tracked.txt").write_text("base\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "base")
+    (tmp_path / "tracked.txt").write_text("owned\n", encoding="utf-8")
+    git("stash", "push", "-qm", "owned")
+    owned = git("rev-parse", "refs/stash")
+    injected = False
+
+    def race_before_mutation(command, **kwargs):
+        nonlocal injected
+        is_drop = command[-2:-1] == ["drop"]
+        is_ref_delete = command[-4:-3] == ["update-ref"] and "-d" in command
+        if not injected and (is_drop or is_ref_delete):
+            injected = True
+            (tmp_path / "tracked.txt").write_text("foreign\n", encoding="utf-8")
+            git("stash", "push", "-qm", "foreign")
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", race_before_mutation)
+
+    assert update_cmd._drop_owned_stash(["git"], tmp_path, owned) is False
+    remaining = git("stash", "list", "--format=%H")
+    assert owned in remaining
+    assert len(remaining.splitlines()) == 2
+
+
 
 
 def test_refresh_active_memory_provider_dependencies_reinstalls_active_provider(monkeypatch):

@@ -366,6 +366,42 @@ def test_evidence_append_rejects_symlink_manifest(repo: Path, tmp_path: Path) ->
     assert outside.read_text(encoding="utf-8") == "do not append\n"
 
 
+@pytest.mark.require_symlinks
+def test_evidence_append_rejects_symlink_created_during_open_without_nofollow(
+    monkeypatch, repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text("do not append\n", encoding="utf-8")
+    manifest = tmp_path / "evidence.jsonl"
+    frozen = git(repo, "rev-parse", "HEAD")
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
+    real_open = release_gate.os.open
+
+    def racing_open(path, flags, mode=0o777):
+        if Path(path) == manifest and not manifest.exists():
+            manifest.symlink_to(outside)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(release_gate.os, "O_NOFOLLOW", 0, raising=False)
+    monkeypatch.setattr(release_gate.os, "open", racing_open)
+
+    with pytest.raises(ValueError, match="evidence-target-(symlink|replaced)"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=frozen,
+            command="tests",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+    assert outside.read_text(encoding="utf-8") == "do not append\n"
+
+
 def test_evidence_append_rejects_non_regular_manifest(repo: Path, tmp_path: Path) -> None:
     manifest = tmp_path / "evidence.jsonl"
     manifest.mkdir()
@@ -383,6 +419,47 @@ def test_evidence_append_rejects_non_regular_manifest(repo: Path, tmp_path: Path
             exit_code=0,
             recorded_at="2026-08-30T04:00:00Z",
         )
+
+
+def test_evidence_append_rejects_existing_replacement_race(
+    monkeypatch, repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    manifest.write_bytes(b"")
+    original_identity = manifest.stat()
+    frozen = git(repo, "rev-parse", "HEAD")
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
+    real_open = release_gate.os.open
+    replaced = False
+
+    def replace_before_open(path, flags, mode=0o777):
+        nonlocal replaced
+        if Path(path) == manifest and not replaced:
+            replaced = True
+            manifest.unlink()
+            manifest.write_bytes(b"")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(release_gate.os, "open", replace_before_open)
+
+    with pytest.raises(ValueError, match="evidence-target-replaced"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=frozen,
+            command="tests",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+    assert (manifest.stat().st_dev, manifest.stat().st_ino) != (
+        original_identity.st_dev,
+        original_identity.st_ino,
+    )
 
 
 def test_release_evidence_rejects_a_failed_required_gate(repo: Path, tmp_path: Path) -> None:
@@ -801,12 +878,13 @@ def test_overlap_authority_requires_overlap_compatibility_gate(
     from scripts import release_gate
 
     manifest = tmp_path / "evidence.jsonl"
-    frozen = git(repo, "rev-parse", "HEAD")
-    candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
+    reviewed = git(repo, "rev-parse", "HEAD")
+    frozen = commit(repo, "candidate.txt", "candidate\n", "frozen upstream")
     git(repo, "branch", "frozen", frozen)
+    candidate = commit(repo, "local.txt", "local\n", "local candidate")
     snapshot = freeze_snapshot(repo, "frozen", local_base_sha=candidate)
     overlap = classify_overlap(
-        repo, frozen, candidate, critical_paths=("candidate.txt",)
+        repo, reviewed, frozen, critical_paths=("candidate.txt",)
     )
     for gate_id in REQUIRED_RELEASE_GATE_IDS:
         append_evidence(
@@ -832,5 +910,83 @@ def test_overlap_authority_requires_overlap_compatibility_gate(
             required_gate_ids=("freeze",),
             expected_candidate_sha=candidate,
             expected_frozen_sha=frozen,
+            expected_critical_paths=("candidate.txt",),
+            expected_candidate_tree_sha=git(repo, "rev-parse", f"{candidate}^{{tree}}"),
+        )
+
+
+def test_overlap_authority_rejects_latest_sha_other_than_expected_frozen(
+    repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    frozen = git(repo, "rev-parse", "HEAD")
+    git(repo, "branch", "frozen", frozen)
+    candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=candidate)
+    report = classify_overlap(repo, frozen, candidate, critical_paths=("candidate.txt",))
+    for gate_id in (*REQUIRED_RELEASE_GATE_IDS, "overlap-compatibility"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=candidate,
+            gate_id=gate_id,
+            command=gate_id,
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+            overlap_report=report if gate_id == "freeze" else None,
+            overlap_critical_paths=("candidate.txt",) if gate_id == "freeze" else (),
+        )
+
+    with pytest.raises(EvidenceCorrupt, match="release-overlap-frozen-mismatch"):
+        release_gate.validate_release_evidence(
+            manifest,
+            repo=repo,
+            required_gate_ids=("overlap-compatibility",),
+            expected_candidate_sha=candidate,
+            expected_frozen_sha=frozen,
+            expected_critical_paths=("candidate.txt",),
+            expected_candidate_tree_sha=git(repo, "rev-parse", f"{candidate}^{{tree}}"),
+        )
+
+
+def test_overlap_authority_rejects_event_supplied_critical_path_policy(
+    repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    reviewed = git(repo, "rev-parse", "HEAD")
+    frozen = commit(repo, "candidate.txt", "candidate\n", "frozen")
+    git(repo, "branch", "frozen", frozen)
+    candidate = commit(repo, "local.txt", "local\n", "candidate")
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=candidate)
+    report = classify_overlap(repo, reviewed, frozen, critical_paths=("candidate.txt",))
+    for gate_id in (*REQUIRED_RELEASE_GATE_IDS, "overlap-compatibility"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=candidate,
+            gate_id=gate_id,
+            command=gate_id,
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+            overlap_report=report if gate_id == "freeze" else None,
+            overlap_critical_paths=("candidate.txt",) if gate_id == "freeze" else (),
+        )
+
+    with pytest.raises(EvidenceCorrupt, match="release-overlap-critical-paths-mismatch"):
+        release_gate.validate_release_evidence(
+            manifest,
+            repo=repo,
+            required_gate_ids=("overlap-compatibility",),
+            expected_candidate_sha=candidate,
+            expected_frozen_sha=frozen,
+            expected_critical_paths=("gateway/",),
             expected_candidate_tree_sha=git(repo, "rev-parse", f"{candidate}^{{tree}}"),
         )

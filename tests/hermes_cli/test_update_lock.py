@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -137,6 +138,32 @@ def test_release_leaves_a_marker_a_handoff_partner_now_owns(marker):
     lock.release()
 
     assert marker.exists(), "the partner's marker is not ours to remove"
+
+
+def test_release_does_not_delete_replacement_after_owner_read(
+    marker, monkeypatch
+):
+    """A claimant replacing our marker in the read/unlink window keeps it."""
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is True
+    replacement = f"{DEAD_PID}\n{int(time.time())}\n"
+    real_read_text = Path.read_text
+    replaced = False
+
+    def replace_after_read(path, *args, **kwargs):
+        nonlocal replaced
+        raw = real_read_text(path, *args, **kwargs)
+        if path == marker and not replaced:
+            replaced = True
+            marker.unlink()
+            marker.write_text(replacement, encoding="utf-8")
+        return raw
+
+    monkeypatch.setattr(Path, "read_text", replace_after_read)
+
+    lock.release()
+
+    assert real_read_text(marker, encoding="utf-8") == replacement
 
 
 def test_dead_owner_is_reclaimed_not_honored(marker):

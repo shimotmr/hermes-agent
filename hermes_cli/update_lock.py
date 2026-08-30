@@ -318,6 +318,7 @@ class UpdateLock:
             return
         self.acquired = False
         try:
+            marker_identity = self.path.lstat()
             raw = self.path.read_text(encoding="utf-8")
             owner = int(raw.splitlines()[0].strip())
         except (OSError, IndexError, ValueError):
@@ -327,7 +328,12 @@ class UpdateLock:
             # its own pid). Leave it alone — it's still a live update.
             return
         try:
-            self.path.unlink()
+            current_identity = self.path.lstat()
+            if (
+                current_identity.st_dev == marker_identity.st_dev
+                and current_identity.st_ino == marker_identity.st_ino
+            ):
+                self.path.unlink()
         except OSError:
             pass
 
