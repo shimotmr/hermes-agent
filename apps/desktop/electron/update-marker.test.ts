@@ -121,7 +121,22 @@ test('writeUpdateMarker preserves a live holder age across pid hand-off', () => 
   const startedAt = Math.floor(now / 1000) - 300
 
   writeMarker(home, 1010, startedAt)
-  writeUpdateMarker(home, 2020, { kill: ALIVE, now: () => now })
+  const oldHandle = fs.openSync(markerPath(home), 'r')
+
+  try {
+    writeUpdateMarker(home, 2020, { kill: ALIVE, now: () => now })
+
+    const detachedBody = Buffer.alloc(128)
+    const detachedLength = fs.readSync(oldHandle, detachedBody, 0, detachedBody.length, 0)
+
+    assert.match(
+      detachedBody.subarray(0, detachedLength).toString('utf8'),
+      /^1010\n/,
+      'handoff publishes a new inode; an already-open old claim is never rewritten in place'
+    )
+  } finally {
+    fs.closeSync(oldHandle)
+  }
 
   const [pidLine, startedLine] = fs.readFileSync(markerPath(home), 'utf8').split('\n')
   assert.equal(Number.parseInt(pidLine, 10), 2020, 'the hand-off records the new owner')

@@ -24,6 +24,7 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -176,6 +177,66 @@ fn marker_owned_by_self(path: &Path) -> bool {
         == Some(std::process::id())
 }
 
+fn marker_quarantine(path: &Path, action: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("update-marker");
+    path.with_file_name(format!(
+        ".{name}.{action}-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+}
+
+fn restore_quarantined_marker(path: &Path, quarantine: &Path) {
+    match std::fs::hard_link(quarantine, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(quarantine);
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(quarantine);
+        }
+        Err(_) => {
+            // Fail closed: retain the detached claim for diagnosis rather than
+            // deleting an inode whose ownership could not be restored safely.
+        }
+    }
+}
+
+fn remove_marker_if_owned(path: &Path, owner_pid: u32) {
+    let quarantine = marker_quarantine(path, "remove");
+    if std::fs::rename(path, &quarantine).is_err() {
+        return;
+    }
+    let owned = std::fs::read_to_string(&quarantine)
+        .ok()
+        .and_then(|raw| raw.lines().next()?.trim().parse::<u32>().ok())
+        == Some(owner_pid);
+    if owned {
+        if std::fs::remove_file(&quarantine).is_err() {
+            restore_quarantined_marker(path, &quarantine);
+        }
+    } else {
+        restore_quarantined_marker(path, &quarantine);
+    }
+}
+
+fn publish_new_marker(path: &Path, body: &str) -> std::io::Result<()> {
+    let temporary = marker_quarantine(path, "write");
+    let result = (|| {
+        let mut handle = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        handle.write_all(body.as_bytes())?;
+        handle.sync_all()?;
+        std::fs::hard_link(&temporary, path)
+    })();
+    let _ = std::fs::remove_file(temporary);
+    result
+}
+
 /// The exit-2 heal decision (#75788), extracted so the contract is testable.
 ///
 /// True only when BOTH hold: the child exited with the concurrent-update
@@ -225,10 +286,9 @@ fn pid_is_alive(pid: u32) -> bool {
 impl UpdateMarkerGuard {
     /// Claim the marker, or report the live updater that already owns it.
     ///
-    /// Writing is best-effort: a write failure must NOT abort the update (the
-    /// gate degrades to "no marker => proceed", i.e. exactly the pre-marker
-    /// behavior), so we log and carry on with a guard that still attempts
-    /// cleanup of whatever may exist at the path.
+    /// Claim publication is fail-closed. Proceeding without a durable marker
+    /// would make ownership unknowable and permit a second updater to mutate
+    /// the same checkout.
     fn acquire(path: PathBuf) -> Result<Self, MarkerOwner> {
         let pid = std::process::id();
         if let Some(owner) = live_marker_owner(&path) {
@@ -242,6 +302,22 @@ impl UpdateMarkerGuard {
             }
             return Err(owner);
         }
+        if path.exists() {
+            let quarantine = marker_quarantine(&path, "stale");
+            if std::fs::rename(&path, &quarantine).is_err() {
+                return Err(MarkerOwner { pid: 0, age_secs: 0 });
+            }
+            if let Some(owner) = live_marker_owner(&quarantine) {
+                restore_quarantined_marker(&path, &quarantine);
+                let restored = live_marker_owner(&path)
+                    .unwrap_or(MarkerOwner { pid: 0, age_secs: 0 });
+                if restored.pid == pid {
+                    return Ok(Self { path, owned: true });
+                }
+                return Err(if restored.pid == 0 { owner } else { restored });
+            }
+            let _ = std::fs::remove_file(quarantine);
+        }
         let started_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -249,8 +325,13 @@ impl UpdateMarkerGuard {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(err) = std::fs::write(&path, format!("{pid}\n{started_at}")) {
+        if let Err(err) = publish_new_marker(&path, &format!("{pid}\n{started_at}")) {
             tracing::warn!(?path, %err, "could not write update-in-progress marker");
+            let owner = live_marker_owner(&path).unwrap_or(MarkerOwner {
+                pid: 0,
+                age_secs: 0,
+            });
+            return Err(owner);
         }
         Ok(Self { path, owned: true })
     }
@@ -267,11 +348,7 @@ impl UpdateMarkerGuard {
         if !self.owned {
             return;
         }
-        if let Err(err) = std::fs::remove_file(&self.path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = ?self.path, %err, "could not remove completed update marker");
-            }
-        }
+        remove_marker_if_owned(&self.path, std::process::id());
     }
 }
 

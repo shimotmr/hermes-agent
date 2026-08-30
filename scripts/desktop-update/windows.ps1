@@ -524,14 +524,24 @@ function Write-Result([bool]$Ok, [int]$Code, [string]$Message, [bool]$ManualActi
 
 function Remove-MarkerIfOwned {
     if ($NoMarkerCleanup) { return }
+    $quarantine = "$MarkerPath.remove-$PID-$([Guid]::NewGuid().ToString('N'))"
     try {
-        if (Test-Path -LiteralPath $MarkerPath) {
-            $firstLine = (Get-Content -LiteralPath $MarkerPath -TotalCount 1 -ErrorAction SilentlyContinue)
+        if ([System.IO.File]::Exists($MarkerPath)) {
+            [System.IO.File]::Move($MarkerPath, $quarantine)
+            $firstLine = (Get-Content -LiteralPath $quarantine -TotalCount 1 -ErrorAction SilentlyContinue)
             if ("$firstLine".Trim() -eq "$PID") {
-                Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $quarantine -Force -ErrorAction SilentlyContinue
+                if ([System.IO.File]::Exists($quarantine)) {
+                    try { [System.IO.File]::Move($quarantine, $MarkerPath) } catch {}
+                }
                 Write-HandoffLog "removed update marker (owned)"
             } else {
                 Write-HandoffLog "leaving update marker: owned by pid '$firstLine', not us ($PID)"
+                try { [System.IO.File]::Move($quarantine, $MarkerPath) } catch {
+                    if ([System.IO.File]::Exists($MarkerPath)) {
+                        Remove-Item -LiteralPath $quarantine -Force -ErrorAction SilentlyContinue
+                    }
+                }
             }
         }
     } catch {}
@@ -1373,10 +1383,18 @@ try {
         }
         # WriteAllText for byte-exact LF framing: Set-Content emits CRLF and
         # the marker contract (Rust/TS/Python readers) is "<pid>\n<ts>\n".
-        [System.IO.File]::WriteAllText($MarkerPath, "$PID`n$startedAt`n")
+        $markerTemp = "$MarkerPath.write-$PID-$([Guid]::NewGuid().ToString('N'))"
+        [System.IO.File]::WriteAllText($markerTemp, "$PID`n$startedAt`n")
+        if ([System.IO.File]::Exists($MarkerPath)) {
+            [System.IO.File]::Replace($markerTemp, $MarkerPath, $null)
+        } else {
+            [System.IO.File]::Move($markerTemp, $MarkerPath)
+        }
         Write-HandoffLog "claimed update marker (pid $PID)"
     } catch {
-        Write-HandoffLog "WARNING: could not write update marker: $($_.Exception.Message)"
+        if ($markerTemp) { Remove-Item -LiteralPath $markerTemp -Force -ErrorAction SilentlyContinue }
+        Write-HandoffLog "ERROR: could not atomically claim update marker: $($_.Exception.Message)"
+        throw
     }
 
     if ($SelfTestMarker) {

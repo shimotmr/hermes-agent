@@ -33,6 +33,66 @@ export function markerPath(hermesHome) {
   return path.join(hermesHome, '.hermes-update-in-progress')
 }
 
+function atomicReplaceMarker(file: string, body: string) {
+  const temporary = `${file}.write-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+
+  try {
+    fs.writeFileSync(temporary, body, { encoding: 'utf8', flag: 'wx' })
+    fs.renameSync(temporary, file)
+  } finally {
+    try {
+      fs.unlinkSync(temporary)
+    } catch {
+      void 0
+    }
+  }
+}
+
+function removeMarkerIfUnchanged(file: string, expected: string) {
+  const quarantine = `${file}.remove-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+
+  try {
+    fs.renameSync(file, quarantine)
+  } catch {
+    return false
+  }
+
+  let removable = false
+
+  try {
+    removable = fs.readFileSync(quarantine, 'utf8') === expected
+  } catch {
+    removable = false
+  }
+
+  if (!removable) {
+    try {
+      fs.linkSync(quarantine, file)
+    } catch {
+      void 0
+    }
+  }
+
+  let removed = false
+
+  try {
+    fs.unlinkSync(quarantine)
+    removed = true
+  } catch {
+    void 0
+  }
+
+  if (removable && !removed) {
+    try {
+      fs.linkSync(quarantine, file)
+    } catch {
+      void 0
+    }
+  }
+
+  return removable && removed
+}
+
 // True only if a host process with this pid is currently alive. Signal 0 does
 // not deliver a signal — it just probes existence/permission. ESRCH => dead;
 // EPERM => alive but owned by another user (still "alive" for our purposes).
@@ -91,11 +151,7 @@ export function readLiveUpdateMarker(
   const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
 
   if (!alive || ageMs > maxAgeMs) {
-    try {
-      fs.unlinkSync(file)
-    } catch {
-      void 0
-    }
+    removeMarkerIfUnchanged(file, raw)
 
     return null
   }
@@ -153,7 +209,7 @@ export function writeUpdateMarker(
         : Math.floor(nowMs / 1000)
 
   try {
-    fs.writeFileSync(file, `${pid}\n${acquiredAt}\n`, 'utf8')
+    atomicReplaceMarker(file, `${pid}\n${acquiredAt}\n`)
   } catch {
     // Best-effort: if we can't write the marker, proceed anyway. The
     // updater will write its own when it reaches run_update.

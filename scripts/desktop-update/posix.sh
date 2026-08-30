@@ -429,8 +429,21 @@ finish() {
   [ "$FINAL_CODE" -eq 0 ] && [ -n "$DONE_NOTE" ] && { FINAL_MSG="$DONE_NOTE"; MANUAL=1; }
   write_result
 
-  if [ "$NO_MARKER_CLEANUP" -eq 0 ] && [ "$(head -1 "$MARKER" 2>/dev/null | tr -d '[:space:]')" = "$$" ]; then
-    rm -f "$MARKER" 2>/dev/null || true
+  if [ "$NO_MARKER_CLEANUP" -eq 0 ]; then
+    marker_quarantine="${MARKER}.remove-$$-${RANDOM}"
+    if mv "$MARKER" "$marker_quarantine" 2>/dev/null; then
+      marker_owner="$(head -1 "$marker_quarantine" 2>/dev/null | tr -d '[:space:]')"
+      if [ "$marker_owner" = "$$" ]; then
+        rm -f "$marker_quarantine" 2>/dev/null || true
+        if [ -e "$marker_quarantine" ]; then
+          ln "$marker_quarantine" "$MARKER" 2>/dev/null || true
+        fi
+      elif ln "$marker_quarantine" "$MARKER" 2>/dev/null; then
+        rm -f "$marker_quarantine" 2>/dev/null || true
+      elif [ -e "$MARKER" ]; then
+        rm -f "$marker_quarantine" 2>/dev/null || true
+      fi
+    fi
   fi
 
   if [ "$FINAL_CODE" -ne 0 ]; then
@@ -538,7 +551,16 @@ if [ "${#STARTED_AT}" -ne "${#NOW}" ] \
     || [[ "$STARTED_AT" > "$NOW" || "$STARTED_AT" < "$MIN_STARTED_AT" ]]; then
   STARTED_AT="$NOW"
 fi
-printf '%s\n%s\n' "$$" "$STARTED_AT" > "$MARKER" 2>/dev/null || log "WARNING: could not write update marker"
+MARKER_TEMP="${MARKER}.write-$$-${RANDOM}"
+if printf '%s\n%s\n' "$$" "$STARTED_AT" > "$MARKER_TEMP" 2>/dev/null \
+    && mv -f "$MARKER_TEMP" "$MARKER" 2>/dev/null; then
+  :
+else
+  rm -f "$MARKER_TEMP" 2>/dev/null || true
+  log "ERROR: could not atomically claim update marker"
+  FINAL_CODE=1 FINAL_MSG="Could not claim the update lock safely. Nothing was changed."
+  exit "$FINAL_CODE"
+fi
 
 if [ "$SELF_TEST_MARKER" -eq 1 ]; then
   trap - EXIT
