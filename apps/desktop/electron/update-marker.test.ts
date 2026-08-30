@@ -21,6 +21,8 @@ import { test } from 'vitest'
 
 import {
   isPidAlive,
+  claimUpdateMarker,
+  handoffUpdateMarker,
   markerPath,
   readLiveUpdateMarker,
   UPDATE_MARKER_MAX_AGE_MS,
@@ -70,13 +72,33 @@ test('dead pid => no live update and marker is pruned', () => {
   assert.ok(!fs.existsSync(markerPath(home)), 'a dead-pid marker self-heals (deleted)')
 })
 
-test('expired marker (past age ceiling) => no live update and pruned', () => {
+test('expired marker with a live pid remains authoritative', () => {
   const home = tmpHome('expired')
   const now = 1_000_000_000_000
   writeMarker(home, 4242, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
-  // Even though the pid is "alive", the marker is too old to trust.
-  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
-  assert.ok(!fs.existsSync(markerPath(home)), 'an expired marker self-heals (deleted)')
+  const owner = readLiveUpdateMarker(home, { kill: ALIVE, now: () => now })
+  assert.ok(owner)
+  assert.equal(owner.pid, 4242)
+  assert.ok(fs.existsSync(markerPath(home)), 'age alone must never evict a live updater')
+})
+
+test('claim is atomic no-replace and handoff requires expected owner and token', () => {
+  const home = tmpHome('claim-cas')
+  const first = claimUpdateMarker(home, 1010, { now: () => 1_000_000_000_000, kill: ALIVE })
+  assert.ok(first, 'the first claimant atomically publishes')
+
+  assert.equal(
+    claimUpdateMarker(home, 2020, { now: () => 1_000_000_001_000, kill: ALIVE }),
+    null,
+    'a second claimant must not replace the existing claim'
+  )
+  assert.equal(handoffUpdateMarker(home, 1010, 'wrong-token', 2020), false)
+  assert.equal(handoffUpdateMarker(home, 9999, first.token, 2020), false)
+  assert.equal(handoffUpdateMarker(home, 1010, first.token, 2020), true)
+
+  const lines = fs.readFileSync(markerPath(home), 'utf8').split('\n')
+  assert.equal(Number.parseInt(lines[0], 10), 2020)
+  assert.equal(lines[2], first.token)
 })
 
 test('malformed marker => no live update and pruned', () => {
@@ -120,11 +142,12 @@ test('writeUpdateMarker preserves a live holder age across pid hand-off', () => 
   const now = 1_000_000_000_000
   const startedAt = Math.floor(now / 1000) - 300
 
-  writeMarker(home, 1010, startedAt)
+  const claim = claimUpdateMarker(home, 1010, { now: () => now, startedAt })
+  assert.ok(claim)
   const oldHandle = fs.openSync(markerPath(home), 'r')
 
   try {
-    writeUpdateMarker(home, 2020, { kill: ALIVE, now: () => now })
+    assert.equal(handoffUpdateMarker(home, 1010, claim.token, 2020), true)
 
     const detachedBody = Buffer.alloc(128)
     const detachedLength = fs.readSync(oldHandle, detachedBody, 0, detachedBody.length, 0)
@@ -173,9 +196,8 @@ test('writeUpdateMarker + dead pid => self-heals on read', () => {
 // updateHandoffConflict (#75778)
 //
 // A retried "Update" click must not spawn a second updater over a still-live
-// one — writeUpdateMarker unconditionally overwrites the marker, so an
-// unchecked hand-off clobbers the original updater's claim while it is still
-// alive and mutating the checkout.
+// one. The diagnostic helper and atomic claim must agree that the original
+// updater remains authoritative.
 // ---------------------------------------------------------------------------
 
 test('no marker => hand-off is not blocked', () => {
@@ -201,11 +223,11 @@ test('a dead-pid marker does not block a hand-off (self-heals)', () => {
   assert.equal(updateHandoffConflict(home, { kill: DEAD }), null)
 })
 
-test('an expired marker does not block a hand-off (self-heals)', () => {
+test('an old marker still blocks a hand-off while its pid is alive', () => {
   const home = tmpHome('conflict-expired')
   const now = 1_000_000_000_000
   writeMarker(home, 1010, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
-  assert.equal(updateHandoffConflict(home, { kill: ALIVE, now: () => now }), null)
+  assert.ok(updateHandoffConflict(home, { kill: ALIVE, now: () => now }))
 })
 
 test('minutes-scale elapsed time is formatted as "Nm Ss"', () => {
