@@ -30,7 +30,6 @@ if __package__ in (None, ""):
     if sys.path[0] != repo_root:
         sys.path.insert(0, repo_root)
 
-
 class ServingIdentity(NamedTuple):
     pid: int
     start_time: int
@@ -80,20 +79,16 @@ def _live_status_payload(
     current: ServingIdentity, status: dict[str, Any]
 ) -> dict[str, Any]:
     """Project a legacy persisted status into the current writer inventory."""
+    from gateway.platform_status import project_live_platforms
+
     payload = dict(status)
     platforms = status.get("platforms")
     if isinstance(platforms, dict):
-        payload["platforms"] = {
-            name: record
-            for name, record in platforms.items()
-            if not (
-                isinstance(record, dict)
-                and type(record.get("writer_pid")) is int
-                and record.get("writer_pid") != current.pid
-                and type(record.get("writer_start_time")) is int
-                and record.get("writer_start_time") != current.start_time
-            )
-        }
+        payload["platforms"] = project_live_platforms(
+            platforms,
+            current_pid=current.pid,
+            current_start_time=current.start_time,
+        )
     return payload
 
 
