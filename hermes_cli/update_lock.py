@@ -18,15 +18,15 @@ once — so a dashboard-spawned ``hermes update`` and an installer-driven
 under a live interpreter and leaving the tree half-updated.
 
 This module makes that same marker the single lock for **all** update
-entrypoints instead of adding a fourth mechanism. Format and location are
-unchanged and remain byte-compatible with the Rust and Electron readers:
+entrypoints instead of adding a fourth mechanism. The first two lines remain
+backward-compatible; a third opaque token binds release/handoff authority:
 
-    <HERMES_HOME>/.hermes-update-in-progress   body: "<pid>\\n<started_at_unix>"
+    <HERMES_HOME>/.hermes-update-in-progress   body: "<pid>\\n<started_at_unix>\\n<token>"
 
-A marker only counts as a live update when its pid is alive AND it is younger
-than :data:`UPDATE_MARKER_MAX_AGE_MS` — mirroring ``readLiveUpdateMarker`` so a
-crashed updater self-heals instead of wedging every future update. A stale
-marker is removed on read by whoever notices it first.
+A marker counts as live whenever its pid is alive. Age is diagnostic only:
+Windows updates can legitimately be quiet for 40+ minutes, and PID identity
+uncertainty fails closed. Confirmed-dead markers are removed under the shared
+operation guard.
 
 One layering wrinkle: the Tauri updater holds this marker for its WHOLE run and
 then spawns ``hermes update`` as a child stage. Without a handoff the child
@@ -55,6 +55,7 @@ import os
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,8 +63,8 @@ logger = logging.getLogger(__name__)
 
 # Keep in sync with UPDATE_MARKER_MAX_AGE_MS in
 # apps/desktop/electron/update-marker.ts — the same marker is read by both, and
-# a shorter ceiling here would let Python steal a lock Electron still considers
-# live. A full update (git pull + uv sync + desktop rebuild) is minutes.
+# retained for wire/API compatibility and elapsed-time tests. It is not an
+# eviction authority while the owner pid remains alive.
 UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
 
 MARKER_NAME = ".hermes-update-in-progress"
@@ -74,6 +75,7 @@ MARKER_NAME = ".hermes-update-in-progress"
 # own parent's lock and the GUI update can never complete. See update_child_env
 # in apps/bootstrap-installer/src-tauri/src/update.rs — keep the name in sync.
 HANDOFF_PID_ENV = "HERMES_UPDATE_HANDOFF_PID"
+HANDOFF_TOKEN_ENV = "HERMES_UPDATE_CLAIM_TOKEN"
 
 # Exit code meaning "another updater/instance owns this install right now".
 # Already the de-facto contract: the Windows shim + venv-holder guards in
@@ -107,8 +109,9 @@ def _pid_alive(pid: int) -> bool:
     process group (bpo-14484). A liveness check that killed the updater it was
     asking about would be a spectacular way to fix a concurrency bug.
 
-    Any pid we cannot evaluate counts as dead: a corrupt marker must not wedge
-    the lock forever.
+    An unevaluable positive pid fails closed as alive. PID reuse cannot be
+    distinguished portably across every publisher, so a live numeric identity
+    is never evicted merely because the claim is old.
     """
     if pid <= 0:
         return False
@@ -117,10 +120,9 @@ def _pid_alive(pid: int) -> bool:
 
         return bool(_pid_exists(pid))
     except Exception as exc:
-        # Import failure or an unusable pid (e.g. larger than the platform's
-        # pid_t). Treat the marker as stale rather than blocking updates.
+        # Import/probe failure leaves authority uncertain. Fail closed.
         logger.debug("Could not probe pid %s: %s", pid, exc)
-        return False
+        return True
 
 
 def _handoff_pid() -> int | None:
@@ -177,6 +179,66 @@ def _marker_owner(raw: str) -> int | None:
         return None
 
 
+def _marker_token(raw: str) -> str | None:
+    lines = raw.splitlines()
+    if len(lines) < 3:
+        return None
+    token = lines[2].strip()
+    return token or None
+
+
+def _operation_guard_path(marker: Path) -> Path:
+    return marker.with_name(f"{marker.name}.lock")
+
+
+@contextmanager
+def _marker_operation(marker: Path):
+    """Serialize every canonical marker mutation across all updater runtimes."""
+    guard = _operation_guard_path(marker)
+    owner_file = guard / "owner"
+    acquired = False
+    for _attempt in range(3):
+        try:
+            guard.mkdir()
+            acquired = True
+            try:
+                owner_file.write_text(f"{os.getpid()}\n", encoding="ascii")
+            except OSError:
+                # The directory itself is already the atomic exclusion claim.
+                pass
+            break
+        except FileExistsError:
+            try:
+                guard_pid = int(owner_file.read_text(encoding="ascii").strip())
+            except (OSError, ValueError):
+                yield False
+                return
+            if _pid_alive(guard_pid):
+                yield False
+                return
+            try:
+                owner_file.unlink(missing_ok=True)
+                guard.rmdir()
+            except OSError:
+                yield False
+                return
+        except OSError:
+            yield False
+            return
+    if not acquired:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        try:
+            owner_file.unlink(missing_ok=True)
+            guard.rmdir()
+        except OSError:
+            # A stranded guard fails closed; never delete uncertain authority.
+            pass
+
+
 def _restore_quarantined_marker(marker: Path, quarantine: Path) -> None:
     """Restore a marker without replacing a claim published after our rename."""
     try:
@@ -203,27 +265,30 @@ def _remove_marker_if(marker: Path, predicate) -> bool:
     publish: a claim published before the rename is re-verified in quarantine;
     one published after it remains at ``marker`` and cannot be deleted here.
     """
-    quarantine = marker.with_name(
-        f".{marker.name}.remove-{os.getpid()}-{uuid.uuid4().hex}"
-    )
-    try:
-        os.replace(marker, quarantine)
-    except OSError:
-        return False
-    try:
-        raw = quarantine.read_text(encoding="utf-8")
-        removable = bool(predicate(raw))
-    except Exception:
-        removable = False
-    if not removable:
-        _restore_quarantined_marker(marker, quarantine)
-        return False
-    try:
-        quarantine.unlink()
-    except OSError:
-        _restore_quarantined_marker(marker, quarantine)
-        return False
-    return True
+    with _marker_operation(marker) as guarded:
+        if not guarded:
+            return False
+        quarantine = marker.with_name(
+            f".{marker.name}.remove-{os.getpid()}-{uuid.uuid4().hex}"
+        )
+        try:
+            os.replace(marker, quarantine)
+        except OSError:
+            return False
+        try:
+            raw = quarantine.read_text(encoding="utf-8")
+            removable = bool(predicate(raw))
+        except Exception:
+            removable = False
+        if not removable:
+            _restore_quarantined_marker(marker, quarantine)
+            return False
+        try:
+            quarantine.unlink()
+        except OSError:
+            _restore_quarantined_marker(marker, quarantine)
+            return False
+        return True
 
 
 def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
@@ -251,7 +316,7 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
         started_at = float("-inf")
 
     age = time.time() - started_at
-    if not _pid_alive(pid) or age > UPDATE_MARKER_MAX_AGE_SECONDS:
+    if not _pid_alive(pid):
         def still_stale(candidate: str) -> bool:
             candidate_lines = candidate.splitlines()
             try:
@@ -259,11 +324,7 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
                 candidate_started = float(candidate_lines[1].strip())
             except (IndexError, ValueError):
                 return True
-            candidate_age = time.time() - candidate_started
-            return (
-                not _pid_alive(candidate_pid)
-                or candidate_age > UPDATE_MARKER_MAX_AGE_SECONDS
-            )
+            return not _pid_alive(candidate_pid)
 
         _remove_marker_if(marker, still_stale)
         return None
@@ -299,6 +360,7 @@ class UpdateLock:
         self.path = path or update_marker_path()
         self.acquired = False
         self.holder: UpdateHolder | None = None
+        self.token: str | None = None
 
     def acquire(self) -> bool:
         """Claim the lock. Returns False (and sets ``holder``) if it's taken.
@@ -313,7 +375,20 @@ class UpdateLock:
         for _attempt in range(3):
             existing = read_live_update(path=self.path)
             if existing is not None:
-                if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
+                try:
+                    existing_raw = self.path.read_text(encoding="utf-8")
+                except OSError:
+                    return False
+                handoff_token = os.environ.get(HANDOFF_TOKEN_ENV, "").strip()
+                token_handoff = (
+                    handoff_token
+                    and existing.pid == _handoff_pid()
+                    and _marker_token(existing_raw) == handoff_token
+                )
+                legacy_handoff = not handoff_token and (
+                    existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid)
+                )
+                if token_handoff or legacy_handoff:
                     return True
                 self.holder = existing
                 return False
@@ -331,39 +406,39 @@ class UpdateLock:
             else:
                 return False
 
-            temporary_path: str | None = None
-            try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                descriptor, temporary_path = tempfile.mkstemp(
-                    prefix=f".{self.path.name}.", dir=self.path.parent
-                )
-                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                    handle.write(f"{os.getpid()}\n{int(time.time())}\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                # Publish a complete marker with one atomic no-replace link.
-                # Exactly one simultaneous claimant can create the destination.
-                os.link(temporary_path, self.path)
-            except FileExistsError as exc:
-                if temporary_path is None:
-                    # Failure happened while preparing the private claim, not
-                    # because another claimant published the destination.
+            with _marker_operation(self.path) as guarded:
+                if not guarded:
+                    return False
+                # Revalidate absence while holding the protocol shared by all
+                # publishers and cleanup paths.
+                if self.path.exists():
+                    continue
+                temporary_path: str | None = None
+                try:
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    descriptor, temporary_path = tempfile.mkstemp(
+                        prefix=f".{self.path.name}.", dir=self.path.parent
+                    )
+                    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                        self.token = uuid.uuid4().hex
+                        handle.write(f"{os.getpid()}\n{int(time.time())}\n{self.token}\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.link(temporary_path, self.path)
+                except FileExistsError as exc:
+                    if temporary_path is None:
+                        logger.debug("Could not write update marker %s: %s", self.path, exc)
+                        return False
+                    continue
+                except OSError as exc:
                     logger.debug("Could not write update marker %s: %s", self.path, exc)
                     return False
-                # Another claimant won after our live-holder probe. Re-read its
-                # complete claim rather than overwriting it.
-                continue
-            except OSError as exc:
-                # Without a durable claim, updater ownership is unknowable.
-                # Fail closed rather than allowing concurrent checkout mutation.
-                logger.debug("Could not write update marker %s: %s", self.path, exc)
-                return False
-            finally:
-                if temporary_path is not None:
-                    try:
-                        Path(temporary_path).unlink()
-                    except OSError:
-                        pass
+                finally:
+                    if temporary_path is not None:
+                        try:
+                            Path(temporary_path).unlink()
+                        except OSError:
+                            pass
 
             self.acquired = True
             return True
@@ -383,11 +458,16 @@ class UpdateLock:
         except OSError:
             return
         owner = _marker_owner(raw)
-        if owner != os.getpid():
+        token = _marker_token(raw)
+        if owner != os.getpid() or (self.token is not None and token != self.token):
             # A handoff partner took ownership (e.g. the Tauri updater wrote
             # its own pid). Leave it alone — it's still a live update.
             return
-        _remove_marker_if(self.path, lambda candidate: _marker_owner(candidate) == os.getpid())
+        _remove_marker_if(
+            self.path,
+            lambda candidate: _marker_owner(candidate) == os.getpid()
+            and (self.token is None or _marker_token(candidate) == self.token),
+        )
 
     def __enter__(self) -> "UpdateLock":
         self.acquire()

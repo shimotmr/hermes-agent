@@ -25,6 +25,7 @@ import pytest
 
 from hermes_cli.update_lock import (
     HANDOFF_PID_ENV,
+    HANDOFF_TOKEN_ENV,
     UPDATE_MARKER_MAX_AGE_SECONDS,
     UpdateLock,
     describe_holder,
@@ -62,7 +63,8 @@ def test_acquire_writes_pid_and_start_time(marker):
     lines = marker.read_text(encoding="utf-8").splitlines()
     assert int(lines[0]) == os.getpid(), "the Electron gate probes this pid for liveness"
     assert int(lines[1]) == pytest.approx(time.time(), abs=5)
-    assert len(lines) == 2, "wire format is exactly pid + started_at"
+    assert len(lines) == 3, "wire format is pid + started_at + claim token"
+    assert lines[2], "token binds release and handoff authority"
 
 
 def test_second_acquire_is_refused_while_the_first_is_live(marker):
@@ -201,13 +203,41 @@ def test_dead_owner_is_reclaimed_not_honored(marker):
     assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
 
 
-def test_owner_past_the_age_ceiling_is_reclaimed(marker):
-    """A live-but-wedged updater must not hold the lock forever."""
+def test_owner_past_the_age_ceiling_is_never_reclaimed_while_alive(marker):
+    """A long-running Windows updater remains authoritative while alive."""
     long_ago = int(time.time()) - UPDATE_MARKER_MAX_AGE_SECONDS - 60
     marker.write_text(f"{os.getpid()}\n{long_ago}\n", encoding="utf-8")
 
     lock = UpdateLock(path=marker)
-    assert lock.acquire() is True
+    assert lock.acquire() is False
+    assert lock.holder is not None
+    assert lock.holder.pid == os.getpid()
+    assert marker.exists()
+
+
+def test_cleanup_never_opens_a_publish_window_or_loses_live_foreign_claim(
+    marker, monkeypatch
+):
+    """A revalidated live inode must remain canonical throughout cleanup."""
+    import hermes_cli.update_lock as update_lock_module
+
+    original = f"{os.getpid()}\n{int(time.time())}\n"
+    marker.write_text(original, encoding="utf-8")
+    real_replace = update_lock_module.os.replace
+    contender_result = None
+
+    def contend_after_detach(source, destination, *args, **kwargs):
+        nonlocal contender_result
+        result = real_replace(source, destination, *args, **kwargs)
+        if Path(source) == marker:
+            contender_result = UpdateLock(path=marker).acquire()
+        return result
+
+    monkeypatch.setattr(update_lock_module.os, "replace", contend_after_detach)
+
+    assert update_lock_module._remove_marker_if(marker, lambda _raw: False) is False
+    assert contender_result is False, "cleanup must hold the shared operation guard"
+    assert marker.read_text(encoding="utf-8") == original
 
 
 @pytest.mark.parametrize(
@@ -337,6 +367,18 @@ class TestHandoffFromOrchestratingUpdater:
         lock = UpdateLock(path=marker)
         assert lock.acquire() is False
         assert lock.holder is not None
+
+    def test_token_handoff_requires_expected_owner_and_token(self, marker, monkeypatch):
+        token = "handoff-token"
+        marker.write_text(
+            f"{os.getpid()}\n{int(time.time())}\n{token}\n", encoding="utf-8"
+        )
+        monkeypatch.setenv(HANDOFF_PID_ENV, str(os.getpid() + 1))
+        monkeypatch.setenv(HANDOFF_TOKEN_ENV, token)
+        assert UpdateLock(path=marker).acquire() is False
+
+        monkeypatch.setenv(HANDOFF_PID_ENV, str(os.getpid()))
+        assert UpdateLock(path=marker).acquire() is True
 
     @pytest.mark.parametrize("value", ["", "not-a-pid", "-1", "0"], ids=["empty", "garbage", "negative", "zero"])
     def test_malformed_handoff_values_fall_back_to_refusal(self, marker, monkeypatch, value):
