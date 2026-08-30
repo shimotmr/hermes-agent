@@ -323,10 +323,11 @@ profile_parent=home.parent.name
 is_profile_home=(profile_parent.lower()=='profiles') if os.name=='nt' else (profile_parent=='profiles')
 install_root=home.parent.parent if is_profile_home else home
 marker_path=install_root/'.hermes-update-in-progress'
+guard_path=marker_path.with_name(marker_path.name+'.lock')
 status_path=home/('.update_exit_code.'+correlation)
 ready_path=home/('.update_coordinator_ready.'+correlation)
 intent_path=home/('.update_launch_intent.'+correlation)
-marker_re=re.compile(rb'([1-9][0-9]*)\r?\n([0-9]+)(?:\r?\n)?\Z')
+marker_re=re.compile(rb'([1-9][0-9]*)\r?\n([0-9]+)\r?\n([^\r\n]+)(?:\r?\n)?\Z')
 
 def pid_alive(pid):
     if os.name!='nt':
@@ -385,9 +386,16 @@ def process_creation(pid):
         finally:kernel.CloseHandle(handle)
     except Exception:return None
 
+def guard_state():
+    try:guard_path.lstat()
+    except FileNotFoundError:return False
+    except OSError:return None
+    return True
+
 def marker_state():
+    if guard_state() is not False:return {'state':'unavailable'}
     try:raw=marker_path.read_bytes()
-    except FileNotFoundError:return {'state':'absent'}
+    except FileNotFoundError:return {'state':'absent'} if guard_state() is False else {'state':'unavailable'}
     except OSError:return {'state':'unavailable'}
     match=marker_re.fullmatch(raw)
     if not match:return {'state':'malformed'}

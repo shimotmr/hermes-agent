@@ -17,7 +17,7 @@ import assert from 'node:assert/strict'
 import os from 'os'
 import path from 'path'
 
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
 
 import {
   isPidAlive,
@@ -52,6 +52,103 @@ const DEAD: typeof process.kill = () => {
 test('absent marker => no live update', () => {
   const home = tmpHome('absent')
   assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
+})
+
+test('operation guard blocks backend gate while canonical marker is absent', () => {
+  const home = tmpHome('guard-only')
+  const guard = `${markerPath(home)}.lock`
+  fs.mkdirSync(guard)
+  fs.writeFileSync(path.join(guard, 'owner'), `${process.pid}\n`)
+
+  const blocked = readLiveUpdateMarker(home, { kill: ALIVE })
+
+  assert.ok(blocked)
+  assert.equal(blocked.pid, 0)
+})
+
+test('operation guard appearing during marker read still blocks backend gate', () => {
+  const home = tmpHome('guard-race')
+  const file = markerPath(home)
+  const guard = `${file}.lock`
+  const read = vi.spyOn(fs, 'readFileSync').mockImplementation(candidate => {
+    assert.equal(candidate, file)
+    fs.writeFileSync(guard, `${process.pid}\n`)
+    const err = new Error('marker temporarily absent')
+
+    ;(err as NodeJS.ErrnoException).code = 'ENOENT'
+    throw err
+  })
+
+  try {
+    assert.ok(readLiveUpdateMarker(home, { kill: ALIVE }))
+  } finally {
+    read.mockRestore()
+  }
+})
+
+test('unknown or corrupt operation guard blocks backend gate', () => {
+  const home = tmpHome('guard-corrupt')
+  fs.mkdirSync(`${markerPath(home)}.lock`)
+
+  assert.ok(readLiveUpdateMarker(home, { kill: DEAD }))
+})
+
+test('operation guard reclaim preserves an ABA replacement published after detach', () => {
+  const home = tmpHome('guard-aba')
+  const guard = `${markerPath(home)}.lock`
+  fs.writeFileSync(guard, '999999\n')
+  const replacement = `${process.pid}\n`
+  const renameSync = fs.renameSync.bind(fs)
+  const rename = vi.spyOn(fs, 'renameSync').mockImplementation((source, destination) => {
+    renameSync(source, destination)
+    if (source === guard) fs.writeFileSync(guard, replacement)
+  })
+
+  try {
+    assert.equal(claimUpdateMarker(home, 4242, { kill: pid => (pid === process.pid ? true : DEAD(pid, 0)) }), null)
+    assert.equal(
+      rename.mock.calls.filter((call: any[]) => call[0] === guard).length,
+      1,
+      'the replacement guard must never be detached'
+    )
+    assert.equal(fs.readFileSync(guard, 'ascii'), replacement)
+  } finally {
+    rename.mockRestore()
+  }
+})
+
+test('operation guard restore failure keeps the canonical namespace blocked', () => {
+  const home = tmpHome('guard-restore-failure')
+  const guard = `${markerPath(home)}.lock`
+  fs.writeFileSync(guard, 'malformed\n')
+  const linkSync = fs.linkSync.bind(fs)
+  const mkdirSync = fs.mkdirSync.bind(fs)
+  const link = vi.spyOn(fs, 'linkSync').mockImplementation((source, destination) => {
+    if (destination === guard && String(source).includes('.stale-')) {
+      const err = new Error('simulated ACL denial')
+      ;(err as NodeJS.ErrnoException).code = 'EACCES'
+      throw err
+    }
+    return linkSync(source, destination)
+  })
+  const mkdir = vi.spyOn(fs, 'mkdirSync').mockImplementation((candidate, options) => {
+    if (candidate === guard) {
+      const err = new Error('simulated namespace denial')
+      ;(err as NodeJS.ErrnoException).code = 'EACCES'
+      throw err
+    }
+    return mkdirSync(candidate, options as any)
+  })
+
+  try {
+    assert.equal(claimUpdateMarker(home, 4242, { kill: DEAD }), null)
+    assert.equal(fs.existsSync(guard), false)
+    assert.ok(fs.readdirSync(path.dirname(guard)).some(name => name.includes(`${path.basename(guard)}.stale-`)))
+    assert.equal(claimUpdateMarker(home, 4242, { kill: DEAD }), null, 'orphan quarantine must block reacquire')
+  } finally {
+    link.mockRestore()
+    mkdir.mockRestore()
+  }
 })
 
 test('live pid within age ceiling => live update reported', () => {
@@ -101,11 +198,11 @@ test('claim is atomic no-replace and handoff requires expected owner and token',
   assert.equal(lines[2], first.token)
 })
 
-test('malformed marker => no live update and pruned', () => {
+test('malformed marker fails closed', () => {
   const home = tmpHome('malformed')
   fs.writeFileSync(markerPath(home), 'not-a-pid\nnonsense')
-  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
-  assert.ok(!fs.existsSync(markerPath(home)))
+  assert.ok(readLiveUpdateMarker(home, { kill: ALIVE }))
+  assert.ok(fs.existsSync(markerPath(home)))
 })
 
 test('isPidAlive: own pid is alive, impossible pid is dead', () => {
@@ -124,6 +221,17 @@ test('isPidAlive: EPERM counts as alive (process owned by another user)', () => 
   }
 
   assert.equal(isPidAlive(4242, eperm), true)
+})
+
+test('isPidAlive: unknown probe errors fail closed', () => {
+  const unknown = () => {
+    const err = new Error('probe failed')
+
+    ;(err as any).code = 'EIO'
+    throw err
+  }
+
+  assert.equal(isPidAlive(4242, unknown), true)
 })
 
 test('writeUpdateMarker writes a marker that readLiveUpdateMarker accepts', () => {

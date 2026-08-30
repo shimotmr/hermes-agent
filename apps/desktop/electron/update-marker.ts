@@ -33,6 +33,15 @@ export function markerPath(hermesHome) {
   return path.join(hermesHome, '.hermes-update-in-progress')
 }
 
+function authorityPathPresentOrUnknown(file: string) {
+  try {
+    fs.lstatSync(file)
+    return true
+  } catch (err) {
+    return !err || (err as NodeJS.ErrnoException).code !== 'ENOENT'
+  }
+}
+
 function atomicReplaceMarker(file: string, body: string) {
   const temporary = `${file}.write-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
 
@@ -48,47 +57,127 @@ function atomicReplaceMarker(file: string, body: string) {
   }
 }
 
-function markerOperationGuard(file: string, action: () => boolean) {
-  const guard = `${file}.lock`
-  const ownerFile = path.join(guard, 'owner')
+const PRESERVE_OPERATION_GUARD = Symbol('preserve-operation-guard')
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+function removeGuardQuarantine(quarantine: string) {
+  try {
+    fs.rmSync(quarantine, { recursive: true, force: true })
+  } catch {
+    void 0
+  }
+}
+
+function guardQuarantinePresent(guard: string) {
+  const basename = path.basename(guard)
+  const prefixes = [`.${basename}.stale-`, `${basename}.stale-`]
+  try {
+    return fs.readdirSync(path.dirname(guard)).some(entry => prefixes.some(prefix => entry.startsWith(prefix)))
+  } catch {
+    return true
+  }
+}
+
+function reclaimDeadOperationGuard(guard: string) {
+  const quarantine = `${guard}.stale-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  try {
+    fs.renameSync(guard, quarantine)
+  } catch {
+    return false
+  }
+  const owner =
+    fs.existsSync(quarantine) && fs.statSync(quarantine).isDirectory() ? path.join(quarantine, 'owner') : quarantine
+  let guardPid = 0
+  try {
+    guardPid = Number.parseInt(fs.readFileSync(owner, 'ascii').split(/\r?\n/, 1)[0].trim(), 10)
+  } catch {
+    guardPid = 0
+  }
+  if (!Number.isInteger(guardPid) || isPidAlive(guardPid)) {
     try {
-      fs.mkdirSync(guard)
-      try {
-        fs.writeFileSync(ownerFile, `${process.pid}\n`, { encoding: 'ascii', flag: 'wx' })
-      } catch {
-        void 0
-      }
-      try {
-        return action()
-      } finally {
+      fs.linkSync(owner, guard)
+    } catch (err) {
+      if (!err || (err as NodeJS.ErrnoException).code !== 'EEXIST') {
+        // Preserve a canonical fail-closed sentinel without replacing a newer
+        // claimant. The detached authority remains in quarantine even if its
+        // owner cannot be linked into the sentinel directory.
         try {
-          fs.unlinkSync(ownerFile)
+          fs.mkdirSync(guard)
+        } catch (mkdirErr) {
+          if (!mkdirErr || (mkdirErr as NodeJS.ErrnoException).code !== 'EEXIST') return false
+          return false
+        }
+        try {
+          fs.linkSync(owner, path.join(guard, 'owner'))
         } catch {
           void 0
         }
+        return false
+      }
+    }
+    removeGuardQuarantine(quarantine)
+    return false
+  }
+  removeGuardQuarantine(quarantine)
+  // A replacement published after our detach is authoritative. Do not retry
+  // by detaching the newer guard.
+  return !fs.existsSync(quarantine) && !fs.existsSync(guard)
+}
+
+function markerOperationGuard(file: string, action: () => boolean | typeof PRESERVE_OPERATION_GUARD) {
+  const guard = `${file}.lock`
+
+  if (guardQuarantinePresent(guard)) return false
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let privateGuard: string | null = null
+    try {
+      privateGuard = fs.mkdtempSync(`${guard}.`)
+      const privateOwner = path.join(privateGuard, 'owner')
+      const descriptor = fs.openSync(privateOwner, 'wx', 0o600)
+      try {
+        fs.writeSync(descriptor, `${process.pid}\n`, undefined, 'ascii')
+        fs.fsyncSync(descriptor)
+      } finally {
+        fs.closeSync(descriptor)
+      }
+      try {
+        const directoryDescriptor = fs.openSync(privateGuard, 'r')
         try {
-          fs.rmdirSync(guard)
-        } catch {
-          void 0
+          fs.fsyncSync(directoryDescriptor)
+        } finally {
+          fs.closeSync(directoryDescriptor)
+        }
+      } catch {
+        // Windows cannot open directories through the regular file API.
+      }
+      fs.linkSync(privateOwner, guard)
+      let preserve = false
+      try {
+        const result = action()
+        preserve = result === PRESERVE_OPERATION_GUARD
+        return preserve ? false : result
+      } finally {
+        if (!preserve) {
+          try {
+            if (fs.statSync(guard).isDirectory()) fs.unlinkSync(path.join(guard, 'owner'))
+            else fs.unlinkSync(guard)
+          } catch {
+            void 0
+          }
+          try {
+            if (fs.existsSync(guard) && fs.statSync(guard).isDirectory()) fs.rmdirSync(guard)
+          } catch {
+            void 0
+          }
         }
       }
     } catch (err) {
       if (!err || (err as NodeJS.ErrnoException).code !== 'EEXIST') return false
-      let guardPid = 0
-      try {
-        guardPid = Number.parseInt(fs.readFileSync(ownerFile, 'ascii').trim(), 10)
-      } catch {
-        return false
-      }
-      if (isPidAlive(guardPid)) return false
-      try {
-        fs.unlinkSync(ownerFile)
-        fs.rmdirSync(guard)
-      } catch {
-        return false
-      }
+      // Identity-preserving stale reclaim: detach exactly one guard inode,
+      // validate it in quarantine, and never replace a newer canonical guard.
+      if (!reclaimDeadOperationGuard(guard)) return false
+    } finally {
+      if (privateGuard) fs.rmSync(privateGuard, { recursive: true, force: true })
     }
   }
   return false
@@ -119,7 +208,7 @@ function removeMarkerIfUnchangedGuarded(file: string, expected: string) {
     try {
       fs.linkSync(quarantine, file)
     } catch {
-      void 0
+      return PRESERVE_OPERATION_GUARD
     }
   }
 
@@ -136,7 +225,7 @@ function removeMarkerIfUnchangedGuarded(file: string, expected: string) {
     try {
       fs.linkSync(quarantine, file)
     } catch {
-      void 0
+      return PRESERVE_OPERATION_GUARD
     }
   }
 
@@ -147,28 +236,31 @@ function removeMarkerIfUnchangedGuarded(file: string, expected: string) {
 // not deliver a signal — it just probes existence/permission. ESRCH => dead;
 // EPERM => alive but owned by another user (still "alive" for our purposes).
 // Injectable `kill` keeps it unit-testable.
-export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(process)) {
+function pidLiveness(pid, kill: typeof process.kill = process.kill.bind(process)): 'alive' | 'dead' | 'unknown' {
   if (!Number.isInteger(pid) || pid <= 0) {
-    return false
+    return 'unknown'
   }
 
   try {
     kill(pid, 0)
 
-    return true
+    return 'alive'
   } catch (err) {
-    return Boolean(err && (err as NodeJS.ErrnoException).code !== 'ESRCH')
+    return err && (err as NodeJS.ErrnoException).code === 'ESRCH' ? 'dead' : 'unknown'
   }
+}
+
+export function isPidAlive(pid, kill: typeof process.kill = process.kill.bind(process)) {
+  return Number.isInteger(pid) && pid > 0 && pidLiveness(pid, kill) !== 'dead'
 }
 
 /**
  * Read + interpret the marker.
  *
  * Returns `{ pid, ageMs }` only when an update is GENUINELY still running
- * (parseable pid that is alive). Returns `null` for every "no live update"
- * case — absent, unreadable, malformed, or confirmed-dead pid — and, when a
- * stale marker file exists, deletes it so it
- * cannot strand future launches.
+ * (parseable pid that is alive). Only confirmed absence or confirmed-dead
+ * authority that was safely removed returns `null`; operation guards and
+ * unknown/corrupt authority fail closed.
  *
  * Pure-ish: file I/O against the given path, plus an injectable pid probe and
  * clock for tests.
@@ -186,12 +278,14 @@ export function readLiveUpdateMarker(
   } = {}
 ) {
   const file = markerPath(hermesHome)
+  if (authorityPathPresentOrUnknown(`${file}.lock`)) return { pid: 0, ageMs: Infinity }
   let raw
 
   try {
     raw = fs.readFileSync(file, 'utf8')
-  } catch {
-    return null // absent or unreadable => no live update
+  } catch (err) {
+    const markerUnknown = !err || (err as NodeJS.ErrnoException).code !== 'ENOENT'
+    return markerUnknown || authorityPathPresentOrUnknown(`${file}.lock`) ? { pid: 0, ageMs: Infinity } : null
   }
 
   const [pidLine, startedLine] = String(raw).split('\n')
@@ -200,9 +294,11 @@ export function readLiveUpdateMarker(
   const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
   const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
 
+  if (!Number.isInteger(pid) || !Number.isInteger(startedAt)) return { pid: 0, ageMs }
+
   if (!alive) {
     const removed = removeMarkerIfUnchanged(file, raw)
-    if (!removed && fs.existsSync(file)) {
+    if (!removed && (fs.existsSync(file) || authorityPathPresentOrUnknown(`${file}.lock`))) {
       // A cross-runtime handoff/cleanup operation currently owns the guard.
       // Fail closed until its canonical marker transition completes.
       return { pid: Number.isInteger(pid) ? pid : 0, ageMs }
@@ -242,11 +338,32 @@ export function claimUpdateMarker(
       } catch {
         return false
       }
+      if (!Number.isInteger(existingPid) || existingPid <= 0) return false
       if (isPidAlive(existingPid, kill)) return false
       const stale = `${file}.stale-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
       try {
         fs.renameSync(file, stale)
-        fs.unlinkSync(stale)
+        const detached = fs.readFileSync(stale, 'utf8')
+        const detachedPid = Number.parseInt(detached.split('\n')[0].trim(), 10)
+        if (isPidAlive(detachedPid, kill)) {
+          try {
+            fs.linkSync(stale, file)
+          } catch {
+            return PRESERVE_OPERATION_GUARD
+          }
+          fs.unlinkSync(stale)
+          return false
+        }
+        try {
+          fs.unlinkSync(stale)
+        } catch {
+          try {
+            fs.linkSync(stale, file)
+          } catch {
+            return PRESERVE_OPERATION_GUARD
+          }
+          return false
+        }
       } catch {
         return false
       }

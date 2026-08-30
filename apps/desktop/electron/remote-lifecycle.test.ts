@@ -181,6 +181,7 @@ test('POSIX relaunch gate permits absent/dead markers and normalizes named-profi
   assert.match(commands[0], /home\.parent\.name/)
   assert.match(commands[0], /profiles/)
   assert.match(commands[0], /\.hermes-update-in-progress/)
+  assert.match(commands[0], /marker\.with_name\(marker\.name\+.*\.lock/)
 })
 
 test('POSIX relaunch gate rechecks after token upload immediately before process creation', async () => {
@@ -775,6 +776,7 @@ test('buildSpawnCommand is headless serve, detached, token not in argv', () => {
   assert.match(cmd, /setsid/)
   assert.match(cmd, /<\/dev\/null/)
   assert.match(cmd, /echo \$!/)
+  assert.match(cmd, /\.hermes-update-in-progress.*\.lock/)
   assert.ok(!cmd.includes('tok_secret_value'), 'token must not appear in spawn command')
   assert.ok(!cmd.includes('HERMES_DASHBOARD_SESSION_TOKEN'), 'token env var must not appear')
 })

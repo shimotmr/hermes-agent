@@ -345,3 +345,31 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
     assert status._pid_exists(4242) is False
 
 
+def test_pid_exists_unknown_psutil_probe_fails_closed(monkeypatch):
+    import sys
+    import types
+
+    from gateway import status
+
+    fake_psutil = types.SimpleNamespace(
+        STATUS_ZOMBIE="zombie",
+        NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+    )
+
+    class _Proc:
+        def __init__(self, _pid):
+            pass
+
+        def status(self):
+            raise PermissionError("status unavailable")
+
+    fake_psutil.Process = _Proc
+
+    def unknown(_pid):
+        raise OSError("pid probe unavailable")
+
+    fake_psutil.pid_exists = unknown
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert status._pid_exists(4242) is True
+

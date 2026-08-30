@@ -14,6 +14,7 @@ import json
 import os
 import stat
 import subprocess
+import tempfile
 from datetime import datetime
 from dataclasses import asdict, dataclass
 from contextlib import contextmanager
@@ -148,21 +149,77 @@ def _exclusive_file_lock(
 
 
 def _evidence_lock_path(target: Path, *, is_windows: bool | None = None) -> Path:
-    """Keep Windows' mandatory lock byte outside the JSONL manifest."""
-    use_sidecar = os.name == "nt" if is_windows is None else is_windows
-    return target.with_name(f"{target.name}.lock") if use_sidecar else target
+    """Keep the serialization inode separate from the COW manifest."""
+    return target.with_name(f"{target.name}.lock")
 
 
 @contextmanager
 def _evidence_file_lock(target: Path, manifest_handle):
     lock_target = _evidence_lock_path(target)
-    if lock_target == target:
-        with _exclusive_file_lock(manifest_handle):
-            yield
-        return
-
-    descriptor = os.open(lock_target, os.O_RDWR | os.O_CREAT, 0o600)
     try:
+        initial_status = lock_target.lstat()
+    except FileNotFoundError:
+        initial_status = None
+    if initial_status is not None:
+        if stat.S_ISLNK(initial_status.st_mode):
+            raise ValueError("evidence-lock-symlink")
+        if not stat.S_ISREG(initial_status.st_mode):
+            raise ValueError("evidence-lock-not-regular")
+        if initial_status.st_nlink != 1:
+            raise ValueError("evidence-lock-hardlink")
+
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_target, flags, 0o600)
+    except OSError as exc:
+        if lock_target.is_symlink():
+            raise ValueError("evidence-lock-symlink") from exc
+        raise
+    try:
+        opened_status = os.fstat(descriptor)
+        try:
+            current_status = lock_target.lstat()
+        except OSError as exc:
+            raise ValueError("evidence-lock-replaced") from exc
+        if stat.S_ISLNK(current_status.st_mode):
+            raise ValueError("evidence-lock-symlink")
+        if not stat.S_ISREG(opened_status.st_mode) or not stat.S_ISREG(
+            current_status.st_mode
+        ):
+            raise ValueError("evidence-lock-not-regular")
+        if opened_status.st_nlink != 1 or current_status.st_nlink != 1:
+            raise ValueError("evidence-lock-hardlink")
+        opened_identity = (opened_status.st_dev, opened_status.st_ino)
+        if (current_status.st_dev, current_status.st_ino) != opened_identity:
+            raise ValueError("evidence-lock-replaced")
+        if initial_status is not None and (
+            initial_status.st_dev,
+            initial_status.st_ino,
+        ) != opened_identity:
+            raise ValueError("evidence-lock-replaced")
+
+        def verify_lock_identity() -> None:
+            descriptor_status = os.fstat(descriptor)
+            try:
+                path_status = lock_target.lstat()
+            except OSError as exc:
+                raise ValueError("evidence-lock-replaced") from exc
+            if stat.S_ISLNK(path_status.st_mode):
+                raise ValueError("evidence-lock-symlink")
+            if not stat.S_ISREG(descriptor_status.st_mode) or not stat.S_ISREG(
+                path_status.st_mode
+            ):
+                raise ValueError("evidence-lock-not-regular")
+            if descriptor_status.st_nlink == 0:
+                raise ValueError("evidence-lock-replaced")
+            if descriptor_status.st_nlink > 1 or path_status.st_nlink != 1:
+                raise ValueError("evidence-lock-hardlink")
+            if (
+                descriptor_status.st_dev,
+                descriptor_status.st_ino,
+            ) != (path_status.st_dev, path_status.st_ino):
+                raise ValueError("evidence-lock-replaced")
+
         with os.fdopen(descriptor, "r+b", closefd=False) as lock_handle:
             lock_handle.seek(0, os.SEEK_END)
             if lock_handle.tell() == 0:
@@ -170,9 +227,19 @@ def _evidence_file_lock(target: Path, manifest_handle):
                 lock_handle.flush()
                 os.fsync(lock_handle.fileno())
             with _exclusive_file_lock(lock_handle):
-                yield
+                verify_lock_identity()
+                yield verify_lock_identity
+                verify_lock_identity()
     finally:
         os.close(descriptor)
+
+
+def _evidence_before_private_write(_path: Path, _descriptor: int) -> None:
+    """Adversarial-test seam immediately before private-inode validation/write."""
+
+
+def _evidence_before_replace(_temporary: Path, _target: Path) -> None:
+    """Adversarial-test seam immediately before final identity validation."""
 
 
 def _changed_paths(repo: Path, old_sha: str, new_sha: str) -> tuple[str, ...]:
@@ -659,119 +726,135 @@ def append_evidence(
         raise ValueError("snapshot-tree-mismatch")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        target_status = target.lstat()
-    except FileNotFoundError:
-        target_status = None
-    if target_status is not None:
-        if stat.S_ISLNK(target_status.st_mode):
-            raise ValueError("evidence-target-symlink")
-        if not stat.S_ISREG(target_status.st_mode):
-            raise ValueError("evidence-target-not-regular")
-        if target_status.st_nlink != 1:
-            raise ValueError("evidence-target-hardlink")
-    open_flags = os.O_RDWR | os.O_APPEND
-    if target_status is None:
-        open_flags |= os.O_CREAT | os.O_EXCL
-    open_flags |= getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(target, open_flags, 0o600)
-    except FileExistsError as exc:
-        if target_status is None:
-            raise ValueError("evidence-target-exists") from exc
-        raise
-    except OSError as exc:
-        if target.is_symlink():
-            raise ValueError("evidence-target-symlink") from exc
-        raise
-    try:
-        opened_status = os.fstat(descriptor)
-        if not stat.S_ISREG(opened_status.st_mode):
-            raise ValueError("evidence-target-not-regular")
-        if opened_status.st_nlink != 1:
-            raise ValueError("evidence-target-hardlink")
+    with _evidence_file_lock(target, None) as verify_evidence_lock:
         try:
-            current_status = target.lstat()
-        except OSError as exc:
-            raise ValueError("evidence-target-replaced") from exc
-        if stat.S_ISLNK(current_status.st_mode):
-            raise ValueError("evidence-target-symlink")
-        if (
-            current_status.st_dev != opened_status.st_dev
-            or current_status.st_ino != opened_status.st_ino
-        ):
-            raise ValueError("evidence-target-replaced")
-        if target_status is not None and (
-            opened_status.st_dev != target_status.st_dev
-            or opened_status.st_ino != target_status.st_ino
-        ):
-            raise ValueError("evidence-target-replaced")
-        with os.fdopen(descriptor, "r+b", closefd=False) as handle:
-            with _evidence_file_lock(target, handle):
-                def verify_target_identity() -> None:
-                    try:
-                        locked_status = target.lstat()
-                    except OSError as exc:
-                        raise ValueError("evidence-target-replaced") from exc
-                    if stat.S_ISLNK(locked_status.st_mode):
-                        raise ValueError("evidence-target-symlink")
-                    if (
-                        locked_status.st_dev != opened_status.st_dev
-                        or locked_status.st_ino != opened_status.st_ino
-                    ):
-                        raise ValueError("evidence-target-replaced")
-                    descriptor_status = os.fstat(handle.fileno())
-                    if descriptor_status.st_nlink != 1:
-                        raise ValueError("evidence-target-hardlink")
+            target_status = target.lstat()
+        except FileNotFoundError:
+            target_status = None
+        if target_status is not None:
+            if stat.S_ISLNK(target_status.st_mode):
+                raise ValueError("evidence-target-symlink")
+            if not stat.S_ISREG(target_status.st_mode):
+                raise ValueError("evidence-target-not-regular")
+            if target_status.st_nlink != 1:
+                raise ValueError("evidence-target-hardlink")
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(target, flags)
+            try:
+                opened_status = os.fstat(descriptor)
+                current_status = target.lstat()
+                if (
+                    not stat.S_ISREG(opened_status.st_mode)
+                    or opened_status.st_nlink != 1
+                    or (opened_status.st_dev, opened_status.st_ino)
+                    != (target_status.st_dev, target_status.st_ino)
+                    or (current_status.st_dev, current_status.st_ino)
+                    != (opened_status.st_dev, opened_status.st_ino)
+                ):
+                    raise ValueError("evidence-target-replaced")
+                with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                    existing_bytes = handle.read()
+            finally:
+                os.close(descriptor)
+        else:
+            existing_bytes = b""
 
-                verify_target_identity()
-                fchmod = getattr(os, "fchmod", None)
-                if fchmod is not None:
-                    fchmod(descriptor, 0o600)
-                else:
-                    os.chmod(target, 0o600)
-                verify_target_identity()
-                handle.seek(0)
-                events = _read_evidence_bytes(handle.read(), repo=Path(repo))
-                snapshot_payload = asdict(snapshot)
-                event: dict[str, Any] = {
-                    "schema_version": _SCHEMA_EVIDENCE,
-                    "sequence": len(events) + 1,
-                    "frozen_sha": frozen_sha,
-                    "candidate_sha": candidate_sha,
-                    "snapshot_id": snapshot.snapshot_id,
-                    "snapshot": snapshot_payload,
-                    "frozen_tree_sha": frozen_tree,
-                    "candidate_tree_sha": candidate_tree,
-                    "gate_id": gate_id,
-                    "command": command,
-                    "exit_code": exit_code,
-                    "recorded_at": recorded_at,
-                    "previous_event_hash": events[-1]["event_hash"] if events else None,
-                }
-                if overlap_report is not None:
-                    if gate_id != "freeze" or not overlap_critical_paths:
-                        raise ValueError("evidence-overlap-binding-invalid")
-                    recomputed = classify_overlap(
-                        Path(repo),
-                        overlap_report.from_sha,
-                        overlap_report.latest_sha,
-                        critical_paths=tuple(overlap_critical_paths),
-                    )
-                    if asdict(recomputed) != asdict(overlap_report):
-                        raise ValueError("evidence-overlap-report-mismatch")
-                    event["overlap_report"] = asdict(overlap_report)
-                    event["overlap_critical_paths"] = list(overlap_critical_paths)
-                event["event_hash"] = hashlib.sha256(_canonical_bytes(event)).hexdigest()
-                event = json.loads(_canonical_bytes(event))
-                encoded = _canonical_bytes(event) + b"\n"
-                verify_target_identity()
-                os.write(handle.fileno(), encoded)
-                os.fsync(handle.fileno())
-                verify_target_identity()
-                return event
-    finally:
-        os.close(descriptor)
+        events = _read_evidence_bytes(existing_bytes, repo=Path(repo))
+        snapshot_payload = asdict(snapshot)
+        event: dict[str, Any] = {
+            "schema_version": _SCHEMA_EVIDENCE,
+            "sequence": len(events) + 1,
+            "frozen_sha": frozen_sha,
+            "candidate_sha": candidate_sha,
+            "snapshot_id": snapshot.snapshot_id,
+            "snapshot": snapshot_payload,
+            "frozen_tree_sha": frozen_tree,
+            "candidate_tree_sha": candidate_tree,
+            "gate_id": gate_id,
+            "command": command,
+            "exit_code": exit_code,
+            "recorded_at": recorded_at,
+            "previous_event_hash": events[-1]["event_hash"] if events else None,
+        }
+        if overlap_report is not None:
+            if gate_id != "freeze" or not overlap_critical_paths:
+                raise ValueError("evidence-overlap-binding-invalid")
+            recomputed = classify_overlap(
+                Path(repo),
+                overlap_report.from_sha,
+                overlap_report.latest_sha,
+                critical_paths=tuple(overlap_critical_paths),
+            )
+            if asdict(recomputed) != asdict(overlap_report):
+                raise ValueError("evidence-overlap-report-mismatch")
+            event["overlap_report"] = asdict(overlap_report)
+            event["overlap_critical_paths"] = list(overlap_critical_paths)
+        event["event_hash"] = hashlib.sha256(_canonical_bytes(event)).hexdigest()
+        event = json.loads(_canonical_bytes(event))
+        encoded = existing_bytes + _canonical_bytes(event) + b"\n"
+        temporary_path: str | None = None
+        private_descriptor: int | None = None
+        try:
+            private_descriptor, temporary_path = tempfile.mkstemp(
+                prefix=f".{target.name}.", dir=target.parent
+            )
+            temporary = Path(temporary_path)
+            private_status = os.fstat(private_descriptor)
+            if private_status.st_nlink != 1 or stat.S_IMODE(private_status.st_mode) != 0o600:
+                raise ValueError("evidence-target-hardlink")
+            _evidence_before_private_write(temporary, private_descriptor)
+            if os.fstat(private_descriptor).st_nlink != 1:
+                raise ValueError("evidence-target-hardlink")
+            verify_evidence_lock()
+            os.write(private_descriptor, encoded)
+            os.fsync(private_descriptor)
+            if os.fstat(private_descriptor).st_nlink != 1:
+                raise ValueError("evidence-target-hardlink")
+            _evidence_before_replace(temporary, target)
+            if os.fstat(private_descriptor).st_nlink != 1:
+                raise ValueError("evidence-target-hardlink")
+            verify_evidence_lock()
+            try:
+                current_status = target.lstat()
+            except FileNotFoundError:
+                current_status = None
+            if target_status is None:
+                if current_status is not None:
+                    raise ValueError("evidence-target-exists")
+            elif current_status is None or (
+                current_status.st_dev,
+                current_status.st_ino,
+                current_status.st_nlink,
+            ) != (target_status.st_dev, target_status.st_ino, 1):
+                raise ValueError("evidence-target-replaced")
+            os.replace(temporary, target)
+            temporary_path = None
+            published = target.lstat()
+            if (
+                (published.st_dev, published.st_ino)
+                != (private_status.st_dev, private_status.st_ino)
+                or published.st_nlink != 1
+                or stat.S_IMODE(published.st_mode) != 0o600
+            ):
+                raise ValueError("evidence-target-replaced")
+            try:
+                directory = os.open(target.parent, os.O_RDONLY)
+            except OSError:
+                directory = None
+            if directory is not None:
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            return event
+        finally:
+            if private_descriptor is not None:
+                os.close(private_descriptor)
+            if temporary_path is not None:
+                try:
+                    Path(temporary_path).unlink()
+                except OSError:
+                    pass
 
 
 def _load_snapshot(path: Path) -> ReleaseSnapshot:

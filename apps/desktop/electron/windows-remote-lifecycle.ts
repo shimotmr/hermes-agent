@@ -102,11 +102,12 @@ public static class HermesMarkerNoFollow {
     '$parent=Split-Path -Parent $home',
     'if((Split-Path -Leaf $parent) -ieq "profiles"){$installRoot=Split-Path -Parent $parent}',
     '$marker=Join-Path $installRoot ".hermes-update-in-progress"',
+    '$guard=$marker+".lock"',
     '$result="UNCERTAIN"',
     '$stream=$null;$memory=$null',
     'try{',
     'Assert-NoReparse $marker $true',
-    'if(-not (Test-Path -LiteralPath $marker -PathType Leaf)){$result="CLEAR"}else{$stream=[HermesMarkerNoFollow]::OpenRead($marker)',
+    'if(Test-Path -LiteralPath $guard){$result="UNCERTAIN"}elseif(-not (Test-Path -LiteralPath $marker -PathType Leaf)){if(Test-Path -LiteralPath $guard){$result="UNCERTAIN"}else{$result="CLEAR"}}else{$stream=[HermesMarkerNoFollow]::OpenRead($marker)',
     'Assert-NoReparse $marker $false',
     '$memory=New-Object IO.MemoryStream;$stream.CopyTo($memory);$bytes=$memory.ToArray()',
     'if($bytes.Length -le 256){',
@@ -125,7 +126,7 @@ public static class HermesMarkerNoFollow {
     '}catch [ArgumentException]{$result="CLEAR"} catch{$result="UNCERTAIN"}',
     '}',
     '}',
-    '}}catch [IO.FileNotFoundException]{$result="CLEAR"}catch{$result="UNCERTAIN"}finally{if($memory){$memory.Dispose()};if($stream){$stream.Dispose()}}',
+    '}}catch [IO.FileNotFoundException]{if(Test-Path -LiteralPath $guard){$result="UNCERTAIN"}else{$result="CLEAR"}}catch{$result="UNCERTAIN"}finally{if($memory){$memory.Dispose()};if($stream){$stream.Dispose()}}',
     'Write-Output $result'
   ].join(';')
 
@@ -257,11 +258,12 @@ function atomicWindowsSpawnCommand(runtime, reservation: any = {}) {
     '$parent=Split-Path -Parent $home',
     'if((Split-Path -Leaf $parent) -ieq "profiles"){$installRoot=Split-Path -Parent $parent}',
     '$marker=Join-Path $installRoot ".hermes-update-in-progress"',
+    '$markerGuard=$marker+".lock"',
     '$mutexPath=$marker+".mutex"',
     '$mutex=[IO.File]::Open($mutexPath,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite)',
     'try{',
     '  $mutex.Lock(0,1)',
-    '  if([IO.File]::Exists($marker)){throw "remote update marker is present"}',
+    '  if([IO.File]::Exists($marker) -or [IO.File]::Exists($markerGuard)){throw "remote update marker is present"}',
     reservation.ownershipId
       ? `  $existingLines=@(& ${helper('read-lock').map(psLiteral).join(' ')} ${psLiteral(reservation.ownershipId)}); $existingExit=$LASTEXITCODE; ` +
         '  if($existingExit -eq 0 -and $existingLines.Count -gt 0){try{$existing=$existingLines[-1]|ConvertFrom-Json}catch{$existing=$null}; ' +
@@ -279,7 +281,7 @@ function atomicWindowsSpawnCommand(runtime, reservation: any = {}) {
       ? `  $spawned=$spawnLines[-1]|ConvertFrom-Json; $lock=[ordered]@{schemaVersion=2;protocolVersion=1;ownershipId=${psLiteral(reservation.ownershipId)};spawnNonce=${psLiteral(reservation.spawnNonce)};pid=[int]$spawned.pid;creationTimeNs=[string]$spawned.creationTimeNs;port=0;profile=${psLiteral(reservation.profile)};hermesPath=${psLiteral(reservation.hermesPath)};hermesHome=${psLiteral(reservation.hermesHome)};tokenFingerprint=${psLiteral(reservation.tokenFingerprint)};startedAt=${psLiteral(reservation.startedAt)}}|ConvertTo-Json -Compress; ` +
         `  & ${helper('write-lock').map(psLiteral).join(' ')} ${psLiteral(reservation.ownershipId)} $lock|Out-Null; if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}; $spawnLines|Write-Output`
       : '',
-    '  if([IO.File]::Exists($marker)){throw "remote update marker claimed during backend spawn"}',
+    '  if([IO.File]::Exists($marker) -or [IO.File]::Exists($markerGuard)){throw "remote update marker claimed during backend spawn"}',
     '}finally{try{$mutex.Unlock(0,1)}catch{};$mutex.Dispose()}'
   ]
     .filter(line => line !== '')

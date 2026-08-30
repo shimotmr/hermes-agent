@@ -32,20 +32,14 @@ One layering wrinkle: the Tauri updater holds this marker for its WHOLE run and
 then spawns ``hermes update`` as a child stage. Without a handoff the child
 sees its own parent's live marker and refuses — the GUI update deadlocks
 against itself on every attempt ("Hermes is still running", retry forever).
-Two mechanisms recognize the orchestrating parent, and either suffices:
+The orchestrating parent exports a pid + opaque token pair:
 
 * The updater exports :data:`HANDOFF_PID_ENV` naming its own pid, and
   ``acquire`` treats a live holder matching that pid as the lock we are
   already running under. The env var alone grants nothing: the pid must also
   be the live marker owner, so a stale or forged value cannot bypass the lock.
-* A live holder that is a *process ancestor* of ours is likewise our own
-  orchestrator. This is the load-bearing path for the fleet: the staged
-  ``hermes-setup`` binary under ``~/.hermes`` is only refreshed by a full
-  installer run (``copy_self_to_hermes_home`` deliberately no-ops during
-  ``--update``), so every desktop whose staged updater predates the
-  HANDOFF_PID_ENV export runs an old parent against a new child. Without the
-  ancestry check those users get exit 2 ("Hermes is still running") on every
-  GUI update forever, with no Hermes process actually running.
+Legacy ancestry without that token cannot prove safe ownership transfer and is
+therefore refused; the parent must keep the canonical claim intact.
 """
 
 from __future__ import annotations
@@ -57,6 +51,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -99,7 +94,13 @@ def update_marker_path() -> Path:
     return get_process_hermes_home() / MARKER_NAME
 
 
-def _pid_alive(pid: int) -> bool:
+class _Liveness(Enum):
+    ALIVE = "alive"
+    DEAD = "dead"
+    UNKNOWN = "unknown"
+
+
+def _pid_liveness(pid: int) -> _Liveness:
     """True when a process with ``pid`` currently exists.
 
     Delegates to :func:`gateway.status._pid_exists`, the project's existing
@@ -114,15 +115,20 @@ def _pid_alive(pid: int) -> bool:
     is never evicted merely because the claim is old.
     """
     if pid <= 0:
-        return False
+        return _Liveness.UNKNOWN
     try:
         from gateway.status import _pid_exists
 
-        return bool(_pid_exists(pid))
+        return _Liveness.ALIVE if _pid_exists(pid) else _Liveness.DEAD
     except Exception as exc:
         # Import/probe failure leaves authority uncertain. Fail closed.
         logger.debug("Could not probe pid %s: %s", pid, exc)
-        return True
+        return _Liveness.UNKNOWN
+
+
+def _pid_alive(pid: int) -> bool:
+    """Compatibility predicate: unknown authority is deliberately blocking."""
+    return _pid_liveness(pid) is not _Liveness.DEAD
 
 
 def _handoff_pid() -> int | None:
@@ -139,29 +145,6 @@ def _handoff_pid() -> int | None:
     except ValueError:
         return None
     return pid if pid > 0 else None
-
-
-def _is_ancestor_pid(pid: int) -> bool:
-    """True when ``pid`` is a live ancestor (parent chain) of this process.
-
-    The orchestrating updater spawns ``hermes update`` as a (grand)child, so a
-    live marker owned by one of our ancestors can only be the claim we are
-    already running under — an unrelated concurrent updater is never in our
-    parent chain. This heals the fleet of staged ``hermes-setup`` binaries
-    that predate the HANDOFF_PID_ENV export and can never send it.
-
-    Never includes our own pid, and any failure counts as "not an ancestor":
-    an unprovable ancestry must fall back to the normal refusal.
-    """
-    if pid <= 0:
-        return False
-    try:
-        import psutil
-
-        return any(parent.pid == pid for parent in psutil.Process().parents())
-    except Exception as exc:
-        logger.debug("Could not walk process ancestry for pid %s: %s", pid, exc)
-        return False
 
 
 @dataclass(frozen=True)
@@ -191,70 +174,182 @@ def _operation_guard_path(marker: Path) -> Path:
     return marker.with_name(f"{marker.name}.lock")
 
 
+def _guard_owner_path(guard: Path) -> Path:
+    """Owner inode for the current file guard or a legacy directory guard."""
+    return guard / "owner" if guard.is_dir() else guard
+
+
+def _guard_quarantine_present(guard: Path) -> bool:
+    """Treat any orphaned cross-runtime stale quarantine as authoritative."""
+    prefixes = (f".{guard.name}.stale-", f"{guard.name}.stale-")
+    try:
+        return any(entry.name.startswith(prefixes) for entry in guard.parent.iterdir())
+    except OSError:
+        return True
+
+
+def _restore_quarantined_guard(guard: Path, quarantine: Path, owner_file: Path) -> bool:
+    """Restore detached guard authority without replacing a newer claimant."""
+    try:
+        os.link(owner_file, guard)
+    except FileExistsError:
+        # A newer canonical guard wins. Never delete or replace it.
+        return True
+    except OSError:
+        # If the exact inode cannot be restored, publish a no-replace directory
+        # sentinel.  Even if its owner link also fails, the malformed canonical
+        # guard blocks every runtime while the original stays in quarantine.
+        try:
+            guard.mkdir()
+        except FileExistsError:
+            return True
+        except OSError:
+            return False
+        try:
+            os.link(owner_file, guard / "owner")
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _reclaim_dead_guard(guard: Path) -> bool:
+    """Detach one guard identity, then reclaim only that confirmed-dead inode."""
+    quarantine = guard.with_name(
+        f".{guard.name}.stale-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    try:
+        os.replace(guard, quarantine)
+    except OSError:
+        return False
+
+    owner_file = quarantine / "owner" if quarantine.is_dir() else quarantine
+    try:
+        guard_pid = int(owner_file.read_text(encoding="ascii").splitlines()[0].strip())
+    except (OSError, ValueError, IndexError):
+        if not _restore_quarantined_guard(guard, quarantine, owner_file):
+            return False
+        _remove_guard_quarantine(quarantine)
+        return False
+
+    if _pid_liveness(guard_pid) is not _Liveness.DEAD:
+        if not _restore_quarantined_guard(guard, quarantine, owner_file):
+            return False
+        _remove_guard_quarantine(quarantine)
+        return False
+
+    _remove_guard_quarantine(quarantine)
+    # A replacement published after our detach is authoritative. Do not enter
+    # another retry that would detach that newer guard as if it were stale.
+    return not quarantine.exists() and not guard.exists()
+
+
+def _remove_guard_quarantine(quarantine: Path) -> None:
+    try:
+        if quarantine.is_dir():
+            (quarantine / "owner").unlink(missing_ok=True)
+            quarantine.rmdir()
+        else:
+            quarantine.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 @contextmanager
 def _marker_operation(marker: Path):
     """Serialize every canonical marker mutation across all updater runtimes."""
     guard = _operation_guard_path(marker)
-    owner_file = guard / "owner"
+    private_guard: Path | None = None
     acquired = False
+    preserve = False
+    if _guard_quarantine_present(guard):
+        yield False
+        return
     for _attempt in range(3):
         try:
-            guard.mkdir()
-            acquired = True
+            private_guard = Path(
+                tempfile.mkdtemp(prefix=f".{guard.name}.", dir=guard.parent)
+            )
+            owner_file = private_guard / "owner"
+            descriptor = os.open(owner_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
-                owner_file.write_text(f"{os.getpid()}\n", encoding="ascii")
+                os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            try:
+                directory_descriptor = os.open(private_guard, os.O_RDONLY)
             except OSError:
-                # The directory itself is already the atomic exclusion claim.
-                pass
+                directory_descriptor = None
+            if directory_descriptor is not None:
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
+            os.link(owner_file, guard)
+            acquired = True
             break
         except FileExistsError:
-            try:
-                guard_pid = int(owner_file.read_text(encoding="ascii").strip())
-            except (OSError, ValueError):
-                yield False
-                return
-            if _pid_alive(guard_pid):
-                yield False
-                return
-            try:
-                owner_file.unlink(missing_ok=True)
-                guard.rmdir()
-            except OSError:
+            # Never decide from a pathname and then unlink that pathname: another
+            # runtime can replace it in between (ABA). Detach one identity into
+            # quarantine, revalidate there, and restore with no replacement.
+            if not _reclaim_dead_guard(guard):
                 yield False
                 return
         except OSError:
             yield False
             return
+        finally:
+            if private_guard is not None:
+                try:
+                    (private_guard / "owner").unlink(missing_ok=True)
+                    private_guard.rmdir()
+                except OSError:
+                    pass
+                private_guard = None
     if not acquired:
         yield False
         return
     try:
-        yield True
+        class OperationLease:
+            def preserve(self) -> None:
+                nonlocal preserve
+                preserve = True
+
+            def __bool__(self) -> bool:
+                return True
+
+        yield OperationLease()
     finally:
-        try:
-            owner_file.unlink(missing_ok=True)
-            guard.rmdir()
-        except OSError:
-            # A stranded guard fails closed; never delete uncertain authority.
-            pass
+        if not preserve:
+            try:
+                if guard.is_dir():
+                    (guard / "owner").unlink(missing_ok=True)
+                    guard.rmdir()
+                else:
+                    guard.unlink()
+            except OSError:
+                # A stranded guard fails closed; never delete uncertain authority.
+                pass
 
 
-def _restore_quarantined_marker(marker: Path, quarantine: Path) -> None:
+def _restore_quarantined_marker(marker: Path, quarantine: Path) -> bool:
     """Restore a marker without replacing a claim published after our rename."""
     try:
         os.link(quarantine, marker)
     except FileExistsError:
         # A newer claimant already occupies the canonical pathname. Keeping that
         # marker is the fail-closed result; the quarantined copy is redundant.
-        pass
+        return True
     except OSError:
         # Ownership could not be restored safely. Retain the private marker for
         # diagnosis rather than deleting an inode we do not own.
-        return
+        return False
     try:
         quarantine.unlink()
     except OSError:
         pass
+    return True
 
 
 def _remove_marker_if(marker: Path, predicate) -> bool:
@@ -265,8 +360,8 @@ def _remove_marker_if(marker: Path, predicate) -> bool:
     publish: a claim published before the rename is re-verified in quarantine;
     one published after it remains at ``marker`` and cannot be deleted here.
     """
-    with _marker_operation(marker) as guarded:
-        if not guarded:
+    with _marker_operation(marker) as operation:
+        if not operation:
             return False
         quarantine = marker.with_name(
             f".{marker.name}.remove-{os.getpid()}-{uuid.uuid4().hex}"
@@ -281,12 +376,14 @@ def _remove_marker_if(marker: Path, predicate) -> bool:
         except Exception:
             removable = False
         if not removable:
-            _restore_quarantined_marker(marker, quarantine)
+            if not _restore_quarantined_marker(marker, quarantine):
+                operation.preserve()
             return False
         try:
             quarantine.unlink()
         except OSError:
-            _restore_quarantined_marker(marker, quarantine)
+            if not _restore_quarantined_marker(marker, quarantine):
+                operation.preserve()
             return False
         return True
 
@@ -294,16 +391,18 @@ def _remove_marker_if(marker: Path, predicate) -> bool:
 def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
     """Return the live update holding the lock, or ``None``.
 
-    Mirrors ``readLiveUpdateMarker`` in ``electron/update-marker.ts``: absent,
-    unreadable, malformed, dead-pid, and past-the-ceiling all mean "no live
-    update", and a stale marker file is deleted so it can't strand future runs.
-    Never raises.
+    Mirrors ``readLiveUpdateMarker`` in ``electron/update-marker.ts``. Only an
+    absent marker with no operation guard, or a marker whose process is
+    explicitly dead and safely removed, is clear. Unknown/corrupt authority
+    blocks. Never raises.
     """
     marker = path or update_marker_path()
     try:
         raw = marker.read_text(encoding="utf-8")
     except OSError:
-        return None  # absent or unreadable => no live update
+        if _operation_guard_path(marker).exists():
+            return UpdateHolder(pid=0, age_seconds=float("inf"))
+        return None
 
     lines = raw.splitlines()
     try:
@@ -313,10 +412,11 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
     try:
         started_at = float(lines[1].strip())
     except (IndexError, ValueError):
-        started_at = float("-inf")
+        return UpdateHolder(pid=0, age_seconds=float("inf"))
 
     age = time.time() - started_at
-    if not _pid_alive(pid):
+    liveness = _pid_liveness(pid)
+    if liveness is _Liveness.DEAD:
         def still_stale(candidate: str) -> bool:
             candidate_lines = candidate.splitlines()
             try:
@@ -324,10 +424,14 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
                 candidate_started = float(candidate_lines[1].strip())
             except (IndexError, ValueError):
                 return True
-            return not _pid_alive(candidate_pid)
+            return _pid_liveness(candidate_pid) is _Liveness.DEAD
 
-        _remove_marker_if(marker, still_stale)
-        return None
+        if _remove_marker_if(marker, still_stale):
+            return None
+        return UpdateHolder(pid=0, age_seconds=age)
+
+    if liveness is _Liveness.UNKNOWN:
+        return UpdateHolder(pid=pid if pid > 0 else 0, age_seconds=age)
 
     return UpdateHolder(pid=pid, age_seconds=age)
 
@@ -365,12 +469,10 @@ class UpdateLock:
     def acquire(self) -> bool:
         """Claim the lock. Returns False (and sets ``holder``) if it's taken.
 
-        A live holder whose pid matches :data:`HANDOFF_PID_ENV` — or is a
-        process ancestor of ours — is our own orchestrating parent (the Tauri
-        updater spawning `hermes update` as a stage): we run under ITS claim
-        rather than refusing or re-writing the marker, and ``release`` leaves
-        the parent's marker untouched. The ancestry path exists because staged
-        updaters older than the HANDOFF_PID_ENV export never send the env var.
+        A live holder matching the expected pid + token is atomically
+        transferred to this child. During the staged-updater rollout, an exact
+        two-line marker owned by this process's direct parent is the only
+        tokenless compatibility path; it is immediately upgraded with a token.
         """
         for _attempt in range(3):
             existing = read_live_update(path=self.path)
@@ -380,15 +482,70 @@ class UpdateLock:
                 except OSError:
                     return False
                 handoff_token = os.environ.get(HANDOFF_TOKEN_ENV, "").strip()
+                existing_lines = existing_raw.splitlines()
                 token_handoff = (
                     handoff_token
                     and existing.pid == _handoff_pid()
                     and _marker_token(existing_raw) == handoff_token
                 )
-                legacy_handoff = not handoff_token and (
-                    existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid)
+                # Two-phase rollout for staged updaters that already publish
+                # HANDOFF_PID but predate claim tokens.  The proof is deliberately
+                # narrower than the removed ancestry bypass: exact two-line legacy
+                # wire format + exact live marker owner + exact direct OS parent.
+                legacy_direct_parent_handoff = (
+                    not handoff_token
+                    and len(existing_lines) == 2
+                    and _marker_token(existing_raw) is None
+                    and existing.pid == _handoff_pid()
+                    and existing.pid == os.getppid()
                 )
-                if token_handoff or legacy_handoff:
+                if token_handoff or legacy_direct_parent_handoff:
+                    transfer_token = handoff_token or uuid.uuid4().hex
+                    with _marker_operation(self.path) as guarded:
+                        if not guarded:
+                            return False
+                        try:
+                            current = self.path.read_text(encoding="utf-8")
+                        except OSError:
+                            return False
+                        lines = current.splitlines()
+                        current_is_expected = (
+                            _marker_owner(current) == _handoff_pid()
+                            and len(lines) >= 2
+                            and (
+                                (_marker_token(current) == handoff_token)
+                                if token_handoff
+                                else (
+                                    len(lines) == 2
+                                    and _marker_token(current) is None
+                                    and _handoff_pid() == os.getppid()
+                                )
+                            )
+                        )
+                        if not current_is_expected:
+                            return False
+                        temporary_path: str | None = None
+                        try:
+                            descriptor, temporary_path = tempfile.mkstemp(
+                                prefix=f".{self.path.name}.handoff-", dir=self.path.parent
+                            )
+                            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                                handle.write(
+                                    f"{os.getpid()}\n{lines[1].strip()}\n{transfer_token}\n"
+                                )
+                                handle.flush()
+                                os.fsync(handle.fileno())
+                            os.replace(temporary_path, self.path)
+                        except OSError:
+                            return False
+                        finally:
+                            if temporary_path is not None:
+                                try:
+                                    Path(temporary_path).unlink()
+                                except OSError:
+                                    pass
+                    self.token = transfer_token
+                    self.acquired = True
                     return True
                 self.holder = existing
                 return False

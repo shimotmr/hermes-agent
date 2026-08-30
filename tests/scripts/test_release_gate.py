@@ -388,15 +388,12 @@ def test_evidence_append_rejects_symlink_created_during_open_without_nofollow(
     manifest = tmp_path / "evidence.jsonl"
     frozen = git(repo, "rev-parse", "HEAD")
     snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
-    real_open = release_gate.os.open
-
-    def racing_open(path, flags, mode=0o777):
-        if Path(path) == manifest and not manifest.exists():
-            manifest.symlink_to(outside)
-        return real_open(path, flags, mode)
+    def racing_replace(_temporary, target):
+        if not target.exists():
+            target.symlink_to(outside)
 
     monkeypatch.setattr(release_gate.os, "O_NOFOLLOW", 0, raising=False)
-    monkeypatch.setattr(release_gate.os, "open", racing_open)
+    monkeypatch.setattr(release_gate, "_evidence_before_replace", racing_replace)
 
     with pytest.raises(ValueError, match="evidence-target-(symlink|replaced|exists)"):
         append_evidence(
@@ -473,6 +470,109 @@ def test_evidence_append_rejects_existing_replacement_race(
     )
 
 
+def test_evidence_append_rejects_symlinked_lock_without_mutating_target(
+    repo: Path, tmp_path: Path
+) -> None:
+    manifest = tmp_path / "evidence.jsonl"
+    lock_target = tmp_path / "evidence.jsonl.lock"
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"")
+    lock_target.symlink_to(outside)
+    frozen = git(repo, "rev-parse", "HEAD")
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
+
+    with pytest.raises(ValueError, match="evidence-lock-symlink"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=frozen,
+            command="tests",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+    assert outside.read_bytes() == b""
+    assert not manifest.exists()
+
+
+def test_evidence_append_rejects_lock_replacement_after_acquire(
+    monkeypatch, repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    lock_target = tmp_path / "evidence.jsonl.lock"
+    frozen = git(repo, "rev-parse", "HEAD")
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
+    real_lock = release_gate._exclusive_file_lock
+
+    @contextmanager
+    def replace_after_acquire(handle, **kwargs):
+        with real_lock(handle, **kwargs):
+            lock_target.unlink()
+            lock_target.write_bytes(b"replacement")
+            yield
+
+    monkeypatch.setattr(release_gate, "_exclusive_file_lock", replace_after_acquire)
+
+    with pytest.raises(ValueError, match="evidence-lock-replaced"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=frozen,
+            command="tests",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+    assert not manifest.exists()
+
+
+def test_evidence_append_revalidates_lock_before_private_write(
+    monkeypatch, repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    lock_target = tmp_path / "evidence.jsonl.lock"
+    frozen = git(repo, "rev-parse", "HEAD")
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
+    real_write = release_gate.os.write
+    writes: list[int] = []
+
+    def replace_lock_before_private_write(_temporary, _descriptor):
+        lock_target.unlink()
+        lock_target.write_bytes(b"replacement")
+
+    def record_write(descriptor, payload):
+        writes.append(descriptor)
+        return real_write(descriptor, payload)
+
+    monkeypatch.setattr(
+        release_gate, "_evidence_before_private_write", replace_lock_before_private_write
+    )
+    monkeypatch.setattr(release_gate.os, "write", record_write)
+
+    with pytest.raises(ValueError, match="evidence-lock-replaced"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=frozen,
+            command="tests",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+    assert writes == []
+    assert not manifest.exists()
+
+
 def test_evidence_first_append_rejects_hardlink_created_during_open(
     monkeypatch, repo: Path, tmp_path: Path
 ) -> None:
@@ -486,17 +586,12 @@ def test_evidence_first_append_rejects_hardlink_created_during_open(
     original_mode = outside.stat().st_mode & 0o777
     frozen = git(repo, "rev-parse", "HEAD")
     snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
-    real_open = release_gate.os.open
-    raced = False
+    def hardlink_before_replace(_temporary, target):
+        os.link(outside, target)
 
-    def hardlink_before_open(path, flags, mode=0o777):
-        nonlocal raced
-        if Path(path) == manifest and not raced:
-            raced = True
-            os.link(outside, manifest)
-        return real_open(path, flags, mode)
-
-    monkeypatch.setattr(release_gate.os, "open", hardlink_before_open)
+    monkeypatch.setattr(
+        release_gate, "_evidence_before_replace", hardlink_before_replace
+    )
 
     with pytest.raises(ValueError, match="evidence-target-(exists|replaced)"):
         append_evidence(
@@ -542,6 +637,75 @@ def test_evidence_append_rejects_existing_hardlink_before_chmod_or_append(
     assert outside.stat().st_mode & 0o777 == original_mode
 
 
+def test_evidence_append_cow_never_mutates_inode_linked_immediately_before_write(
+    monkeypatch, repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    manifest.write_bytes(b"")
+    manifest.chmod(0o640)
+    outside = tmp_path / "outside.jsonl"
+    frozen = git(repo, "rev-parse", "HEAD")
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
+    def link_private_inode_before_write(private_path, _descriptor):
+        os.link(private_path, outside)
+
+    monkeypatch.setattr(
+        release_gate, "_evidence_before_private_write", link_private_inode_before_write
+    )
+
+    with pytest.raises(ValueError, match="evidence-target-hardlink"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=frozen,
+            command="tests",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+    assert outside.read_bytes() == b""
+    assert outside.stat().st_mode & 0o777 == 0o600
+    assert manifest.read_bytes() == b""
+    assert manifest.stat().st_mode & 0o777 == 0o640
+
+
+def test_evidence_append_cow_rejects_hardlink_immediately_before_replace(
+    monkeypatch, repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    manifest.write_bytes(b"")
+    manifest.chmod(0o640)
+    outside = tmp_path / "outside.jsonl"
+    frozen = git(repo, "rev-parse", "HEAD")
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
+
+    def link_existing_before_replace(_temporary, target):
+        os.link(target, outside)
+
+    monkeypatch.setattr(release_gate, "_evidence_before_replace", link_existing_before_replace)
+
+    with pytest.raises(ValueError, match="evidence-target-replaced"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=frozen,
+            command="tests",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+    assert outside.read_bytes() == b""
+    assert outside.stat().st_mode & 0o777 == 0o640
+
+
 def test_evidence_append_rechecks_hardlink_count_after_lock_before_mutation(
     monkeypatch, repo: Path, tmp_path: Path
 ) -> None:
@@ -558,9 +722,9 @@ def test_evidence_append_rechecks_hardlink_count_after_lock_before_mutation(
 
     @contextmanager
     def add_hardlink_after_lock(path, handle):
-        with real_lock(path, handle):
+        with real_lock(path, handle) as verify_lock:
             os.link(manifest, outside)
-            yield
+            yield verify_lock
 
     monkeypatch.setattr(release_gate, "_evidence_file_lock", add_hardlink_after_lock)
 
@@ -590,16 +754,11 @@ def test_evidence_append_rejects_path_replacement_after_lock(
     manifest.write_bytes(b"")
     frozen = git(repo, "rev-parse", "HEAD")
     snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
-    real_lock = release_gate._evidence_file_lock
+    def replace_before_publish(_temporary, target):
+        target.unlink()
+        target.write_bytes(b"")
 
-    @contextmanager
-    def replace_after_lock(path, handle):
-        with real_lock(path, handle):
-            manifest.unlink()
-            manifest.write_bytes(b"")
-            yield
-
-    monkeypatch.setattr(release_gate, "_evidence_file_lock", replace_after_lock)
+    monkeypatch.setattr(release_gate, "_evidence_before_replace", replace_before_publish)
 
     with pytest.raises(ValueError, match="evidence-target-replaced"):
         append_evidence(
@@ -941,6 +1100,41 @@ def test_evidence_append_works_without_fchmod(monkeypatch, repo: Path, tmp_path:
     )
 
     assert event["sequence"] == 1
+
+
+def test_evidence_append_survives_unsupported_directory_fsync(
+    monkeypatch, repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    frozen = git(repo, "rev-parse", "HEAD")
+    candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
+    git(repo, "branch", "frozen", frozen)
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=candidate)
+    real_open = release_gate.os.open
+
+    def reject_directory_open(path, flags, *args, **kwargs):
+        if Path(path) == manifest.parent:
+            raise PermissionError("directory fsync unsupported")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(release_gate.os, "open", reject_directory_open)
+
+    event = append_evidence(
+        manifest,
+        repo=repo,
+        snapshot=snapshot,
+        frozen_sha=frozen,
+        candidate_sha=candidate,
+        gate_id="freeze",
+        command="freeze",
+        exit_code=0,
+        recorded_at="2026-08-30T04:00:00Z",
+    )
+
+    assert event["sequence"] == 1
+    assert validate_evidence(manifest, repo=repo) == [event]
 
 
 def test_release_validation_cannot_be_weakened_to_one_caller_gate(

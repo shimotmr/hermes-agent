@@ -78,8 +78,8 @@ DONE_NOTE=""  # set when the update succeeded but the app will NOT reopen itself
 
 log() { echo "$(date +%Y-%m-%dT%H:%M:%S%z) $1" | tee -a "$LOG" 2>/dev/null; }
 
-pid_alive() {
-  case "$1" in ''|*[!0-9]*|0) return 1 ;; esac
+pid_liveness() {
+  case "$1" in ''|*[!0-9]*|0) return 2 ;; esac
   /usr/bin/python3 - "$1" <<'PY' >/dev/null 2>&1
 import os, sys
 try:
@@ -87,29 +87,96 @@ try:
 except ProcessLookupError:
     raise SystemExit(1)
 except (PermissionError, OSError, ValueError):
-    raise SystemExit(0)  # unknown authority fails closed
+    raise SystemExit(2)
 PY
 }
 
+pid_alive() {
+  pid_liveness "$1"
+  [ "$?" -ne 1 ]
+}
+
+remove_guard_quarantine() {
+  local quarantine="$1"
+  if [ -d "$quarantine" ]; then
+    rm -f "$quarantine/owner" 2>/dev/null || true
+    rmdir "$quarantine" 2>/dev/null || true
+  else
+    rm -f "$quarantine" 2>/dev/null || true
+  fi
+}
+
+guard_quarantine_present() {
+  /usr/bin/python3 - "$MARKER_GUARD" <<'PY' >/dev/null 2>&1
+import os, sys
+guard = os.path.abspath(sys.argv[1])
+parent, base = os.path.dirname(guard), os.path.basename(guard)
+try:
+    names = os.listdir(parent)
+except OSError:
+    raise SystemExit(0)
+prefixes = (f".{base}.stale-", f"{base}.stale-")
+raise SystemExit(0 if any(name.startswith(prefixes) for name in names) else 1)
+PY
+}
+
+reclaim_dead_marker_guard() {
+  local quarantine owner_file owner
+  quarantine="${MARKER_GUARD}.stale-$$-${RANDOM}"
+  mv "$MARKER_GUARD" "$quarantine" 2>/dev/null || return 1
+  owner_file="$quarantine"
+  [ -d "$quarantine" ] && owner_file="$quarantine/owner"
+  owner="$(cat "$owner_file" 2>/dev/null | tr -d '[:space:]')"
+
+  # Unknown/malformed/live authority is restored without replacing a newer
+  # canonical guard. A guard published after our rename always wins.
+  if [ -z "$owner" ] || pid_alive "$owner"; then
+    ln "$owner_file" "$MARKER_GUARD" 2>/dev/null || [ -e "$MARKER_GUARD" ] || return 1
+    remove_guard_quarantine "$quarantine"
+    return 1
+  fi
+
+  remove_guard_quarantine "$quarantine"
+  # If another runtime published after the detach, preserve it and fail closed.
+  [ ! -e "$quarantine" ] && [ ! -e "$MARKER_GUARD" ]
+}
+
 acquire_marker_guard() {
-  local attempt owner
+  local attempt private_guard
+  guard_quarantine_present && return 1
   for attempt in 1 2 3; do
-    if mkdir "$MARKER_GUARD" 2>/dev/null; then
-      printf '%s\n' "$$" > "$MARKER_GUARD/owner" 2>/dev/null || true
-      return 0
+    private_guard="$(mktemp -d "${MARKER_GUARD}.XXXXXX" 2>/dev/null)" || return 1
+    if printf '%s\n' "$$" > "$private_guard/owner" 2>/dev/null \
+        && /usr/bin/python3 - "$private_guard" <<'PY' >/dev/null 2>&1
+import os, sys
+owner = os.open(os.path.join(sys.argv[1], "owner"), os.O_RDONLY)
+try: os.fsync(owner)
+finally: os.close(owner)
+directory = os.open(sys.argv[1], os.O_RDONLY)
+try: os.fsync(directory)
+finally: os.close(directory)
+PY
+    then
+      if ln "$private_guard/owner" "$MARKER_GUARD" 2>/dev/null; then
+        rm -f "$private_guard/owner" 2>/dev/null || true
+        rmdir "$private_guard" 2>/dev/null || true
+        return 0
+      fi
     fi
-    owner="$(cat "$MARKER_GUARD/owner" 2>/dev/null | tr -d '[:space:]')"
-    [ -n "$owner" ] || return 1
-    pid_alive "$owner" && return 1
-    rm -f "$MARKER_GUARD/owner" 2>/dev/null || return 1
-    rmdir "$MARKER_GUARD" 2>/dev/null || return 1
+    rm -f "$private_guard/owner" 2>/dev/null || true
+    rmdir "$private_guard" 2>/dev/null || true
+    reclaim_dead_marker_guard || return 1
   done
   return 1
 }
 
 release_marker_guard() {
-  rm -f "$MARKER_GUARD/owner" 2>/dev/null || true
-  rmdir "$MARKER_GUARD" 2>/dev/null || true
+  if [ -d "$MARKER_GUARD" ]; then
+    rm -f "$MARKER_GUARD/owner" 2>/dev/null || true
+    rmdir "$MARKER_GUARD" 2>/dev/null || true
+  else
+    rm -f "$MARKER_GUARD" 2>/dev/null || true
+  fi
 }
 
 # Keep a durable signal breadcrumb.  A detached hand-off used to leave only the
@@ -467,6 +534,7 @@ finish() {
 
   if [ "$NO_MARKER_CLEANUP" -eq 0 ]; then
     if acquire_marker_guard; then
+    keep_marker_guard=0
     marker_quarantine="${MARKER}.remove-$$-${RANDOM}"
     if mv "$MARKER" "$marker_quarantine" 2>/dev/null; then
       marker_owner="$(head -1 "$marker_quarantine" 2>/dev/null | tr -d '[:space:]')"
@@ -474,15 +542,17 @@ finish() {
       if [ "$marker_owner" = "$$" ] && { [ -z "$CLAIM_TOKEN" ] || [ "$marker_token" = "$CLAIM_TOKEN" ]; }; then
         rm -f "$marker_quarantine" 2>/dev/null || true
         if [ -e "$marker_quarantine" ]; then
-          ln "$marker_quarantine" "$MARKER" 2>/dev/null || true
+          ln "$marker_quarantine" "$MARKER" 2>/dev/null || keep_marker_guard=1
         fi
       elif ln "$marker_quarantine" "$MARKER" 2>/dev/null; then
         rm -f "$marker_quarantine" 2>/dev/null || true
       elif [ -e "$MARKER" ]; then
         rm -f "$marker_quarantine" 2>/dev/null || true
+      else
+        keep_marker_guard=1
       fi
     fi
-    release_marker_guard
+    [ "$keep_marker_guard" -eq 1 ] || release_marker_guard
     fi
   fi
 
@@ -579,7 +649,8 @@ log "hand-off start: root=$INSTALL_ROOT branch=$BRANCH desktopPid=$DESKTOP_PID p
 rm -f "$RESULT" 2>/dev/null || true
 
 # Marker claim: same cross-process lock contract as windows.ps1 /
-# update_lock.py (the `hermes update` child adopts it via process ancestry).
+# update_lock.py (the child adopts the exact pid+token claim; legacy two-line
+# direct-parent claims are upgraded once during the staged-updater rollout).
 # The Desktop supplies one acquisition time for the whole ownership chain.
 NOW="$(date +%s)"
 STARTED_AT="${HERMES_UPDATE_STARTED_AT:-$NOW}"
@@ -597,6 +668,7 @@ if [ -z "$CLAIM_TOKEN" ]; then
   [ -n "$CLAIM_TOKEN" ] || CLAIM_TOKEN="$$-$NOW-$RANDOM-$RANDOM"
 fi
 claim_ok=0
+keep_operation_guard=0
 if acquire_marker_guard; then
   if [ -e "$MARKER" ]; then
     current_pid="$(sed -n '1p' "$MARKER" 2>/dev/null | tr -d '[:space:]')"
@@ -611,14 +683,22 @@ if acquire_marker_guard; then
       claim_ok=1
     elif ! pid_alive "$current_pid"; then
       stale="${MARKER}.stale-$$-${RANDOM}"
-      mv "$MARKER" "$stale" 2>/dev/null && rm -f "$stale" 2>/dev/null || true
+      if mv "$MARKER" "$stale" 2>/dev/null; then
+        detached_pid="$(sed -n '1p' "$stale" 2>/dev/null | tr -d '[:space:]')"
+        if pid_alive "$detached_pid"; then
+          ln "$stale" "$MARKER" 2>/dev/null || keep_operation_guard=1
+          [ "$keep_operation_guard" -eq 1 ] || rm -f "$stale" 2>/dev/null || true
+        elif ! rm -f "$stale" 2>/dev/null; then
+          ln "$stale" "$MARKER" 2>/dev/null || keep_operation_guard=1
+        fi
+      fi
     fi
   fi
   if [ "$claim_ok" -eq 0 ] && [ ! -e "$MARKER" ]; then
     printf '%s\n%s\n%s\n' "$$" "$STARTED_AT" "$CLAIM_TOKEN" > "$MARKER_TEMP" 2>/dev/null \
       && ln "$MARKER_TEMP" "$MARKER" 2>/dev/null && claim_ok=1
   fi
-  release_marker_guard
+  [ "$keep_operation_guard" -eq 1 ] || release_marker_guard
 fi
 rm -f "$MARKER_TEMP" 2>/dev/null || true
 if [ "$claim_ok" -ne 1 ]; then

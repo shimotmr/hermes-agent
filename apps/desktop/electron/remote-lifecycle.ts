@@ -297,10 +297,18 @@ from pathlib import Path
 home=Path(os.path.expanduser(sys.argv[1]))
 if home.parent.name=='profiles':home=home.parent.parent
 marker=home/'.hermes-update-in-progress'
+guard=marker.with_name(marker.name+'.lock')
+def guard_state():
+    try:guard.lstat()
+    except FileNotFoundError:return False
+    except OSError:return None
+    return True
+if guard_state() is not False:
+    print('UNCERTAIN');raise SystemExit
 try:
     with marker.open('rb') as stream:raw=stream.read(257)
 except FileNotFoundError:
-    print('CLEAR');raise SystemExit
+    print('CLEAR' if guard_state() is False else 'UNCERTAIN');raise SystemExit
 except OSError:
     print('UNCERTAIN');raise SystemExit
 if len(raw)>256:
@@ -1044,6 +1052,7 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
   const ownerArg = opts.spawnNonce ? ` --ssh-owner-nonce ${validateSpawnNonce(opts.spawnNonce)}` : ''
   const subCmd = `serve --isolated --host 127.0.0.1 --port 0${tokenArg}${ownerArg}`
   const marker = expandRemotePath(`${remoteInstallRoot(opts.hermesHome || '~/.hermes')}/.hermes-update-in-progress`)
+  const markerGuard = `${marker}.lock`
 
   const updateMutex = expandRemotePath(
     `${remoteInstallRoot(opts.hermesHome || '~/.hermes')}/.hermes-update-in-progress.mutex`
@@ -1055,7 +1064,8 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
   // its PID. The reservation is an atomic mkdir and is reclaimed only when its
   // owning remote shell is dead.
   const markerClear =
-    `marker_clear() { if [ ! -e ${marker} ]; then return 0; fi; ` +
+    `marker_clear() { if [ -e ${markerGuard} ] || [ -L ${markerGuard} ]; then return 1; fi; ` +
+    `if [ ! -e ${marker} ]; then [ ! -e ${markerGuard} ] && [ ! -L ${markerGuard} ]; return; fi; ` +
     `if [ ! -r ${marker} ]; then return 1; fi; ` +
     `owner=$(IFS= read -r owner < ${marker} && printf '%s' "$owner"); ` +
     `case "$owner" in ''|*[!0-9]*) return 1;; esac; if kill -0 "$owner" 2>/dev/null; then return 1; fi; return 0; }`

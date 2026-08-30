@@ -288,7 +288,7 @@ test('POSIX managed launcher executes the updater command and atomically publish
       {
         ssh: { exec: async () => '' },
         platform: 'Linux',
-        hermesPath: '/bin/true',
+        hermesPath: '/usr/bin/true',
         hermesHome: home
       },
       CORRELATION
@@ -401,13 +401,35 @@ test('POSIX observer reads the exact correlation receipt and terminal marker fro
   }
 })
 
+test('POSIX observer reports unavailable while operation guard exists without marker', async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'hermes-managed-guard-'))
+
+  try {
+    await writeFile(path.join(home, '.hermes-update-in-progress.lock'), `${process.pid}\n`)
+    const command = buildRemoteUpdateObservationCommand(
+      {
+        ssh: { exec: async () => '' },
+        platform: 'Linux',
+        hermesPath: '/opt/hermes/hermes',
+        hermesHome: home
+      },
+      CORRELATION
+    )
+
+    const { stdout } = await exec(command, { shell: '/bin/sh' })
+    assert.equal(parseRemoteUpdateObservation(stdout, CORRELATION).marker, 'unavailable')
+  } finally {
+    await rm(home, { force: true, recursive: true })
+  }
+})
+
 test('managed observer unwraps a named profile home for the install-wide marker', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'hermes-managed-profile-marker-'))
   const profileHome = path.join(root, 'profiles', 'research')
 
   try {
     await mkdir(profileHome, { recursive: true })
-    await writeFile(path.join(root, '.hermes-update-in-progress'), `${process.pid}\n1\n`)
+    await writeFile(path.join(root, '.hermes-update-in-progress'), `${process.pid}\n1\nobserver-token\n`)
 
     const command = buildRemoteUpdateObservationCommand(
       {
