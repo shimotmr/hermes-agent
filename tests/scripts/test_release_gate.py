@@ -10,6 +10,7 @@ import pytest
 
 from scripts.release_gate import (
     EvidenceCorrupt,
+    REQUIRED_RELEASE_GATE_IDS,
     append_evidence,
     apply_overlap_to_matrix,
     classify_overlap,
@@ -36,6 +37,14 @@ def commit(repo: Path, path: str, text: str, message: str) -> str:
     git(repo, "add", path)
     git(repo, "commit", "-m", message)
     return git(repo, "rev-parse", "HEAD")
+
+
+def authority(repo: Path, frozen: str, candidate: str) -> dict[str, str]:
+    return {
+        "expected_candidate_sha": candidate,
+        "expected_frozen_sha": frozen,
+        "expected_candidate_tree_sha": git(repo, "rev-parse", f"{candidate}^{{tree}}"),
+    }
 
 
 @pytest.fixture
@@ -366,7 +375,10 @@ def test_release_evidence_rejects_a_failed_required_gate(repo: Path, tmp_path: P
 
     with pytest.raises(EvidenceCorrupt, match="required-gate-failed:ruff"):
         release_gate.validate_release_evidence(
-            manifest, repo=repo, required_gate_ids=("tests", "ruff")
+            manifest,
+            repo=repo,
+            required_gate_ids=("tests", "ruff"),
+            **authority(repo, frozen, candidate),
         )
 
 
@@ -394,7 +406,10 @@ def test_release_evidence_rejects_missing_gate_and_mixed_authority(
 
     with pytest.raises(EvidenceCorrupt, match="required-gates-missing"):
         release_gate.validate_release_evidence(
-            manifest, repo=repo, required_gate_ids=("tests", "ruff")
+            manifest,
+            repo=repo,
+            required_gate_ids=("tests", "ruff"),
+            **authority(repo, frozen, first_candidate),
         )
 
     second_candidate = commit(repo, "candidate-2.txt", "two\n", "candidate two")
@@ -413,7 +428,10 @@ def test_release_evidence_rejects_missing_gate_and_mixed_authority(
 
     with pytest.raises(EvidenceCorrupt, match="release-authority-mixed"):
         release_gate.validate_release_evidence(
-            manifest, repo=repo, required_gate_ids=("tests", "ruff")
+            manifest,
+            repo=repo,
+            required_gate_ids=("tests", "ruff"),
+            **authority(repo, frozen, first_candidate),
         )
 
 
@@ -637,7 +655,10 @@ def test_release_validation_cannot_be_weakened_to_one_caller_gate(
 
     with pytest.raises(EvidenceCorrupt, match="required-gates-missing"):
         release_gate.validate_release_evidence(
-            manifest, repo=repo, required_gate_ids=("freeze",)
+            manifest,
+            repo=repo,
+            required_gate_ids=("freeze",),
+            **authority(repo, frozen, candidate),
         )
 
 
@@ -665,5 +686,108 @@ def test_release_validation_recomputes_snapshot_from_candidate(
 
     with pytest.raises(EvidenceCorrupt, match="snapshot-local-base-mismatch"):
         release_gate.validate_release_evidence(
-            manifest, repo=repo, required_gate_ids=("freeze",)
+            manifest,
+            repo=repo,
+            required_gate_ids=("freeze",),
+            **authority(repo, frozen, candidate),
+        )
+
+
+@pytest.mark.parametrize(
+    "recorded_at",
+    ["not-a-timestamp", "2026-08-30T04:00:00", "2026-08-30", ""],
+)
+def test_evidence_rejects_non_timezone_aware_iso_timestamp(
+    repo: Path, tmp_path: Path, recorded_at: str
+) -> None:
+    frozen = git(repo, "rev-parse", "HEAD")
+    candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
+    git(repo, "branch", "frozen", frozen)
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=candidate)
+
+    with pytest.raises(ValueError, match="evidence-recorded-at-invalid"):
+        append_evidence(
+            tmp_path / "evidence.jsonl",
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=candidate,
+            gate_id="freeze",
+            command="freeze",
+            exit_code=0,
+            recorded_at=recorded_at,
+        )
+
+
+def test_release_validation_is_bound_to_caller_expected_authority(
+    repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    frozen = git(repo, "rev-parse", "HEAD")
+    candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
+    git(repo, "branch", "frozen", frozen)
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=candidate)
+    append_evidence(
+        manifest,
+        repo=repo,
+        snapshot=snapshot,
+        frozen_sha=frozen,
+        candidate_sha=candidate,
+        gate_id="freeze",
+        command="freeze",
+        exit_code=0,
+        recorded_at="2026-08-30T04:00:00Z",
+    )
+
+    with pytest.raises(EvidenceCorrupt, match="release-candidate-mismatch"):
+        release_gate.validate_release_evidence(
+            manifest,
+            repo=repo,
+            required_gate_ids=("freeze",),
+            expected_candidate_sha="f" * 40,
+            expected_frozen_sha=frozen,
+            expected_candidate_tree_sha=git(repo, "rev-parse", f"{candidate}^{{tree}}"),
+        )
+
+
+def test_overlap_authority_requires_overlap_compatibility_gate(
+    repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    frozen = git(repo, "rev-parse", "HEAD")
+    candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
+    git(repo, "branch", "frozen", frozen)
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=candidate)
+    overlap = classify_overlap(
+        repo, frozen, candidate, critical_paths=("candidate.txt",)
+    )
+    for gate_id in REQUIRED_RELEASE_GATE_IDS:
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=candidate,
+            gate_id=gate_id,
+            command=gate_id,
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+            overlap_report=overlap if gate_id == "freeze" else None,
+            overlap_critical_paths=("candidate.txt",) if gate_id == "freeze" else (),
+        )
+
+    with pytest.raises(
+        EvidenceCorrupt, match="required-gates-missing:overlap-compatibility"
+    ):
+        release_gate.validate_release_evidence(
+            manifest,
+            repo=repo,
+            required_gate_ids=("freeze",),
+            expected_candidate_sha=candidate,
+            expected_frozen_sha=frozen,
+            expected_candidate_tree_sha=git(repo, "rev-parse", f"{candidate}^{{tree}}"),
         )

@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import subprocess
+from datetime import datetime
 from dataclasses import asdict, dataclass
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
@@ -85,6 +86,16 @@ def _is_sha(value: object) -> bool:
         and len(value) == _SHA_LEN
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _is_aware_iso_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return "T" in value and parsed.tzinfo is not None and parsed.utcoffset() is not None
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
@@ -469,7 +480,7 @@ def _validate_event_shape(
         raise EvidenceCorrupt(f"command-invalid:{expected_sequence}")
     if type(event.get("exit_code")) is not int:
         raise EvidenceCorrupt(f"exit-code-invalid:{expected_sequence}")
-    if not isinstance(event.get("recorded_at"), str) or not event["recorded_at"]:
+    if not _is_aware_iso_timestamp(event.get("recorded_at")):
         raise EvidenceCorrupt(f"recorded-at-invalid:{expected_sequence}")
     if schema == _SCHEMA_EVIDENCE:
         if not isinstance(event.get("gate_id"), str) or not event["gate_id"]:
@@ -514,6 +525,9 @@ def validate_release_evidence(
     *,
     repo: Path,
     required_gate_ids: Sequence[str],
+    expected_candidate_sha: str | None = None,
+    expected_frozen_sha: str | None = None,
+    expected_candidate_tree_sha: str | None = None,
 ) -> list[dict[str, Any]]:
     """Validate one complete, successful release authority chain."""
     required = tuple(dict.fromkeys((*REQUIRED_RELEASE_GATE_IDS, *required_gate_ids)))
@@ -528,6 +542,19 @@ def validate_release_evidence(
     }
     if len(authority) != 1:
         raise EvidenceCorrupt("release-authority-mixed")
+    frozen_sha, candidate_sha, _snapshot_id = next(iter(authority))
+    if (
+        expected_candidate_sha is None
+        or expected_frozen_sha is None
+        or expected_candidate_tree_sha is None
+    ):
+        raise EvidenceCorrupt("release-expected-authority-required")
+    if candidate_sha != expected_candidate_sha:
+        raise EvidenceCorrupt("release-candidate-mismatch")
+    if frozen_sha != expected_frozen_sha:
+        raise EvidenceCorrupt("release-frozen-mismatch")
+    if events[0].get("candidate_tree_sha") != expected_candidate_tree_sha:
+        raise EvidenceCorrupt("release-candidate-tree-mismatch")
     gates: dict[str, dict[str, Any]] = {}
     for event in events:
         if event.get("schema_version") != _SCHEMA_EVIDENCE:
@@ -541,6 +568,38 @@ def validate_release_evidence(
     missing = sorted(set(required) - gates.keys())
     if missing:
         raise EvidenceCorrupt(f"required-gates-missing:{','.join(missing)}")
+    freeze_event = gates["freeze"]
+    overlap_payload = freeze_event.get("overlap_report")
+    critical_paths = freeze_event.get("overlap_critical_paths")
+    if not isinstance(overlap_payload, dict) or not isinstance(critical_paths, list):
+        raise EvidenceCorrupt("release-overlap-authority-missing")
+    try:
+        expected_overlap = OverlapReport(
+            schema_version=overlap_payload["schema_version"],
+            from_sha=overlap_payload["from_sha"],
+            latest_sha=overlap_payload["latest_sha"],
+            classification=overlap_payload["classification"],
+            drift_paths=tuple(overlap_payload["drift_paths"]),
+            overlapping_paths=tuple(overlap_payload["overlapping_paths"]),
+            reason=overlap_payload["reason"],
+        )
+        recomputed = classify_overlap(
+            repo,
+            expected_overlap.from_sha,
+            expected_overlap.latest_sha,
+            critical_paths=tuple(critical_paths),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise EvidenceCorrupt("release-overlap-authority-invalid") from exc
+    if asdict(expected_overlap) != asdict(recomputed):
+        raise EvidenceCorrupt("release-overlap-authority-mismatch")
+    if expected_overlap.classification == "indeterminate":
+        raise EvidenceCorrupt("release-overlap-indeterminate")
+    if (
+        expected_overlap.classification == "overlap"
+        and "overlap-compatibility" not in gates
+    ):
+        raise EvidenceCorrupt("required-gates-missing:overlap-compatibility")
     return events
 
 
@@ -555,6 +614,8 @@ def append_evidence(
     command: str,
     exit_code: int,
     recorded_at: str,
+    overlap_report: OverlapReport | None = None,
+    overlap_critical_paths: Sequence[str] = (),
 ) -> dict[str, Any]:
     if not _is_sha(frozen_sha) or not _is_sha(candidate_sha):
         raise ValueError("evidence-sha-invalid")
@@ -564,7 +625,7 @@ def append_evidence(
         raise ValueError("evidence-gate-id-invalid")
     if type(exit_code) is not int:
         raise ValueError("evidence-exit-code-invalid")
-    if not isinstance(recorded_at, str) or not recorded_at:
+    if not _is_aware_iso_timestamp(recorded_at):
         raise ValueError("evidence-recorded-at-invalid")
     if snapshot.target_sha != frozen_sha:
         raise ValueError("evidence-snapshot-frozen-mismatch")
@@ -612,6 +673,19 @@ def append_evidence(
                     "recorded_at": recorded_at,
                     "previous_event_hash": events[-1]["event_hash"] if events else None,
                 }
+                if overlap_report is not None:
+                    if gate_id != "freeze" or not overlap_critical_paths:
+                        raise ValueError("evidence-overlap-binding-invalid")
+                    recomputed = classify_overlap(
+                        Path(repo),
+                        overlap_report.from_sha,
+                        overlap_report.latest_sha,
+                        critical_paths=tuple(overlap_critical_paths),
+                    )
+                    if asdict(recomputed) != asdict(overlap_report):
+                        raise ValueError("evidence-overlap-report-mismatch")
+                    event["overlap_report"] = asdict(overlap_report)
+                    event["overlap_critical_paths"] = list(overlap_critical_paths)
                 event["event_hash"] = hashlib.sha256(_canonical_bytes(event)).hexdigest()
                 event = json.loads(_canonical_bytes(event))
                 encoded = _canonical_bytes(event) + b"\n"
@@ -636,6 +710,24 @@ def _load_snapshot(path: Path) -> ReleaseSnapshot:
     if claimed != hashlib.sha256(_canonical_bytes(body)).hexdigest():
         raise ValueError("snapshot-id-mismatch")
     return snapshot
+
+
+def _load_overlap_report(path: Path) -> OverlapReport:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("overlap-report-invalid")
+    try:
+        return OverlapReport(
+            schema_version=payload["schema_version"],
+            from_sha=payload["from_sha"],
+            latest_sha=payload["latest_sha"],
+            classification=payload["classification"],
+            drift_paths=tuple(payload["drift_paths"]),
+            overlapping_paths=tuple(payload["overlapping_paths"]),
+            reason=payload["reason"],
+        )
+    except (KeyError, TypeError) as exc:
+        raise ValueError("overlap-report-invalid") from exc
 
 
 def _print_json(value: object) -> None:
@@ -667,11 +759,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     append.add_argument("--command-text", required=True)
     append.add_argument("--exit-code", type=int, required=True)
     append.add_argument("--recorded-at", required=True)
+    append.add_argument("--overlap-report", type=Path)
+    append.add_argument("--policy", type=Path)
 
     validate = subparsers.add_parser("validate-evidence")
     validate.add_argument("--path", type=Path, required=True)
     validate.add_argument("--repo", type=Path, required=True)
     validate.add_argument("--required-gate", action="append", required=True)
+    validate.add_argument("--expected-candidate-sha", required=True)
+    validate.add_argument("--expected-frozen-sha", required=True)
+    validate.add_argument("--expected-candidate-tree-sha", required=True)
 
     args = parser.parse_args(argv)
     if args.command == "freeze":
@@ -698,12 +795,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 command=args.command_text,
                 exit_code=args.exit_code,
                 recorded_at=args.recorded_at,
+                overlap_report=(
+                    _load_overlap_report(args.overlap_report)
+                    if args.overlap_report is not None
+                    else None
+                ),
+                overlap_critical_paths=(
+                    load_critical_paths(args.policy) if args.policy is not None else ()
+                ),
             )
         )
         return 0
     _print_json(
         validate_release_evidence(
-            args.path, repo=args.repo, required_gate_ids=args.required_gate
+            args.path,
+            repo=args.repo,
+            required_gate_ids=args.required_gate,
+            expected_candidate_sha=args.expected_candidate_sha,
+            expected_frozen_sha=args.expected_frozen_sha,
+            expected_candidate_tree_sha=args.expected_candidate_tree_sha,
         )
     )
     return 0
