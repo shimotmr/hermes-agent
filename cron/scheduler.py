@@ -646,6 +646,7 @@ from cron.jobs import (
     claim_job_for_fire,
     fire_claim_fence,
     clear_run_claim,
+    release_fire_claim,
     get_due_jobs,
     heartbeat_fire_claim,
     heartbeat_run_claim,
@@ -698,6 +699,7 @@ _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_fire_owners: dict[str, dict[object, tuple[Optional[str], Path]]] = {}
 _running_lock = threading.Lock()
+_restart_dispatch_pause_owner: object | None = None
 
 # Wall-clock (time.time()) instant each in-flight job id was claimed by
 # ``_submit_with_guard``, plus the future that owns its release (a pending
@@ -794,12 +796,55 @@ def get_running_job_ids() -> "frozenset[str]":
         return frozenset(_running_job_ids | _running_fire_owners.keys())
 
 
+def reserve_restart_dispatch() -> tuple[object, "frozenset[str]"]:
+    """Atomically pause new cron registration and snapshot in-flight jobs."""
+    global _restart_dispatch_pause_owner
+    with _running_lock:
+        if _restart_dispatch_pause_owner is not None:
+            raise RuntimeError("cron restart dispatch pause already reserved")
+        token = object()
+        _restart_dispatch_pause_owner = token
+        running = frozenset(_running_job_ids | _running_fire_owners.keys())
+        return token, running
+
+
+def release_restart_dispatch(token: object) -> None:
+    """Release only the restart pause owned by ``token``."""
+    global _restart_dispatch_pause_owner
+    with _running_lock:
+        if _restart_dispatch_pause_owner is token:
+            _restart_dispatch_pause_owner = None
+
+
+def restart_dispatch_reserved_by(token: object) -> bool:
+    with _running_lock:
+        return _restart_dispatch_pause_owner is token
+
+
+def _register_running_job(job_id: str) -> str:
+    """Atomically register a ticker/manual job and return the decision reason."""
+    with _running_lock:
+        if _restart_dispatch_pause_owner is not None:
+            return "restart_paused"
+        if job_id in _running_job_ids:
+            return "already_running"
+        _running_job_ids.add(job_id)
+        # Claim timestamp + pending-future sentinel are recorded in the SAME
+        # critical section as the add, so there is never a window where an
+        # id is in-flight without an age the stale sweep can bound it by
+        # (t_3778a491).  The sentinel is replaced by the real owning future
+        # once ``pool.submit`` returns.
+        _running_since[job_id] = time.time()
+        _running_futures[job_id] = _FUTURE_PENDING
+        return "registered"
+
+
 def try_register_running_job(job_id: str) -> bool:
     """Atomically add ``job_id`` to the in-flight running set.
 
-    Returns False (without registering) when the job is already mid-run —
-    the caller must skip the fire. This is the single dedupe owner shared by
-    the ticker's ``_submit_with_guard`` and manual runs
+    Returns False (without registering) when restart dispatch is paused or the
+    job is already mid-run. The caller must skip the fire. This is the single
+    dedupe owner shared by the ticker's ``_submit_with_guard`` and manual runs
     (``tools/cronjob_tools``): the fire claim alone cannot prevent a
     double-fire because its TTL (300s) is routinely outlived by real jobs,
     after which a manual ``cronjob(action='run')`` would claim successfully
@@ -810,17 +855,29 @@ def try_register_running_job(job_id: str) -> bool:
     Callers MUST pair a successful registration with
     ``release_running_job`` in a ``finally`` block.
     """
+    return _register_running_job(job_id) == "registered"
+
+
+def _try_register_fire_execution(
+    job_id: str,
+    execution_token: object,
+    fire_owner: Optional[str],
+    profile_home: Path,
+) -> bool:
+    """Register every ``run_one_job`` entry behind the restart pause lock.
+
+    Ticker submissions register ``_running_job_ids`` before reaching this
+    seam; external providers call ``run_one_job`` directly. Both paths must
+    still cross this lock immediately before the execution body so a restart
+    pause cannot be bypassed by a claimed/manual fire.
+    """
     with _running_lock:
-        if job_id in _running_job_ids:
+        if _restart_dispatch_pause_owner is not None:
             return False
-        _running_job_ids.add(job_id)
-        # Claim timestamp + pending-future sentinel are recorded in the SAME
-        # critical section as the add, so there is never a window where an
-        # id is in-flight without an age the stale sweep can bound it by
-        # (t_3778a491).  The sentinel is replaced by the real owning future
-        # once ``pool.submit`` returns.
-        _running_since[job_id] = time.time()
-        _running_futures[job_id] = _FUTURE_PENDING
+        _running_fire_owners.setdefault(job_id, {})[execution_token] = (
+            fire_owner,
+            profile_home,
+        )
         return True
 
 
@@ -7076,11 +7133,10 @@ def run_one_job(
     fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     execution_token = object()
     profile_home = _get_hermes_home().resolve()
-    with _running_lock:
-        _running_fire_owners.setdefault(job["id"], {})[execution_token] = (
-            fire_owner or None,
-            profile_home,
-        )
+    if not _try_register_fire_execution(
+        job["id"], execution_token, fire_owner or None, profile_home
+    ):
+        return False
     try:
         return _run_with_fire_claim_heartbeat(
             job,
@@ -7911,12 +7967,59 @@ def tick(
             # compatible; real callers using return_job=True never take it.
             claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
             claimed_job["execution_id"] = job["execution_id"]
-            return run_one_job(
+            dispatched = run_one_job(
                 claimed_job,
                 adapters=adapters,
                 loop=loop,
                 verbose=verbose,
             )
+            if dispatched is True:
+                return True
+
+            rejection_error = (
+                "Execution was not started because gateway restart "
+                "dispatch is paused."
+            )
+            try:
+                finish_execution(
+                    job["execution_id"],
+                    success=False,
+                    error=rejection_error,
+                )
+            except Exception as execution_err:
+                logger.warning(
+                    "Could not terminalize rejected execution for job '%s': %s",
+                    job.get("name", job["id"]),
+                    execution_err,
+                )
+
+            claim = claimed_job.get("fire_claim")
+            fire_owner = claim.get("by") if isinstance(claim, dict) else None
+            if isinstance(fire_owner, str) and fire_owner:
+                try:
+                    release_fire_claim(
+                        job["id"],
+                        expected_owner=fire_owner,
+                    )
+                except Exception as claim_err:
+                    logger.warning(
+                        "Could not release rejected fire claim for job '%s': %s",
+                        job.get("name", job["id"]),
+                        claim_err,
+                    )
+
+            schedule = job.get("schedule")
+            if isinstance(schedule, dict) and schedule.get("kind") == "once":
+                try:
+                    clear_run_claim(job["id"])
+                except Exception as run_claim_err:
+                    logger.warning(
+                        "Could not clear run_claim for job '%s' after restart "
+                        "dispatch rejection: %s (claim will expire at TTL)",
+                        job.get("name", job["id"]),
+                        run_claim_err,
+                    )
+            return False
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
@@ -7979,8 +8082,19 @@ def tick(
                 )
                 _clear_run_claim_best_effort()
                 return None
-            if not try_register_running_job(job_id):
-                logger.info("Job '%s' already running — skipping", job.get("name", job_id))
+            registration = _register_running_job(job_id)
+            if registration != "registered":
+                if registration == "restart_paused":
+                    _clear_run_claim_best_effort()
+                    logger.info(
+                        "Job '%s' not dispatched — gateway restart is paused",
+                        job.get("name", job_id),
+                    )
+                else:
+                    logger.info(
+                        "Job '%s' already running — skipping",
+                        job.get("name", job_id),
+                    )
                 return None
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.

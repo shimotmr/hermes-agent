@@ -20,6 +20,8 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
+
 
 def _wait_until(predicate, timeout=10.0, interval=0.005):
     """Block until ``predicate()`` is truthy or ``timeout`` elapses.
@@ -420,6 +422,85 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
     assert claimed["execution_id"] == "exec-1"
     assert provider.fire_claimed(claimed) is True
     assert events == ["ledger", "claim", ("run", "exec-1")]
+
+
+def test_fire_claimed_propagates_restart_pause_rejection(monkeypatch):
+    import cron.executions as executions
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    finished = []
+    released = []
+    monkeypatch.setattr(sched, "run_one_job", lambda job, **kwargs: False)
+    monkeypatch.setattr(
+        executions,
+        "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+    monkeypatch.setattr(
+        jobs,
+        "release_fire_claim",
+        lambda job_id, *, expected_owner: released.append(
+            (job_id, expected_owner)
+        )
+        or True,
+        raising=False,
+    )
+
+    claimed = {
+        "id": "j1",
+        "execution_id": "exec-1",
+        "fire_claim": {"by": "owner"},
+    }
+    assert InProcessCronScheduler().fire_claimed(claimed) is False
+    assert finished == [
+        (
+            "exec-1",
+            {
+                "success": False,
+                "error": (
+                    "Execution was not started because gateway restart "
+                    "dispatch is paused."
+                ),
+            },
+        )
+    ]
+    assert released == [("j1", "owner")]
+    assert claimed["fire_claim"] == {"by": "owner"}
+
+
+@pytest.mark.parametrize("failing_cleanup", ["ledger", "claim"])
+def test_fire_claimed_cleanup_failures_are_independent(monkeypatch, failing_cleanup):
+    import cron.executions as executions
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    events = []
+    monkeypatch.setattr(sched, "run_one_job", lambda job, **kwargs: False)
+
+    def finish_execution(execution_id, **kwargs):
+        events.append("ledger")
+        if failing_cleanup == "ledger":
+            raise OSError("ledger unavailable")
+
+    def release_fire_claim(job_id, *, expected_owner):
+        events.append("claim")
+        if failing_cleanup == "claim":
+            raise OSError("claim store unavailable")
+        return True
+
+    monkeypatch.setattr(executions, "finish_execution", finish_execution)
+    monkeypatch.setattr(jobs, "release_fire_claim", release_fire_claim)
+
+    claimed = {
+        "id": "j1",
+        "execution_id": "exec-1",
+        "fire_claim": {"by": "owner"},
+    }
+    assert InProcessCronScheduler().fire_claimed(claimed) is False
+    assert events == ["ledger", "claim"]
 
 
 def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):

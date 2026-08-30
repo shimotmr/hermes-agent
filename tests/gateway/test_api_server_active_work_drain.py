@@ -108,6 +108,50 @@ class TestAPIServerAdapterWorkCount:
 
         assert adapter.active_agent_work_count() == 1
 
+    def test_strict_count_propagates_corrupt_registry(self):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._active_run_tasks = None
+
+        strict_count = getattr(adapter, "strict_active_agent_work_count", None)
+        assert callable(strict_count)
+        with pytest.raises((AttributeError, TypeError)):
+            strict_count()
+
+    @pytest.mark.parametrize("field", ["_pending_agent_requests", "_inflight_agent_runs"])
+    @pytest.mark.parametrize("invalid", ["0", -1, True, 0.5])
+    def test_strict_count_rejects_each_malformed_component(self, field, invalid):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._pending_agent_requests = 0
+        adapter._inflight_agent_runs = 0
+        adapter._active_run_tasks = {}
+        setattr(adapter, field, invalid)
+
+        with pytest.raises((TypeError, ValueError)):
+            adapter.strict_active_agent_work_count()
+
+    @pytest.mark.parametrize("invalid", [1, 0, None, "false", 0.0])
+    def test_strict_count_rejects_non_boolean_task_done_result(self, invalid):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._pending_agent_requests = 0
+        adapter._inflight_agent_runs = 0
+        task = MagicMock()
+        task.done.return_value = invalid
+        adapter._active_run_tasks = {"run-1": task}
+
+        with pytest.raises((TypeError, ValueError)):
+            adapter.strict_active_agent_work_count()
+
+    def test_strict_count_propagates_task_done_error(self):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._pending_agent_requests = 0
+        adapter._inflight_agent_runs = 0
+        task = MagicMock()
+        task.done.side_effect = RuntimeError("corrupt task authority")
+        adapter._active_run_tasks = {"run-1": task}
+
+        with pytest.raises(RuntimeError, match="corrupt task authority"):
+            adapter.strict_active_agent_work_count()
+
     def test_interrupt_active_runs_interrupts_adapter_owned_agents(self):
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
         agent = MagicMock()

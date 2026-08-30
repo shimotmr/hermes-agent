@@ -49,6 +49,56 @@ from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
+
+
+def _call_on_loop_for_bool(
+    loop: Any,
+    operation: Callable[[], bool],
+    *,
+    timeout: float = 5.0,
+    rollback_late_true: Optional[Callable[[], None]] = None,
+) -> bool:
+    """Run a boolean operation on ``loop`` without leaking late success.
+
+    When the caller times out before the callback starts, the operation is
+    skipped.  When it times out while the operation is running, a late true
+    result is rolled back by the same loop callback before it exits.
+    """
+    done = threading.Event()
+    lock = threading.Lock()
+    state: dict[str, Any] = {"phase": "pending", "result": False}
+
+    def _invoke() -> None:
+        with lock:
+            if state["phase"] != "pending":
+                done.set()
+                return
+            state["phase"] = "running"
+        try:
+            result = bool(operation())
+        except Exception:
+            result = False
+        with lock:
+            timed_out = state["phase"] == "timed_out"
+            if not timed_out:
+                state["result"] = result
+                state["phase"] = "done"
+        if timed_out and result and rollback_late_true is not None:
+            try:
+                rollback_late_true()
+            except Exception:
+                pass
+        done.set()
+
+    loop.call_soon_threadsafe(_invoke)
+    if done.wait(timeout=timeout):
+        with lock:
+            return bool(state["result"])
+    with lock:
+        if state["phase"] == "done":
+            return bool(state["result"])
+        state["phase"] = "timed_out"
+    return False
 from agent.conversation_compression import (
     COMPACTION_DONE_STATUS,
     COMPACTION_STATUS,
@@ -7033,6 +7083,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _external_drain_active: bool = False
     _restart_requested: bool = False
     _restart_task_started: bool = False
+    _idle_restart_reserved: bool = False
     _restart_detached: bool = False
     _restart_via_service: bool = False
     _detached_restart_helper_started: bool = False
@@ -7223,6 +7274,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # request -> poll -> proceed loop.
         self._external_drain_active = False
         self._restart_requested = False
+        self._idle_restart_reserved = False
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
         # WITHOUT a planned-stop / takeover marker — i.e. an unexpected
         # external signal (container/s6 SIGTERM on `docker restart` or
@@ -8883,6 +8935,137 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             + self._active_api_run_count()
         )
 
+    def _active_work_count_for_restart(self) -> int:
+        """Read strict API authority, then reserve cron dispatch when idle.
+
+        ``self._draining`` is already true on the gateway loop, so no new API
+        request can pass admission while this synchronous method runs. Existing
+        admitted API work must be allowed to finish before the cron pause is
+        acquired; otherwise its detached fire can be rejected in the narrow
+        pause/count/rollback window and leave a durable claim unprocessed.
+        """
+        api_count = 0
+        adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
+        if adapter is not None:
+            helper = getattr(adapter, "strict_active_agent_work_count", None)
+            if not callable(helper):
+                raise RuntimeError("api_server strict active-work counter unavailable")
+            raw_api_count = helper()
+            if type(raw_api_count) is not int or raw_api_count < 0:
+                raise RuntimeError("api_server active-work counter invalid")
+            api_count = raw_api_count
+
+        # A non-zero result is all the reservation caller needs. Do not briefly
+        # pause cron while an already-admitted API fire is crossing into
+        # run_one_job; the next idle probe will retry after that work drains.
+        if api_count:
+            return self._running_agent_count() + api_count
+
+        from cron.scheduler import reserve_restart_dispatch
+
+        token, running_cron_jobs = reserve_restart_dispatch()
+        self._idle_restart_cron_pause_token = token
+        return self._running_agent_count() + len(running_cron_jobs)
+
+    def _release_idle_restart_cron_pause(self) -> None:
+        token = getattr(self, "_idle_restart_cron_pause_token", None)
+        if token is None:
+            return
+        self._idle_restart_cron_pause_token = None
+        try:
+            from cron.scheduler import release_restart_dispatch
+
+            release_restart_dispatch(token)
+        except Exception:
+            logger.debug("Failed releasing cron restart dispatch pause", exc_info=True)
+
+    def _owns_idle_restart_cron_pause(self) -> bool:
+        token = getattr(self, "_idle_restart_cron_pause_token", None)
+        if token is None:
+            # Minimal test doubles may inject the strict authority directly.
+            return True
+        try:
+            from cron.scheduler import restart_dispatch_reserved_by
+
+            return restart_dispatch_reserved_by(token)
+        except Exception:
+            return False
+
+    def try_reserve_idle_restart(self) -> bool:
+        """Atomically close new-work gates and reserve an idle restart."""
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        if (
+            not getattr(self, "_running", False)
+            or self._restart_task_started
+            or self._stop_task is not None
+            or self._draining
+            or self._external_drain_active
+            or self._idle_restart_reserved
+            or (shutdown_event is not None and shutdown_event.is_set())
+        ):
+            return False
+
+        # This method is called on the gateway loop. Close dispatch before
+        # counting so no new chat/cron/API work can enter after the idle check.
+        self._draining = True
+        try:
+            active_work = self._active_work_count_for_restart()
+        except Exception:
+            self._release_idle_restart_cron_pause()
+            self._draining = False
+            return False
+        if active_work != 0:
+            self._release_idle_restart_cron_pause()
+            self._draining = False
+            return False
+
+        self._idle_restart_reserved = True
+        try:
+            status_published = self._update_runtime_status("draining")
+            if status_published is False:
+                raise OSError("runtime status publication failed")
+        except Exception:
+            # Publishing the reservation is part of the atomic boundary. A
+            # failed status write must not leave dispatch permanently gated.
+            self._idle_restart_reserved = False
+            self._release_idle_restart_cron_pause()
+            self._draining = False
+            return False
+        return True
+
+    def cancel_idle_restart_reservation(self) -> None:
+        """Release a reservation when its control-socket ACK was not drained."""
+        if not self._idle_restart_reserved:
+            self._release_idle_restart_cron_pause()
+            return
+        self._idle_restart_reserved = False
+        self._release_idle_restart_cron_pause()
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        shutdown_started = shutdown_event is not None and shutdown_event.is_set()
+        if (
+            not self._restart_task_started
+            and self._stop_task is None
+            and not shutdown_started
+            and self._running
+        ):
+            self._draining = False
+            self._update_runtime_status(
+                "draining" if self._external_drain_active else "running"
+            )
+
+    def confirm_idle_restart_reservation(self) -> bool:
+        """Revalidate reservation ownership at the post-ACK signal boundary."""
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        return bool(
+            self._idle_restart_reserved
+            and self._owns_idle_restart_cron_pause()
+            and self._running
+            and not self._restart_task_started
+            and self._stop_task is None
+            and not self._external_drain_active
+            and not (shutdown_event is not None and shutdown_event.is_set())
+        )
+
     def _active_cron_job_count(self) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
         own in-flight tracking (``cron.scheduler._running_job_ids``).
@@ -9758,7 +9941,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("goal continuation: active-state recheck failed: %s", exc)
             return False
 
-    def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
+    def _update_runtime_status(
+        self,
+        gateway_state: Optional[str] = None,
+        exit_reason: Optional[str] = None,
+    ) -> bool:
         try:
             from gateway.status import write_runtime_status
             write_runtime_status(
@@ -9767,8 +9954,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 restart_requested=self._restart_requested,
                 active_agents=self._active_work_count(),
             )
+            return True
         except Exception:
-            pass
+            return False
 
     def _persist_active_agents(self) -> None:
         """Persist the live in-flight agent count to ``gateway_state.json``.
@@ -12412,6 +12600,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_detached = detached
         self._restart_via_service = via_service
         self._restart_task_started = True
+        self._idle_restart_reserved = False
         # Refuse new turns immediately while in-flight work finishes.
         # Keep ``_running`` True so adapters stay connected and the active
         # turn can still deliver its final response (#77184).
@@ -32599,7 +32788,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # the process-scan/state-file layer, exactly as before this feature.
     _control_server = None
     try:
-        from gateway.control_socket import GatewayControlServer
+        from gateway.control_socket import (
+            DeferredControlResult,
+            GatewayControlServer,
+            restart_if_idle,
+        )
 
         # pause-for-update (#92091 step 2): the updater asks this gateway to
         # drain in-flight turns and exit cleanly — releasing every venv file
@@ -32623,9 +32816,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
             def _request() -> None:
                 try:
-                    accepted_box.append(
-                        runner.request_restart(detached=False, via_service=True)
-                    )
+                    if runner._idle_restart_reserved:
+                        accepted_box.append(False)
+                    else:
+                        accepted_box.append(
+                            runner.request_restart(detached=False, via_service=True)
+                        )
                 finally:
                     _done.set()
 
@@ -32639,8 +32835,38 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 "drain_timeout": _drain,
             }
 
+        def _try_reserve_idle_restart() -> bool:
+            return _call_on_loop_for_bool(
+                _main_loop,
+                runner.try_reserve_idle_restart,
+                timeout=5.0,
+                rollback_late_true=runner.cancel_idle_restart_reservation,
+            )
+
+        def _restart_if_idle_handler(
+            request: dict[str, Any],
+        ) -> DeferredControlResult:
+            return restart_if_idle(
+                request,
+                try_reserve=_try_reserve_idle_restart,
+                confirm_reservation=runner.confirm_idle_restart_reservation,
+                cancel_reservation=runner.cancel_idle_restart_reservation,
+            )
+
+        _restart_request_handlers: dict[
+            str,
+            Callable[
+                [dict[str, Any]], dict[str, Any] | DeferredControlResult
+            ],
+        ] = (
+            {"restart-if-idle": _restart_if_idle_handler}
+            if hasattr(signal, "SIGUSR1") and sys.platform != "win32"
+            else {}
+        )
+
         _control_server = GatewayControlServer(
-            verb_handlers={"pause-for-update": _pause_for_update_handler}
+            verb_handlers={"pause-for-update": _pause_for_update_handler},
+            request_handlers=_restart_request_handlers,
         )
         if not await _control_server.start():
             _control_server = None

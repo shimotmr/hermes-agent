@@ -72,6 +72,7 @@ def _make_up_to_date_side_effect(sha="abc123"):
 
 def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     """Patch ``_cmd_update_impl`` helpers. Mirrors test_update_head_moved_gate."""
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     (tmp_path / ".git").mkdir()
@@ -272,6 +273,39 @@ def test_run_pending_restart_true_when_no_gateways(monkeypatch, capsys):
 
     assert update_cmd._run_pending_fleet_restart() is True
     assert "nothing to restart" in capsys.readouterr().out
+
+
+def test_pending_macos_restart_never_uses_process_kill_fallback(monkeypatch):
+    kill_calls: list[dict] = []
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr("hermes_cli.gateway.is_macos", lambda: True)
+    monkeypatch.setattr("hermes_cli.gateway.is_windows", lambda: False)
+    monkeypatch.setattr(
+        "hermes_cli.gateway.supports_systemd_services", lambda: False
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway.find_gateway_pids", lambda **_kw: [4200]
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway._get_service_pids", lambda **_kw: {4200}
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway.kill_gateway_processes",
+        lambda **kw: kill_calls.append(kw),
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_restart_macos_launchd_gateways",
+        lambda restarted, failed, _budget: restarted.append("ai.hermes.gateway"),
+    )
+
+    assert update_cmd._run_pending_fleet_restart() is True
+    assert kill_calls == []
+
+
+def test_macos_survivor_sweep_never_allows_force_kill():
+    assert update_cmd._should_force_stuck_gateway_survivors(is_macos_host=True) is False
+    assert update_cmd._should_force_stuck_gateway_survivors(is_macos_host=False) is True
 
 
 # ---------------------------------------------------------------------------

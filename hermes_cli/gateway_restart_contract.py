@@ -8,14 +8,19 @@ cross-checks; no single signal is sufficient to declare a replacement healthy.
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
-import signal
 import subprocess
 import sys
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Sequence
+from typing import Any, Callable, NamedTuple, Sequence, cast
+
+
+_MAX_STATUS_ANSWER_AGE_SECONDS = 10.0
+_MAX_STATUS_ANSWER_FUTURE_SKEW_SECONDS = 1.0
 
 
 # When executed by absolute path, Python puts ``hermes_cli/`` first on sys.path;
@@ -52,15 +57,15 @@ def parse_serving_identity(
 ) -> ServingIdentity:
     if not isinstance(payload, dict):
         raise ValueError("control-identity-missing")
-    if payload.get("protocol") != 1:
+    if type(payload.get("protocol")) is not int or payload.get("protocol") != 1:
         raise ValueError("control-protocol-mismatch")
     if payload.get("kind") != "hermes-gateway":
         raise ValueError("control-kind-mismatch")
     pid = payload.get("pid")
     start_time = payload.get("start_time")
-    if not isinstance(pid, int) or pid <= 1:
+    if type(pid) is not int or pid <= 1:
         raise ValueError("invalid-serving-pid")
-    if not isinstance(start_time, int) or start_time <= 0:
+    if type(start_time) is not int or start_time <= 0:
         raise ValueError("invalid-serving-start-time")
     home = Path(str(payload.get("hermes_home", ""))).expanduser()
     if home != expected_home.expanduser():
@@ -77,21 +82,41 @@ def _validate_status(
     *,
     required_platforms: tuple[str, ...] | None = None,
 ) -> str | None:
+    answered_at = status.get("answered_at")
+    if type(answered_at) not in (int, float):
+        return "status-answer-time-invalid"
+    answer_timestamp = float(cast(int | float, answered_at))
+    if not math.isfinite(answer_timestamp):
+        return "status-answer-time-invalid"
+    answer_age = time.time() - answer_timestamp
+    if (
+        answer_age > _MAX_STATUS_ANSWER_AGE_SECONDS
+        or answer_age < -_MAX_STATUS_ANSWER_FUTURE_SKEW_SECONDS
+    ):
+        return "status-answer-stale"
     if status.get("gateway_state") != "running":
         return "gateway-not-running"
-    if status.get("answering_pid") != current.pid:
+    if type(status.get("answering_pid")) is not int or status.get("answering_pid") != current.pid:
         return "status-answering-pid-mismatch"
+    if type(status.get("pid")) is not int or status.get("pid") != current.pid:
+        return "status-pid-mismatch"
+    if type(status.get("start_time")) is not int or status.get("start_time") != current.start_time:
+        return "status-start-time-mismatch"
     platforms = status.get("platforms")
     if not isinstance(platforms, dict):
         return "platform-state-missing"
     if required_platforms is None:
+        if not platforms:
+            return "platform-inventory-empty"
         required_platforms = tuple(platforms)
     for name in required_platforms:
         record = platforms.get(name)
         if not isinstance(record, dict) or record.get("state") != "connected":
             return f"platform-not-connected:{name}"
-        if record.get("writer_pid") != current.pid:
+        if type(record.get("writer_pid")) is not int or record.get("writer_pid") != current.pid:
             return f"platform-writer-mismatch:{name}"
+        if type(record.get("writer_start_time")) is not int or record.get("writer_start_time") != current.start_time:
+            return f"platform-writer-start-time-mismatch:{name}"
     return None
 
 
@@ -118,7 +143,7 @@ def evaluate_current(
         return RestartProbe(False, "health-check-failed", current)
     if require_idle:
         active_agents = status.get("active_agents")
-        if not isinstance(active_agents, int) or active_agents < 0:
+        if type(active_agents) is not int or active_agents < 0:
             return RestartProbe(False, "active-work-unknown", current)
         if active_agents:
             return RestartProbe(False, f"active-work:{active_agents}", current)
@@ -191,7 +216,7 @@ def perform_verified_graceful_restart(
     home: Path,
     *,
     adapters: RuntimeAdapters | None = None,
-    signal_process: Callable[[int], Any] | None = None,
+    signal_process: Callable[[ServingIdentity], Any] | None = None,
     port: int = 8642,
     health_url: str = "http://127.0.0.1:8642/health",
     expected_code_sha: str | None = None,
@@ -211,26 +236,35 @@ def perform_verified_graceful_restart(
 
     runtime = adapters or default_adapters()
 
-    def snapshot(*, require_idle: bool) -> tuple[RestartProbe, dict[str, Any] | None]:
+    def snapshot(
+        *,
+        require_idle: bool,
+        platforms_required: tuple[str, ...] | None = None,
+    ) -> tuple[RestartProbe, dict[str, Any] | None]:
         try:
             identity = parse_serving_identity(runtime.identify(home), expected_home=home)
             status_payload = runtime.status(home)
-        except (OSError, TypeError, ValueError) as exc:
+            process_alive = runtime.process_alive(identity.pid)
+            listener_pids = runtime.listener_owners(port)
+            is_healthy = runtime.health_ok(health_url)
+        except Exception as exc:
             return RestartProbe(False, str(exc), None), None
         if not isinstance(status_payload, dict):
             return RestartProbe(False, "control-status-missing", identity), None
         probe = evaluate_current(
             current=identity,
             status=status_payload,
-            process_alive=runtime.process_alive(identity.pid),
-            listener_pids=runtime.listener_owners(port),
-            health_ok=runtime.health_ok(health_url),
+            process_alive=process_alive,
+            listener_pids=listener_pids,
+            health_ok=is_healthy,
             require_idle=require_idle,
-            required_platforms=required_platforms,
+            required_platforms=platforms_required,
         )
         return probe, status_payload
 
-    first, first_status = snapshot(require_idle=True)
+    first, first_status = snapshot(
+        require_idle=True, platforms_required=required_platforms
+    )
     if not first.ready or first.identity is None or first_status is None:
         return first
     effective_platforms = required_platforms
@@ -238,16 +272,64 @@ def perform_verified_graceful_restart(
         platforms = first_status.get("platforms")
         effective_platforms = tuple(platforms) if isinstance(platforms, dict) else ()
 
-    second, _ = snapshot(require_idle=True)
+    second, _ = snapshot(
+        require_idle=True, platforms_required=effective_platforms
+    )
     if not second.ready or second.identity is None:
         return second
     if second.identity != first.identity:
         return RestartProbe(False, "serving-identity-changed-before-signal", second.identity)
 
-    send_signal = signal_process or (lambda pid: os.kill(pid, signal.SIGUSR1))
+    # Re-read the control-socket identity and idle state at the signal boundary.
+    # Passing the full identity to the adapter prevents callers from discarding
+    # the start-time PID-reuse fingerprint before delivering SIGUSR1.
+    pre_signal, _ = snapshot(
+        require_idle=True, platforms_required=effective_platforms
+    )
+    if (
+        pre_signal.identity is not None
+        and pre_signal.identity != second.identity
+    ):
+        return RestartProbe(
+            False,
+            "serving-identity-changed-before-signal",
+            pre_signal.identity,
+        )
+    if not pre_signal.ready or pre_signal.identity is None:
+        return pre_signal
+
     try:
-        send_signal(second.identity.pid)
-    except (OSError, ValueError) as exc:
+        if signal_process is not None:
+            signal_process(pre_signal.identity)
+        else:
+            from gateway.control_socket import query_gateway_control
+
+            response = query_gateway_control(
+                home,
+                "restart-if-idle",
+                request_fields={
+                    "expected_pid": pre_signal.identity.pid,
+                    "expected_start_time": pre_signal.identity.start_time,
+                },
+                timeout=max(1.0, min(5.0, timeout)),
+            )
+            response_identity = response.get("identity") if isinstance(response, dict) else None
+            if not (
+                isinstance(response, dict)
+                and response.get("accepted") is True
+                and isinstance(response_identity, dict)
+                and type(response_identity.get("pid")) is int
+                and response_identity.get("pid") == pre_signal.identity.pid
+                and type(response_identity.get("start_time")) is int
+                and response_identity.get("start_time") == pre_signal.identity.start_time
+                and response.get("signal") == "SIGUSR1"
+            ):
+                return RestartProbe(
+                    False,
+                    "atomic-restart-request-rejected",
+                    pre_signal.identity,
+                )
+    except Exception as exc:
         return RestartProbe(
             False, f"graceful-signal-failed:{type(exc).__name__}", second.identity
         )
@@ -274,7 +356,7 @@ def perform_verified_graceful_restart(
                 )
                 if last.ready:
                     return last
-        except (OSError, TypeError, ValueError) as exc:
+        except Exception as exc:
             last = RestartProbe(False, str(exc), None)
         now = monotonic()
         if now >= deadline:

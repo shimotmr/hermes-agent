@@ -1,4 +1,4 @@
-"""Regression for #74973 — `hermes update` must not leave the gateway down.
+"""macOS update restart contract: fail closed without launchctl force paths.
 
 On macOS the update's launchd branch guarded the restart behind
 ``launchctl list <label>`` exiting 0. A job that has been *booted out* of
@@ -8,12 +8,9 @@ exited 0 while the gateway was stopped *and* deregistered, which ``KeepAlive``
 cannot recover because the job definition is gone. Messaging adapters and
 cron stayed dark until someone manually ran ``hermes gateway restart``.
 
-``launchctl list`` is also not a reliable loaded/unloaded classifier: it is
-session-scoped and can exit non-zero while the job is alive in its gui/user
-domain (PR #75021 review). The fix therefore does not classify at all — when
-the plist exists it always calls ``launchd_restart()``, which drains a live
-PID, kickstarts with ``-k``, and falls back to bootout/bootstrap/kickstart
-when the job is genuinely unloaded.
+``launchctl list`` is not a serving-identity oracle. A plist-present gateway
+may only restart through its control socket after verified idle; missing or
+unloaded identity is deferred and never bootstrapped by the updater.
 """
 
 from __future__ import annotations
@@ -23,6 +20,7 @@ import subprocess
 import pytest
 
 from hermes_cli import update_cmd
+from hermes_cli.gateway_restart_contract import RestartProbe
 
 
 class _FakePlist:
@@ -37,20 +35,48 @@ class _FakePlist:
 def launchd(monkeypatch):
     """Stub hermes_cli.gateway so no real launchctl call is made."""
     calls: list[str] = []
-    state = {"plist": _FakePlist(True), "restart_exc": None}
+    state = {
+        "plist": _FakePlist(True),
+        "probe": RestartProbe(False, "control-identity-missing", None),
+        "probe_exc": None,
+    }
     subprocess_calls: list[list] = []
 
     import hermes_cli.gateway as gateway_mod
 
     monkeypatch.setattr(gateway_mod, "get_launchd_label", lambda: "ai.hermes.gateway", raising=False)
     monkeypatch.setattr(gateway_mod, "get_launchd_plist_path", lambda: state["plist"], raising=False)
+    monkeypatch.setattr(
+        gateway_mod,
+        "_launchd_service_registered",
+        lambda _label: True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        gateway_mod,
+        "_locate_launchd_gateway_service",
+        lambda _label: ("gui/501", 4321),
+        raising=False,
+    )
 
-    def fake_restart():
-        if state["restart_exc"] is not None:
-            raise state["restart_exc"]
-        calls.append("restart")
+    def forbidden_restart():
+        raise AssertionError("launchd_restart force path was called")
 
-    monkeypatch.setattr(gateway_mod, "launchd_restart", fake_restart, raising=False)
+    monkeypatch.setattr(
+        gateway_mod, "launchd_restart", forbidden_restart, raising=False
+    )
+
+    def fake_contract():
+        calls.append("contract")
+        if state["probe_exc"] is not None:
+            raise state["probe_exc"]
+        return state["probe"]
+
+    monkeypatch.setattr(
+        update_cmd,
+        "_verified_graceful_restart_current_launchd_gateway",
+        fake_contract,
+    )
 
     def fake_run(*args, **kwargs):
         subprocess_calls.append(args[0] if args else [])
@@ -61,36 +87,26 @@ def launchd(monkeypatch):
 
 
 class TestLaunchdRestartAfterUpdate:
-    def test_plist_present_always_restarts_without_classifying(self, launchd, capsys):
-        """The restart must not be gated on `launchctl list`.
-
-        `list` can exit non-zero while the job is alive in its domain
-        (`launchctl print gui/<uid>/<label>` reports state=running with a
-        PID). Routing that state to a plain start would leave the old-code
-        process running, because `kickstart` without `-k` does not terminate
-        a running service. The helper therefore performs no list-based
-        classification at all — `launchd_restart()` handles every
-        plist-present state.
-        """
+    def test_plist_present_uses_verified_contract_without_classifying(
+        self, launchd, capsys
+    ):
         calls, state, subprocess_calls = launchd
+        state["probe"] = RestartProbe(True, "replacement-healthy", None)
 
         assert update_cmd._restart_launchd_gateway_after_update(supervision_verify=False) == (["ai.hermes.gateway"], [])
-        assert calls == ["restart"]
+        assert calls == ["contract"]
         # No `launchctl list` classification happens in this helper.
         assert subprocess_calls == []
         assert "NOT running" not in capsys.readouterr().out
 
-    def test_restart_failure_warns_that_gateway_is_down(self, launchd, capsys):
+    def test_missing_identity_is_deferred_without_force_fallback(self, launchd, capsys):
         calls, state, _ = launchd
-        state["restart_exc"] = subprocess.CalledProcessError(
-            returncode=1, cmd=["launchctl", "kickstart"], stderr="kickstart refused"
-        )
 
         assert update_cmd._restart_launchd_gateway_after_update(supervision_verify=False) == ([], ["ai.hermes.gateway"])
         out = capsys.readouterr().out
-        assert "Gateway restart failed" in out
-        assert "kickstart refused" in out
-        assert "hermes gateway restart" in out
+        assert calls == ["contract"]
+        assert "control-identity-missing" in out
+        assert "No force fallback" in out
 
     @pytest.mark.parametrize(
         "exc",
@@ -99,16 +115,15 @@ class TestLaunchdRestartAfterUpdate:
             subprocess.TimeoutExpired(cmd=["launchctl", "kickstart"], timeout=90),
         ],
     )
-    def test_launchctl_unusable_is_not_swallowed(self, launchd, capsys, exc):
-        """A missing binary or a timeout used to `pass` silently."""
+    def test_contract_exception_is_not_swallowed(self, launchd, capsys, exc):
         calls, state, _ = launchd
-        state["restart_exc"] = exc
+        state["probe_exc"] = exc
 
         assert update_cmd._restart_launchd_gateway_after_update(supervision_verify=False) == ([], ["ai.hermes.gateway"])
-        assert calls == []
+        assert calls == ["contract"]
         out = capsys.readouterr().out
-        assert "Could not restart the gateway" in out
-        assert "hermes gateway restart" in out
+        assert "Could not verify a graceful gateway restart" in out
+        assert "No force fallback" in out
 
     def test_no_plist_is_not_a_launchd_install(self, launchd, capsys):
         """No service definition → nothing to restart, and nothing to warn about."""
@@ -158,6 +173,10 @@ class TestServicePidSweepExclusion:
             if argv[:2] == ["launchctl", "list"]:
                 return subprocess.CompletedProcess(argv, state["list_rc"], stdout="", stderr="")
             if argv[:2] == ["launchctl", "print"]:
+                if argv[2].startswith("user/501/"):
+                    return subprocess.CompletedProcess(
+                        argv, 113, stdout="", stderr=""
+                    )
                 return subprocess.CompletedProcess(
                     argv, state["print_rc"], stdout=state["print_out"], stderr=""
                 )

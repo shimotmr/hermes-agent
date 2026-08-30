@@ -3373,6 +3373,33 @@ def _sweep_completed_oneshots(
     return removed
 
 
+def release_fire_claim(job_id: str, *, expected_owner: str) -> bool:
+    """Compare-and-clear one external fire claim without marking a job run.
+
+    Restart admission can reject a claimed fire before heartbeat, execution,
+    delivery, or ``mark_job_run`` begins. Clearing only the exact persisted
+    owner makes that occurrence retryable without mutating run history,
+    repeat accounting, or a replacement owner's claim.
+    """
+    if not expected_owner:
+        return False
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            jobs = load_jobs()
+            for job in jobs:
+                if job.get("id") != job_id:
+                    continue
+                claim = job.get("fire_claim")
+                if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+                    return False
+                job["fire_claim"] = None
+                save_jobs(jobs)
+                return True
+    return False
+
+
 def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
