@@ -175,6 +175,24 @@ def test_stale_marker_is_removed_on_read(marker):
     assert not marker.exists(), "whoever notices a stale marker clears it"
 
 
+def test_stale_cleanup_does_not_delete_a_replacement_claim(marker, monkeypatch):
+    import hermes_cli.update_lock as update_lock_module
+
+    stale = f"{DEAD_PID}\n{int(time.time())}\n"
+    replacement = f"{os.getpid()}\n{int(time.time())}\n"
+    marker.write_text(stale, encoding="utf-8")
+
+    def replace_while_validating(_pid):
+        marker.unlink()
+        marker.write_text(replacement, encoding="utf-8")
+        return False
+
+    monkeypatch.setattr(update_lock_module, "_pid_alive", replace_while_validating)
+
+    assert read_live_update(path=marker) is None
+    assert marker.read_text(encoding="utf-8") == replacement
+
+
 def test_absent_marker_reports_no_live_update(marker):
     assert read_live_update(path=marker) is None
 
@@ -200,16 +218,12 @@ def test_describe_holder_names_the_pid_and_elapsed_time(marker):
     assert "already running" in message
 
 
-def test_unwritable_marker_location_does_not_block_the_update(tmp_path):
-    """Degrade to pre-lock behavior rather than refusing to update at all.
-
-    An unwritable marker path is a worse reason to block an update than the
-    race the lock prevents.
-    """
+def test_unwritable_marker_location_fails_closed(tmp_path):
+    """An updater must not mutate a checkout when lock ownership is unknowable."""
     lock = UpdateLock(path=tmp_path / "nonexistent-file" / "marker")
     (tmp_path / "nonexistent-file").write_text("i am a file, not a dir", encoding="utf-8")
 
-    assert lock.acquire() is True
+    assert lock.acquire() is False
     assert lock.acquired is False, "nothing was written, so there is nothing to release"
 
 

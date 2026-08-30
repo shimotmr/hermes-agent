@@ -179,6 +179,7 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
     """
     marker = path or update_marker_path()
     try:
+        marker_identity = marker.lstat()
         raw = marker.read_text(encoding="utf-8")
     except OSError:
         return None  # absent or unreadable => no live update
@@ -196,7 +197,12 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
     age = time.time() - started_at
     if not _pid_alive(pid) or age > UPDATE_MARKER_MAX_AGE_SECONDS:
         try:
-            marker.unlink()
+            current_identity = marker.lstat()
+            if (
+                current_identity.st_dev == marker_identity.st_dev
+                and current_identity.st_ino == marker_identity.st_ino
+            ):
+                marker.unlink()
         except OSError:
             pass
         return None
@@ -251,6 +257,19 @@ class UpdateLock:
                 self.holder = existing
                 return False
 
+            # ``None`` means either genuinely absent or unreadable/stale. A
+            # marker entry that remains after the read cannot be reclaimed
+            # safely, so destructive update ownership is unprovable.
+            try:
+                self.path.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.debug("Could not inspect update marker %s: %s", self.path, exc)
+                return False
+            else:
+                return False
+
             temporary_path: str | None = None
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -269,16 +288,15 @@ class UpdateLock:
                     # Failure happened while preparing the private claim, not
                     # because another claimant published the destination.
                     logger.debug("Could not write update marker %s: %s", self.path, exc)
-                    return True
+                    return False
                 # Another claimant won after our live-holder probe. Re-read its
                 # complete claim rather than overwriting it.
                 continue
             except OSError as exc:
-                # Best-effort, exactly like the Rust guard: an unwritable marker
-                # must not block the update itself (that would be a worse failure
-                # than the race it prevents). Degrade to the pre-lock behavior.
+                # Without a durable claim, updater ownership is unknowable.
+                # Fail closed rather than allowing concurrent checkout mutation.
                 logger.debug("Could not write update marker %s: %s", self.path, exc)
-                return True
+                return False
             finally:
                 if temporary_path is not None:
                     try:
