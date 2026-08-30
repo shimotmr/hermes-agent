@@ -611,3 +611,41 @@ def test_update_on_main_fast_path_unchanged(repo_pair, monkeypatch, capsys):
     head = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
     remote = _git(repo_pair, "rev-parse", "origin/main").stdout.strip()
     assert head == remote
+
+
+def test_fork_sync_finishes_before_target_sha_is_frozen(
+    repo_pair, monkeypatch
+):
+    """A fork sync may move refs/HEAD, so it cannot run after target freeze."""
+    _git(repo_pair, "checkout", "-q", "main")
+    _git(repo_pair, "merge", "--ff-only", "origin/main")
+    _patch_update_flow(monkeypatch, repo_pair)
+    monkeypatch.setattr(update_cmd, "_is_fork", lambda *a, **k: True)
+    frozen = {"captured": False}
+    order: list[str] = []
+    real_capture = update_cmd._capture_fetched_target_sha
+
+    def capture(*args, **kwargs):
+        order.append("freeze")
+        frozen["captured"] = True
+        return real_capture(*args, **kwargs)
+
+    class _StopAfterSync(Exception):
+        pass
+
+    def sync(*args, **kwargs):
+        assert frozen["captured"] is False
+        assert order == ["stash"]
+        raise _StopAfterSync
+
+    monkeypatch.setattr(
+        hermes_main,
+        "_stash_local_changes_if_needed",
+        lambda *args, **kwargs: order.append("stash") or None,
+    )
+    monkeypatch.setattr(update_cmd, "_capture_fetched_target_sha", capture)
+    monkeypatch.setattr(hermes_main, "_sync_with_upstream_if_needed", sync)
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+
+    with pytest.raises(_StopAfterSync):
+        hermes_main.cmd_update(args)

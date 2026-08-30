@@ -1305,7 +1305,12 @@ def _branch_head_suffix(git_cmd=None, cwd=None) -> str:
 
 
 def _assess_parked_branch_switch(
-    git_cmd: list[str], cwd: Path, current_branch: str, target_branch: str
+    git_cmd: list[str],
+    cwd: Path,
+    current_branch: str,
+    target_branch: str,
+    *,
+    frozen_target_sha: str | None = None,
 ) -> tuple[bool, str]:
     """Decide whether it is safe to auto-switch a parked feature branch back
     to the update target.
@@ -1356,8 +1361,9 @@ def _assess_parked_branch_switch(
     if status.stdout.strip():
         return False, "dirty"
 
+    comparison_target = frozen_target_sha or f"origin/{target_branch}"
     cherry = subprocess.run(
-        git_cmd + ["cherry", f"origin/{target_branch}"],
+        git_cmd + ["cherry", comparison_target],
         cwd=cwd, capture_output=True,
         text=True, encoding="utf-8", errors="replace",
     )
@@ -1372,6 +1378,58 @@ def _assess_parked_branch_switch(
         # "branch kept with N unmerged commit(s)" notice.
         return True, f"unmerged:{len(unmerged)}"
     return True, ""
+
+
+def _checkout_target_at_frozen(
+    git_cmd: list[str], cwd: Path, target_branch: str, frozen_target_sha: str
+) -> subprocess.CompletedProcess[str]:
+    """Checkout the target without letting its mutable ref redefine this run.
+
+    A target branch with local-only commits is checked out unchanged so the
+    subsequent frozen-SHA merge can preserve them.  Otherwise the branch is
+    anchored directly to the already-frozen commit.
+    """
+    local_only = subprocess.run(
+        git_cmd
+        + [
+            "rev-list",
+            "--count",
+            f"{frozen_target_sha}..refs/heads/{target_branch}",
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if local_only.returncode == 0:
+        try:
+            if int(local_only.stdout.strip()) > 0:
+                return subprocess.run(
+                    git_cmd + ["checkout", target_branch],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+        except ValueError:
+            return subprocess.CompletedProcess(
+                local_only.args, 1, local_only.stdout, "invalid local-only count"
+            )
+    elif (
+        "unknown revision" not in local_only.stderr
+        and "ambiguous argument" not in local_only.stderr
+    ):
+        return local_only
+    return subprocess.run(
+        git_cmd + ["checkout", "-B", target_branch, frozen_target_sha],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 def _print_parked_branch_skip_warning(
@@ -8074,6 +8132,50 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _print_fetch_failure(fetch_result.stderr)
             sys.exit(1)
 
+        # Resolve the checkout before freezing.  Fork synchronization may
+        # advance HEAD and origin/main, so it must either finish now or wait
+        # for a later run; it is never allowed to mutate this run's target
+        # after the immutable SHA has been captured.
+        result = subprocess.run(
+            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        current_branch = result.stdout.strip()
+        upstream_checked = not is_fork
+        fork_sync_advanced = False
+        auto_stash_ref = None
+        if is_fork and branch == "main" and current_branch == branch:
+            auto_stash_ref = _m()._stash_local_changes_if_needed(
+                git_cmd, _m().PROJECT_ROOT
+            )
+            pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+            upstream_checked = _m()._sync_with_upstream_if_needed(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                assume_yes=assume_yes,
+                input_fn=gw_input_fn,
+            )
+            post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+            fork_sync_advanced = bool(
+                pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha
+            )
+            refresh_result = subprocess.run(
+                git_cmd + ["fetch", "origin", branch],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if refresh_result.returncode != 0:
+                _print_fetch_failure(refresh_result.stderr)
+                sys.exit(1)
+
         frozen_remote_ref = f"origin/{branch}"
         frozen_target_sha = _capture_fetched_target_sha(
             git_cmd, _m().PROJECT_ROOT, frozen_remote_ref
@@ -8084,16 +8186,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             print("  Refusing to apply a moving or malformed update target.")
             sys.exit(1)
-
-        # Get current branch (returns literal "HEAD" when detached)
-        result = subprocess.run(
-            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            check=True,
-        )
-        current_branch = result.stdout.strip()
 
         # Parked-branch guard (2026-08-17 live incident): the checkout can be
         # left parked on a stale feature branch by earlier tooling. Blindly
@@ -8126,7 +8218,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         in_place_update = False
         if current_branch != branch and current_branch != "HEAD":
             switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
-                git_cmd, _m().PROJECT_ROOT, current_branch, branch
+                git_cmd,
+                _m().PROJECT_ROOT,
+                current_branch,
+                branch,
+                frozen_target_sha=frozen_target_sha,
             )
             if not switch_safe:
                 _m()._print_parked_branch_skip_warning(
@@ -8192,6 +8288,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     f"(fully merged) — switching back to {branch}..."
                 )
 
+        target_checkout_advanced = False
         if not in_place_update and current_branch != branch:
             if current_branch == "HEAD":
                 print(
@@ -8200,11 +8297,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
             # Stash before checkout so uncommitted work isn't lost
             auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
-            checkout_result = subprocess.run(
-                git_cmd + ["checkout", branch],
+            target_tip_before = subprocess.run(
+                git_cmd + ["rev-parse", "--verify", f"refs/heads/{branch}"],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            ).stdout.strip()
+            checkout_result = _checkout_target_at_frozen(
+                git_cmd, _m().PROJECT_ROOT, branch, frozen_target_sha
+            )
+            target_checkout_advanced = bool(
+                checkout_result.returncode == 0
+                and target_tip_before != frozen_target_sha
+                and _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+                == frozen_target_sha
             )
             if checkout_result.returncode != 0:
                 # Local checkout doesn't have this branch yet. Try to set
@@ -8232,7 +8340,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     if track_result.stderr.strip():
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
-        else:
+        elif auto_stash_ref is None:
             auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
 
         prompt_for_restore = (
@@ -8255,6 +8363,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         commit_count = int(result.stdout.strip())
+        if target_checkout_advanced and commit_count == 0:
+            commit_count = 1
+        if fork_sync_advanced and commit_count == 0:
+            commit_count = max(
+                1,
+                _count_commits_between(
+                    git_cmd, _m().PROJECT_ROOT, pre_sync_sha, post_sync_sha
+                ),
+            )
 
         apply_is_shallow = (
             subprocess.run(
@@ -8289,27 +8406,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # date!" and verified nothing).
         # Non-fork checkouts have no upstream question: origin IS the official
         # repo, so "Already up to date!" is fully verified there.
-        upstream_checked = True
-        if commit_count == 0 and is_fork and branch == "main":
-            pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-            upstream_checked = _m()._sync_with_upstream_if_needed(
-                git_cmd,
-                _m().PROJECT_ROOT,
-                assume_yes=assume_yes,
-                input_fn=gw_input_fn,
-            )
-            post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-            if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
-                synced_count = _count_commits_between(
-                    git_cmd,
-                    _m().PROJECT_ROOT,
-                    pre_sync_sha,
-                    post_sync_sha,
-                )
-                # HEAD moving is itself proof of an update. Keep the update
-                # path active even if the informational count cannot be read.
-                commit_count = max(1, synced_count)
-
         if commit_count == 0:
             _invalidate_update_cache()
 
@@ -8712,7 +8808,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # and post-pull HEAD; if they match, surface the no-op instead of
         # claiming success.
         post_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        if pre_pull_sha and post_pull_sha == pre_pull_sha:
+        if (
+            pre_pull_sha
+            and post_pull_sha == pre_pull_sha
+            and not target_checkout_advanced
+            and not fork_sync_advanced
+        ):
             print()
             print("✗ Code did not move — update was a no-op.")
             print(
