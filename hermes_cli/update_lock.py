@@ -54,6 +54,7 @@ import logging
 import os
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -169,6 +170,62 @@ class UpdateHolder:
     age_seconds: float
 
 
+def _marker_owner(raw: str) -> int | None:
+    try:
+        return int(raw.splitlines()[0].strip())
+    except (IndexError, ValueError):
+        return None
+
+
+def _restore_quarantined_marker(marker: Path, quarantine: Path) -> None:
+    """Restore a marker without replacing a claim published after our rename."""
+    try:
+        os.link(quarantine, marker)
+    except FileExistsError:
+        # A newer claimant already occupies the canonical pathname. Keeping that
+        # marker is the fail-closed result; the quarantined copy is redundant.
+        pass
+    except OSError:
+        # Ownership could not be restored safely. Retain the private marker for
+        # diagnosis rather than deleting an inode we do not own.
+        return
+    try:
+        quarantine.unlink()
+    except OSError:
+        pass
+
+
+def _remove_marker_if(marker: Path, predicate) -> bool:
+    """Atomically detach, verify, and delete one marker claim.
+
+    Writers publish a fresh inode with atomic replacement. Renaming the pathname
+    into a private quarantine therefore linearizes deletion against every
+    publish: a claim published before the rename is re-verified in quarantine;
+    one published after it remains at ``marker`` and cannot be deleted here.
+    """
+    quarantine = marker.with_name(
+        f".{marker.name}.remove-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    try:
+        os.replace(marker, quarantine)
+    except OSError:
+        return False
+    try:
+        raw = quarantine.read_text(encoding="utf-8")
+        removable = bool(predicate(raw))
+    except Exception:
+        removable = False
+    if not removable:
+        _restore_quarantined_marker(marker, quarantine)
+        return False
+    try:
+        quarantine.unlink()
+    except OSError:
+        _restore_quarantined_marker(marker, quarantine)
+        return False
+    return True
+
+
 def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
     """Return the live update holding the lock, or ``None``.
 
@@ -179,7 +236,6 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
     """
     marker = path or update_marker_path()
     try:
-        marker_identity = marker.lstat()
         raw = marker.read_text(encoding="utf-8")
     except OSError:
         return None  # absent or unreadable => no live update
@@ -196,15 +252,20 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
 
     age = time.time() - started_at
     if not _pid_alive(pid) or age > UPDATE_MARKER_MAX_AGE_SECONDS:
-        try:
-            current_identity = marker.lstat()
-            if (
-                current_identity.st_dev == marker_identity.st_dev
-                and current_identity.st_ino == marker_identity.st_ino
-            ):
-                marker.unlink()
-        except OSError:
-            pass
+        def still_stale(candidate: str) -> bool:
+            candidate_lines = candidate.splitlines()
+            try:
+                candidate_pid = int(candidate_lines[0].strip())
+                candidate_started = float(candidate_lines[1].strip())
+            except (IndexError, ValueError):
+                return True
+            candidate_age = time.time() - candidate_started
+            return (
+                not _pid_alive(candidate_pid)
+                or candidate_age > UPDATE_MARKER_MAX_AGE_SECONDS
+            )
+
+        _remove_marker_if(marker, still_stale)
         return None
 
     return UpdateHolder(pid=pid, age_seconds=age)
@@ -318,24 +379,15 @@ class UpdateLock:
             return
         self.acquired = False
         try:
-            marker_identity = self.path.lstat()
             raw = self.path.read_text(encoding="utf-8")
-            owner = int(raw.splitlines()[0].strip())
-        except (OSError, IndexError, ValueError):
+        except OSError:
             return
+        owner = _marker_owner(raw)
         if owner != os.getpid():
             # A handoff partner took ownership (e.g. the Tauri updater wrote
             # its own pid). Leave it alone — it's still a live update.
             return
-        try:
-            current_identity = self.path.lstat()
-            if (
-                current_identity.st_dev == marker_identity.st_dev
-                and current_identity.st_ino == marker_identity.st_ino
-            ):
-                self.path.unlink()
-        except OSError:
-            pass
+        _remove_marker_if(self.path, lambda candidate: _marker_owner(candidate) == os.getpid())
 
     def __enter__(self) -> "UpdateLock":
         self.acquire()

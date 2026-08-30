@@ -166,6 +166,33 @@ def test_release_does_not_delete_replacement_after_owner_read(
     assert real_read_text(marker, encoding="utf-8") == replacement
 
 
+def test_release_does_not_delete_same_inode_handoff_during_unlink(
+    marker, monkeypatch
+):
+    """An Electron-style in-place owner rewrite at unlink time must survive."""
+    import hermes_cli.update_lock as update_lock_module
+
+    lock = UpdateLock(path=marker)
+    assert lock.acquire() is True
+    replacement = f"{DEAD_PID}\n{int(time.time())}\n"
+    real_replace = update_lock_module.os.replace
+    rewrote = False
+
+    def rewrite_during_detach(source, destination, *args, **kwargs):
+        nonlocal rewrote
+        result = real_replace(source, destination, *args, **kwargs)
+        if Path(source) == marker and not rewrote:
+            rewrote = True
+            Path(destination).write_text(replacement, encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(update_lock_module.os, "replace", rewrite_during_detach)
+
+    lock.release()
+
+    assert marker.read_text(encoding="utf-8") == replacement
+
+
 def test_dead_owner_is_reclaimed_not_honored(marker):
     marker.write_text(f"{DEAD_PID}\n{int(time.time())}\n", encoding="utf-8")
 
@@ -215,6 +242,32 @@ def test_stale_cleanup_does_not_delete_a_replacement_claim(marker, monkeypatch):
         return False
 
     monkeypatch.setattr(update_lock_module, "_pid_alive", replace_while_validating)
+
+    assert read_live_update(path=marker) is None
+    assert marker.read_text(encoding="utf-8") == replacement
+
+
+def test_stale_cleanup_does_not_delete_same_inode_handoff_during_unlink(
+    marker, monkeypatch
+):
+    """Stale cleanup must not unlink a same-inode owner handoff."""
+    import hermes_cli.update_lock as update_lock_module
+
+    stale = f"{DEAD_PID}\n{int(time.time())}\n"
+    replacement = f"{os.getpid()}\n{int(time.time())}\n"
+    marker.write_text(stale, encoding="utf-8")
+    real_replace = update_lock_module.os.replace
+    rewrote = False
+
+    def rewrite_during_detach(source, destination, *args, **kwargs):
+        nonlocal rewrote
+        result = real_replace(source, destination, *args, **kwargs)
+        if Path(source) == marker and not rewrote:
+            rewrote = True
+            Path(destination).write_text(replacement, encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(update_lock_module.os, "replace", rewrite_during_detach)
 
     assert read_live_update(path=marker) is None
     assert marker.read_text(encoding="utf-8") == replacement
