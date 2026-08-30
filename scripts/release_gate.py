@@ -25,6 +25,15 @@ _SCHEMA_EVIDENCE_LEGACY = frozenset(
     {"hermes.update.evidence-event.v1", "hermes.update.evidence-event.v2"}
 )
 _SHA_LEN = 40
+REQUIRED_RELEASE_GATE_IDS = (
+    "freeze",
+    "updater-restart-control",
+    "ruff",
+    "pycompile",
+    "diff-secret",
+    "pip-check",
+    "live-side-effect",
+)
 
 
 class EvidenceCorrupt(ValueError):
@@ -402,6 +411,15 @@ def _validate_git_binding(
         raise EvidenceCorrupt(f"snapshot-binding-mismatch:{expected_sequence}")
     if snapshot.get("target_tree_sha") != frozen_tree:
         raise EvidenceCorrupt(f"snapshot-tree-mismatch:{expected_sequence}")
+    if snapshot.get("schema_version") != _SCHEMA_SNAPSHOT:
+        raise EvidenceCorrupt(f"snapshot-schema-mismatch:{expected_sequence}")
+    if snapshot.get("local_base_sha") != candidate:
+        raise EvidenceCorrupt(f"snapshot-local-base-mismatch:{expected_sequence}")
+    merge_base = _git_text(repo, "merge-base", candidate, frozen)
+    if snapshot.get("merge_base_sha") != merge_base:
+        raise EvidenceCorrupt(f"snapshot-merge-base-mismatch:{expected_sequence}")
+    if snapshot.get("changed_paths") != list(_changed_paths(repo, candidate, frozen)):
+        raise EvidenceCorrupt(f"snapshot-changed-paths-mismatch:{expected_sequence}")
 
 
 def _validate_event_shape(
@@ -474,7 +492,7 @@ def validate_release_evidence(
     required_gate_ids: Sequence[str],
 ) -> list[dict[str, Any]]:
     """Validate one complete, successful release authority chain."""
-    required = tuple(required_gate_ids)
+    required = tuple(dict.fromkeys((*REQUIRED_RELEASE_GATE_IDS, *required_gate_ids)))
     if not required or any(not isinstance(gate, str) or not gate for gate in required):
         raise EvidenceCorrupt("required-gates-empty-or-invalid")
     events = validate_evidence(path, repo=repo)
@@ -545,7 +563,11 @@ def append_evidence(
     target.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(target, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.fchmod(descriptor, 0o600)
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(descriptor, 0o600)
+        else:
+            os.chmod(target, 0o600)
         with os.fdopen(descriptor, "r+b", closefd=False) as handle:
             with _exclusive_file_lock(handle):
                 handle.seek(0)

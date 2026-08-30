@@ -153,3 +153,34 @@ def test_target_checkout_does_not_overwrite_branch_advanced_after_probe(
     assert raced_tip
     assert git(repo, "rev-parse", "main") == raced_tip[0]
     assert git(repo, "branch", "--show-current") == "main"
+
+
+def test_destructive_reset_refuses_when_head_advanced_after_observation(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.name", "Updater Test")
+    git(repo, "config", "user.email", "updater@example.invalid")
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    git(repo, "add", "base.txt")
+    git(repo, "commit", "-m", "base")
+    observed = git(repo, "rev-parse", "HEAD")
+    (repo / "remote.txt").write_text("remote\n", encoding="utf-8")
+    git(repo, "add", "remote.txt")
+    git(repo, "commit", "-m", "remote")
+    target = git(repo, "rev-parse", "HEAD")
+    git(repo, "reset", "--hard", observed)
+    (repo / "local.txt").write_text("local\n", encoding="utf-8")
+    git(repo, "add", "local.txt")
+    git(repo, "commit", "-m", "raced local")
+    raced = git(repo, "rev-parse", "HEAD")
+
+    result = update_cmd._reset_hard_if_head_matches(
+        ["git"], repo, target, expected_head=observed
+    )
+
+    assert result.returncode != 0
+    assert git(repo, "rev-parse", "HEAD") == raced
+    assert (repo / "local.txt").read_text() == "local\n"

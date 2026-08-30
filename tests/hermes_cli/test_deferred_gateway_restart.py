@@ -400,3 +400,42 @@ def test_stale_worker_cannot_overwrite_receipt_or_delete_newer_intent(
     assert surviving["generation"] == replacement_generation[0]
     assert surviving["worker_pid"] == 999
     assert not deferred_restart_receipt_path(tmp_path).exists()
+
+
+def test_worker_losing_authority_during_ready_probe_cannot_restart(tmp_path: Path) -> None:
+    clock = Clock()
+    old = identity(tmp_path)
+    schedule_deferred_restart(
+        home=tmp_path,
+        port=8642,
+        expected_sha="a" * 40,
+        old_identity=old,
+        reason="active-work:1",
+        spawn=lambda _argv: 321,
+        now=clock.now,
+    )
+    restart_calls: list[object] = []
+
+    def restart_attempt(intent):
+        restart_calls.append(intent)
+        return RestartProbe(False, "unexpected-restart", old)
+
+    def replace_during_probe(_intent):
+        intent_path = deferred_restart_intent_path(tmp_path)
+        payload = json.loads(intent_path.read_text())
+        payload["generation"] = "replacement-generation"
+        payload["owner_token"] = "replacement-owner"
+        payload["worker_pid"] = 999
+        intent_path.write_text(json.dumps(payload))
+        return RestartProbe(True, "idle", old)
+
+    exit_code = run_deferred_restart(
+        deferred_restart_intent_path(tmp_path),
+        probe=replace_during_probe,
+        restart=restart_attempt,
+        now=clock.now,
+        sleep=clock.sleep,
+    )
+
+    assert exit_code == 1
+    assert restart_calls == []

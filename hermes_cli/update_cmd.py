@@ -551,6 +551,53 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
         return None
 
 
+def _reset_hard_if_head_matches(
+    git_cmd: list[str], cwd: Path, target_sha: str, *, expected_head: str
+) -> subprocess.CompletedProcess[str]:
+    """Move the checked-out branch only if HEAD still matches the observed SHA."""
+    branch_result = subprocess.run(
+        git_cmd + ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    branch = branch_result.stdout.strip()
+    current = _capture_head_sha(git_cmd, cwd)
+    if branch_result.returncode != 0 or not branch or current != expected_head:
+        return subprocess.CompletedProcess(
+            git_cmd, 1, "", "HEAD changed after destructive-reset authorization"
+        )
+    detach = subprocess.run(
+        git_cmd + ["checkout", "--detach", expected_head],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if detach.returncode != 0:
+        return detach
+    update_ref = subprocess.run(
+        git_cmd + ["update-ref", f"refs/heads/{branch}", target_sha, expected_head],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    checkout = subprocess.run(
+        git_cmd + ["checkout", "-f", branch],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return update_ref if update_ref.returncode != 0 else checkout
+
+
 def _capture_fetched_target_sha(git_cmd, cwd, remote_ref: str) -> str | None:
     """Resolve a fetched mutable ref once; reject missing or malformed SHAs."""
     try:
@@ -8696,11 +8743,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(
                         "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                     )
-                    reset_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", _remote_ref],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
+                    reset_result = _reset_hard_if_head_matches(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        _remote_ref,
+                        expected_head=pre_pull_sha or "",
                     )
                     if reset_result.returncode != 0:
                         print(f"✗ Failed to reset to {_remote_ref}.")
@@ -8717,6 +8764,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # ruff check), this catches it on the user side and rolls back
             # so the CLI stays bootable. The user can then retry ``hermes
             # update`` later once a fix lands upstream.
+            applied_head_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
                 _m().PROJECT_ROOT
             )
@@ -8732,11 +8780,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 if pre_pull_sha:
                     print()
                     print(f"→ Rolling back to {pre_pull_sha[:10]}...")
-                    rollback_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", pre_pull_sha],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
+                    rollback_result = _reset_hard_if_head_matches(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        pre_pull_sha,
+                        expected_head=applied_head_sha or "",
                     )
                     if rollback_result.returncode == 0:
                         print("  ✓ Rollback complete — your install is unchanged.")

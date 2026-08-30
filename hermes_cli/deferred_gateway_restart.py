@@ -89,7 +89,7 @@ def _parse_intent(payload: object) -> DeferredRestartIntent:
         raise ValueError("intent-fields-invalid")
     if payload.get("schema") != 1 or type(payload.get("schema")) is not int:
         raise ValueError("intent-schema-invalid")
-    if payload.get("state") not in {"pending", "running"}:
+    if payload.get("state") not in {"pending", "running", "restarting"}:
         raise ValueError("intent-state-invalid")
     home = payload.get("home")
     if not isinstance(home, str) or not home or not Path(home).is_absolute():
@@ -214,6 +214,29 @@ def _cas_write_intent(
         return True
 
 
+def _claim_restart_authority(
+    path: Path, intent: DeferredRestartIntent, *, now: float
+) -> bool:
+    """Atomically claim the one restart side effect for this live worker."""
+    with _intent_lock(path):
+        try:
+            current = _read_intent(path)
+        except Exception:
+            return False
+        if (
+            current.generation != intent.generation
+            or current.owner_token != intent.owner_token
+            or current.state != "running"
+            or current.worker_pid != os.getpid()
+            or current.deadline_at <= now
+        ):
+            return False
+        payload = asdict(current)
+        payload["state"] = "restarting"
+        _atomic_write_json(path, payload)
+        return True
+
+
 def _create_intent_if_absent(path: Path, payload: dict[str, Any]) -> bool:
     with _intent_lock(path):
         if path.exists():
@@ -308,13 +331,15 @@ def schedule_deferred_restart(
             and current.old_pid == old_identity.pid
             and current.old_start_time == old_identity.start_time
         )
-        if (
-            same_target
-            and current.worker_pid is not None
-            and current.deadline_at > created_at
-            and process_alive(current.worker_pid)
-        ):
-            return ScheduleResult(True, "already-scheduled", path)
+        if current.worker_pid is not None and process_alive(current.worker_pid):
+            if current.state == "restarting" or (
+                same_target and current.deadline_at > created_at
+            ):
+                return ScheduleResult(
+                    same_target,
+                    "already-scheduled" if same_target else "different-intent-active",
+                    path,
+                )
         if not same_target and current.deadline_at > created_at:
             return ScheduleResult(False, "different-intent-active", path)
         replacement = True
@@ -546,7 +571,9 @@ def run_deferred_restart(
                     finished_at=current_time,
                 )
                 return 1
-            replacement = restart(intent)
+            if not _claim_restart_authority(intent_path, intent, now=current_time):
+                return 1
+            replacement = restart(_read_intent(intent_path))
             if (
                 replacement.ready
                 and replacement.identity is not None

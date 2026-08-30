@@ -299,8 +299,8 @@ def test_evidence_append_binds_real_commits_snapshot_trees_and_ancestry(
     manifest = tmp_path / "evidence.jsonl"
     frozen = git(repo, "rev-parse", "HEAD")
     git(repo, "branch", "frozen", frozen)
-    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=frozen)
     candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=candidate)
     first = append_evidence(
         manifest,
         repo=repo,
@@ -339,8 +339,8 @@ def test_release_evidence_rejects_a_failed_required_gate(repo: Path, tmp_path: P
     manifest = tmp_path / "evidence.jsonl"
     frozen = git(repo, "rev-parse", "HEAD")
     git(repo, "branch", "frozen", frozen)
-    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=frozen)
     candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=candidate)
     append_evidence(
         manifest,
         repo=repo,
@@ -378,8 +378,8 @@ def test_release_evidence_rejects_missing_gate_and_mixed_authority(
     manifest = tmp_path / "evidence.jsonl"
     frozen = git(repo, "rev-parse", "HEAD")
     git(repo, "branch", "frozen", frozen)
-    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=frozen)
     first_candidate = commit(repo, "candidate-1.txt", "one\n", "candidate one")
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=first_candidate)
     append_evidence(
         manifest,
         repo=repo,
@@ -392,16 +392,17 @@ def test_release_evidence_rejects_missing_gate_and_mixed_authority(
         recorded_at="2026-08-30T04:00:00Z",
     )
 
-    with pytest.raises(EvidenceCorrupt, match="required-gates-missing:ruff"):
+    with pytest.raises(EvidenceCorrupt, match="required-gates-missing"):
         release_gate.validate_release_evidence(
             manifest, repo=repo, required_gate_ids=("tests", "ruff")
         )
 
     second_candidate = commit(repo, "candidate-2.txt", "two\n", "candidate two")
+    second_snapshot = freeze_snapshot(repo, "frozen", local_base_sha=second_candidate)
     append_evidence(
         manifest,
         repo=repo,
-        snapshot=snapshot,
+        snapshot=second_snapshot,
         frozen_sha=frozen,
         candidate_sha=second_candidate,
         gate_id="ruff",
@@ -420,8 +421,8 @@ def test_evidence_tampering_is_detected_without_rewriting(repo: Path, tmp_path: 
     manifest = tmp_path / "evidence.jsonl"
     frozen = git(repo, "rev-parse", "HEAD")
     git(repo, "branch", "frozen", frozen)
-    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=frozen)
     candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=candidate)
     append_evidence(
         manifest,
         repo=repo,
@@ -557,3 +558,83 @@ def test_windows_first_append_does_not_truncate_writer_that_won_lock(
         assert handle.read() == b"first-writer-event\n"
 
     assert lock_calls == 1
+
+
+def test_evidence_append_works_without_fchmod(monkeypatch, repo: Path, tmp_path: Path) -> None:
+    from scripts import release_gate
+
+    frozen = git(repo, "rev-parse", "HEAD")
+    candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
+    git(repo, "branch", "frozen", frozen)
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=candidate)
+    monkeypatch.delattr(release_gate.os, "fchmod")
+
+    event = append_evidence(
+        tmp_path / "evidence.jsonl",
+        repo=repo,
+        snapshot=snapshot,
+        frozen_sha=frozen,
+        candidate_sha=candidate,
+        gate_id="freeze",
+        command="freeze",
+        exit_code=0,
+        recorded_at="2026-08-30T04:00:00Z",
+    )
+
+    assert event["sequence"] == 1
+
+
+def test_release_validation_cannot_be_weakened_to_one_caller_gate(
+    repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    frozen = git(repo, "rev-parse", "HEAD")
+    candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
+    git(repo, "branch", "frozen", frozen)
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=candidate)
+    append_evidence(
+        manifest,
+        repo=repo,
+        snapshot=snapshot,
+        frozen_sha=frozen,
+        candidate_sha=candidate,
+        gate_id="freeze",
+        command="freeze",
+        exit_code=0,
+        recorded_at="2026-08-30T04:00:00Z",
+    )
+
+    with pytest.raises(EvidenceCorrupt, match="required-gates-missing"):
+        release_gate.validate_release_evidence(
+            manifest, repo=repo, required_gate_ids=("freeze",)
+        )
+
+
+def test_release_validation_recomputes_snapshot_from_candidate(
+    repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    frozen = git(repo, "rev-parse", "HEAD")
+    git(repo, "branch", "frozen", frozen)
+    candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
+    wrong_base_snapshot = freeze_snapshot(repo, "frozen", local_base_sha=frozen)
+    append_evidence(
+        manifest,
+        repo=repo,
+        snapshot=wrong_base_snapshot,
+        frozen_sha=frozen,
+        candidate_sha=candidate,
+        gate_id="freeze",
+        command="freeze",
+        exit_code=0,
+        recorded_at="2026-08-30T04:00:00Z",
+    )
+
+    with pytest.raises(EvidenceCorrupt, match="snapshot-local-base-mismatch"):
+        release_gate.validate_release_evidence(
+            manifest, repo=repo, required_gate_ids=("freeze",)
+        )
