@@ -76,6 +76,27 @@ def parse_serving_identity(
     return ServingIdentity(pid, start_time, home, code_sha)
 
 
+def _live_status_payload(
+    current: ServingIdentity, status: dict[str, Any]
+) -> dict[str, Any]:
+    """Project a legacy persisted status into the current writer inventory."""
+    payload = dict(status)
+    platforms = status.get("platforms")
+    if isinstance(platforms, dict):
+        payload["platforms"] = {
+            name: record
+            for name, record in platforms.items()
+            if not (
+                isinstance(record, dict)
+                and type(record.get("writer_pid")) is int
+                and record.get("writer_pid") != current.pid
+                and type(record.get("writer_start_time")) is int
+                and record.get("writer_start_time") != current.start_time
+            )
+        }
+    return payload
+
+
 def _validate_status(
     current: ServingIdentity,
     status: dict[str, Any],
@@ -201,6 +222,7 @@ def probe_current_gateway(
     runtime_status = status(home)
     if not isinstance(runtime_status, dict):
         return RestartProbe(False, "control-status-missing", current)
+    runtime_status = _live_status_payload(current, runtime_status)
     return evaluate_current(
         current=current,
         status=runtime_status,
@@ -251,6 +273,7 @@ def perform_verified_graceful_restart(
             return RestartProbe(False, str(exc), None), None
         if not isinstance(status_payload, dict):
             return RestartProbe(False, "control-status-missing", identity), None
+        status_payload = _live_status_payload(identity, status_payload)
         probe = evaluate_current(
             current=identity,
             status=status_payload,
@@ -343,6 +366,7 @@ def perform_verified_graceful_restart(
             if not isinstance(status_payload, dict):
                 last = RestartProbe(False, "control-status-missing", current)
             else:
+                status_payload = _live_status_payload(current, status_payload)
                 last = evaluate_replacement(
                     old=second.identity,
                     current=current,
@@ -453,6 +477,7 @@ def main(
     status_payload = runtime.status(args.home)
     if not isinstance(status_payload, dict):
         return _emit_probe(RestartProbe(False, "control-status-missing", current))
+    status_payload = _live_status_payload(current, status_payload)
 
     if args.command == "healthy":
         return _emit_probe(

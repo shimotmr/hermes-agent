@@ -276,6 +276,64 @@ def test_current_verifies_only_platforms_published_by_runtime_inventory() -> Non
     assert result == RestartProbe(True, "gateway-healthy", NEW)
 
 
+def test_probe_filters_complete_prior_writer_from_legacy_gateway_status() -> None:
+    status = _status()
+    status["platforms"]["feishu"] = {
+        "state": "connected",
+        "writer_pid": OLD.pid,
+        "writer_start_time": OLD.start_time,
+    }
+
+    result = probe_current_gateway(
+        HOME,
+        identify=lambda _home: {
+            "protocol": 1,
+            "kind": "hermes-gateway",
+            "pid": NEW.pid,
+            "start_time": NEW.start_time,
+            "hermes_home": str(HOME),
+            "code_sha": NEW.code_sha,
+        },
+        status=lambda _home: status,
+        process_alive=lambda _pid: True,
+        listener_owners=lambda _port: {NEW.pid},
+        health_ok=lambda _url: True,
+        port=8642,
+        health_url="http://127.0.0.1:8642/health",
+    )
+
+    assert result == RestartProbe(True, "gateway-healthy", NEW)
+
+
+def test_probe_preserves_partial_writer_mismatch_from_legacy_gateway_status() -> None:
+    status = _status()
+    status["platforms"]["feishu"] = {
+        "state": "connected",
+        "writer_pid": OLD.pid,
+        "writer_start_time": NEW.start_time,
+    }
+
+    result = probe_current_gateway(
+        HOME,
+        identify=lambda _home: {
+            "protocol": 1,
+            "kind": "hermes-gateway",
+            "pid": NEW.pid,
+            "start_time": NEW.start_time,
+            "hermes_home": str(HOME),
+            "code_sha": NEW.code_sha,
+        },
+        status=lambda _home: status,
+        process_alive=lambda _pid: True,
+        listener_owners=lambda _port: {NEW.pid},
+        health_ok=lambda _url: True,
+        port=8642,
+        health_url="http://127.0.0.1:8642/health",
+    )
+
+    assert result == RestartProbe(False, "platform-writer-mismatch:feishu", NEW)
+
+
 def test_replacement_must_run_expected_code_sha_when_supplied() -> None:
     result = evaluate_replacement(
         old=OLD,
@@ -676,6 +734,36 @@ def test_signal_adapter_receives_identity_revalidated_immediately_before_signal(
 
     assert result.reason == "serving-identity-changed-before-signal"
     assert signals == []
+
+
+def test_cli_healthy_filters_complete_prior_writer_from_legacy_gateway_status(
+    capsys,
+) -> None:
+    status = _status()
+    status["platforms"]["feishu"] = {
+        "state": "connected",
+        "writer_pid": OLD.pid,
+        "writer_start_time": OLD.start_time,
+    }
+    adapters = RuntimeAdapters(
+        identify=lambda home: {
+            "protocol": 1,
+            "kind": "hermes-gateway",
+            "pid": NEW.pid,
+            "start_time": NEW.start_time,
+            "hermes_home": str(home),
+            "code_sha": NEW.code_sha,
+        },
+        status=lambda _home: status,
+        process_alive=lambda pid: pid == NEW.pid,
+        listener_owners=lambda _port: {NEW.pid},
+        health_ok=lambda _url: True,
+    )
+
+    exit_code = main(["healthy", "--home", str(HOME)], adapters=adapters)
+
+    assert exit_code == 0
+    assert capsys.readouterr().out.strip() == f"{NEW.pid} {NEW.start_time}"
 
 
 def test_cli_ready_prints_only_verified_replacement_identity(capsys) -> None:

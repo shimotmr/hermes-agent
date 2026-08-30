@@ -233,9 +233,29 @@ def build_status_payload() -> dict[str, Any]:
 
     payload = read_runtime_status() or {}
     payload = dict(payload)
+    answering_pid = os.getpid()
+    current_start_time = payload.get("start_time")
+    platforms = payload.get("platforms")
+    if isinstance(platforms, dict):
+        # The persisted status intentionally retains primary-profile platform
+        # history for diagnostics.  Do not expose an entry as part of the live
+        # restart inventory when both writer-identity fields unambiguously
+        # belong to a prior process.  Partial/malformed mismatches stay visible
+        # so the restart validator continues to fail closed on corrupt state.
+        payload["platforms"] = {
+            name: record
+            for name, record in platforms.items()
+            if not (
+                isinstance(record, dict)
+                and type(record.get("writer_pid")) is int
+                and record.get("writer_pid") != answering_pid
+                and type(record.get("writer_start_time")) is int
+                and record.get("writer_start_time") != current_start_time
+            )
+        }
     payload["protocol"] = CONTROL_PROTOCOL_VERSION
     payload["answered_at"] = time.time()
-    payload["answering_pid"] = os.getpid()
+    payload["answering_pid"] = answering_pid
     return payload
 
 

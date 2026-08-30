@@ -411,6 +411,65 @@ def test_restart_if_idle_accepts_live_reservation_and_defers_signal(
     assert cancellations == []
 
 
+def test_live_status_excludes_complete_prior_writer_identity(monkeypatch):
+    import gateway.control_socket as control_socket
+    import gateway.status as gateway_status
+
+    monkeypatch.setattr(control_socket.os, "getpid", lambda: 123)
+    monkeypatch.setattr(
+        gateway_status,
+        "read_runtime_status",
+        lambda: {
+            "pid": 123,
+            "start_time": 42,
+            "platforms": {
+                "api_server": {
+                    "state": "connected",
+                    "writer_pid": 123,
+                    "writer_start_time": 42,
+                },
+                "feishu": {
+                    "state": "connected",
+                    "writer_pid": 999,
+                    "writer_start_time": 41,
+                },
+            },
+        },
+    )
+
+    result = control_socket.build_status_payload()
+
+    assert tuple(result["platforms"]) == ("api_server",)
+
+
+def test_live_status_preserves_partial_writer_mismatch_for_fail_closed_validation(
+    monkeypatch,
+):
+    import gateway.control_socket as control_socket
+    import gateway.status as gateway_status
+
+    monkeypatch.setattr(control_socket.os, "getpid", lambda: 123)
+    monkeypatch.setattr(
+        gateway_status,
+        "read_runtime_status",
+        lambda: {
+            "pid": 123,
+            "start_time": 42,
+            "platforms": {
+                "telegram": {
+                    "state": "connected",
+                    "writer_pid": 123,
+                    "writer_start_time": 41,
+                }
+            },
+        },
+    )
+
+    result = control_socket.build_status_payload()
+
+    assert tuple(result["platforms"]) == ("telegram",)
+
+
 @pytest.mark.parametrize(
     "extra",
     [
