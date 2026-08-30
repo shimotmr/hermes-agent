@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 from subprocess import CalledProcessError
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -75,6 +76,23 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
     monkeypatch.setattr(hermes_main, "_upgrade_pip_before_lazy_refresh", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda *a, **kw: True)
+
+
+def test_drop_owned_stash_revalidates_selector_before_mutation(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[-3:] == ["stash", "list", "--format=%gd %H"]:
+            return subprocess.CompletedProcess(command, 0, "stash@{0} owned\n", "")
+        if command[-2:] == ["rev-parse", "stash@{0}"]:
+            return subprocess.CompletedProcess(command, 0, "replacement\n", "")
+        raise AssertionError(f"unsafe mutation attempted: {command}")
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+
+    assert update_cmd._drop_owned_stash(["git"], tmp_path, "owned") is False
+    assert not any(command[-2:] == ["drop", "stash@{0}"] for command in calls)
 
 
 

@@ -2587,6 +2587,29 @@ def _resolve_stash_selector(
             return selector.strip()
     return None
 
+
+def _drop_owned_stash(git_cmd: list[str], cwd: Path, stash_ref: str) -> bool:
+    """Drop only the selector that still resolves to our immutable stash OID."""
+    stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
+    if stash_selector is None:
+        return False
+    ownership = subprocess.run(
+        git_cmd + ["rev-parse", stash_selector],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if ownership.returncode != 0 or ownership.stdout.strip() != stash_ref:
+        return False
+    drop = subprocess.run(
+        git_cmd + ["stash", "drop", stash_selector],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    return drop.returncode == 0
+
+
 def _print_stash_cleanup_guidance(
     stash_ref: str, stash_selector: Optional[str] = None
 ) -> None:
@@ -2748,20 +2771,10 @@ def _restore_stashed_changes(
         )
         _print_stash_cleanup_guidance(stash_ref)
     else:
-        drop = subprocess.run(
-            git_cmd + ["stash", "drop", stash_selector],
-            cwd=cwd,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if drop.returncode != 0:
+        if not _drop_owned_stash(git_cmd, cwd, stash_ref):
             print(
                 "⚠ Local changes were restored, but Hermes couldn't drop the saved stash entry."
             )
-            if drop.stdout.strip():
-                print(drop.stdout.strip())
-            if drop.stderr.strip():
-                print(drop.stderr.strip())
             print(
                 "  The stash was left in place. You can remove it manually after checking the result."
             )
@@ -2799,19 +2812,11 @@ def _discard_stashed_changes(
         _print_stash_cleanup_guidance(stash_ref)
         return False
 
-    drop = subprocess.run(
-        git_cmd + ["stash", "drop", stash_selector],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    if drop.returncode != 0:
+    if not _drop_owned_stash(git_cmd, cwd, stash_ref):
         print(
             "⚠ Configured to discard local changes, but Hermes couldn't drop "
             "the saved stash entry."
         )
-        if drop.stderr.strip():
-            print(f"  {drop.stderr.strip().splitlines()[0]}")
         _print_stash_cleanup_guidance(stash_ref, stash_selector)
         return False
 
