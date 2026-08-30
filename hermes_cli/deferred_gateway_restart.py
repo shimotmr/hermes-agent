@@ -11,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
@@ -43,6 +45,8 @@ class DeferredRestartIntent:
     deadline_at: float
     reason: str
     worker_pid: int | None
+    generation: str
+    owner_token: str
 
 
 def deferred_restart_intent_path(home: Path) -> Path:
@@ -78,6 +82,8 @@ def _parse_intent(payload: object) -> DeferredRestartIntent:
         "deadline_at",
         "reason",
         "worker_pid",
+        "generation",
+        "owner_token",
     }
     if set(payload) != required:
         raise ValueError("intent-fields-invalid")
@@ -115,6 +121,12 @@ def _parse_intent(payload: object) -> DeferredRestartIntent:
     worker_pid = payload.get("worker_pid")
     if worker_pid is not None and (type(worker_pid) is not int or worker_pid <= 0):
         raise ValueError("intent-worker-pid-invalid")
+    generation = payload.get("generation")
+    owner_token = payload.get("owner_token")
+    if not isinstance(generation, str) or not generation:
+        raise ValueError("intent-generation-invalid")
+    if not isinstance(owner_token, str) or not owner_token:
+        raise ValueError("intent-owner-invalid")
     return DeferredRestartIntent(
         schema=1,
         state=str(payload["state"]),
@@ -128,6 +140,8 @@ def _parse_intent(payload: object) -> DeferredRestartIntent:
         deadline_at=float(deadline_at),
         reason=reason,
         worker_pid=worker_pid,
+        generation=generation,
+        owner_token=owner_token,
     )
 
 
@@ -151,6 +165,82 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+@contextmanager
+def _intent_lock(path: Path):
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _cas_write_intent(
+    path: Path,
+    *,
+    generation: str,
+    owner_token: str,
+    payload: dict[str, Any],
+) -> bool:
+    with _intent_lock(path):
+        try:
+            current = _read_intent(path)
+        except Exception:
+            return False
+        if current.generation != generation or current.owner_token != owner_token:
+            return False
+        _atomic_write_json(path, payload)
+        return True
+
+
+def _create_intent_if_absent(path: Path, payload: dict[str, Any]) -> bool:
+    with _intent_lock(path):
+        if path.exists():
+            return False
+        _atomic_write_json(path, payload)
+        return True
+
+
+def _publish_spawned_worker(
+    path: Path, *, generation: str, owner_token: str, worker_pid: int
+) -> bool:
+    """Publish a spawned PID without regressing a worker's running claim."""
+    with _intent_lock(path):
+        try:
+            current = _read_intent(path)
+        except Exception:
+            return False
+        if current.generation != generation or current.owner_token != owner_token:
+            return False
+        if current.state == "running" and current.worker_pid is not None:
+            return True
+        if current.state != "pending" or current.worker_pid is not None:
+            return False
+        payload = asdict(current)
+        payload["worker_pid"] = worker_pid
+        _atomic_write_json(path, payload)
+        return True
 
 
 def _process_alive(pid: int) -> bool:
@@ -204,6 +294,8 @@ def schedule_deferred_restart(
         return ScheduleResult(False, "deadline-invalid", None)
     path = deferred_restart_intent_path(home)
     replacement = False
+    replaced_generation: str | None = None
+    replaced_owner: str | None = None
     if path.exists():
         try:
             current = _read_intent(path)
@@ -226,6 +318,8 @@ def schedule_deferred_restart(
         if not same_target and current.deadline_at > created_at:
             return ScheduleResult(False, "different-intent-active", path)
         replacement = True
+        replaced_generation = current.generation
+        replaced_owner = current.owner_token
 
     payload: dict[str, Any] = {
         "schema": 1,
@@ -240,8 +334,20 @@ def schedule_deferred_restart(
         "deadline_at": created_at + float(timeout),
         "reason": reason,
         "worker_pid": None,
+        "generation": uuid.uuid4().hex,
+        "owner_token": uuid.uuid4().hex,
     }
-    _atomic_write_json(path, payload)
+    if replacement:
+        if not _cas_write_intent(
+            path,
+            generation=str(replaced_generation),
+            owner_token=str(replaced_owner),
+            payload=payload,
+        ):
+            return ScheduleResult(False, "intent-replaced-before-publish", path)
+    else:
+        if not _create_intent_if_absent(path, payload):
+            return ScheduleResult(False, "intent-created-concurrently", path)
     argv = [sys.executable, "-m", "hermes_cli.deferred_gateway_restart", "--intent", str(path)]
     try:
         worker_pid = spawn(argv)
@@ -249,8 +355,13 @@ def schedule_deferred_restart(
         return ScheduleResult(False, "worker-spawn-failed", path)
     if type(worker_pid) is not int or worker_pid <= 0:
         return ScheduleResult(False, "worker-pid-invalid", path)
-    payload["worker_pid"] = worker_pid
-    _atomic_write_json(path, payload)
+    if not _publish_spawned_worker(
+        path,
+        generation=str(payload["generation"]),
+        owner_token=str(payload["owner_token"]),
+        worker_pid=worker_pid,
+    ):
+        return ScheduleResult(False, "intent-replaced-after-spawn", path)
     return ScheduleResult(True, "worker-replaced" if replacement else "scheduled", path)
 
 
@@ -342,7 +453,7 @@ def _write_terminal(
     reason: str,
     finished_at: float,
     identity: ServingIdentity | None = None,
-) -> None:
+) -> bool:
     receipt = _terminal_payload(
         intent,
         state=state,
@@ -351,11 +462,22 @@ def _write_terminal(
         identity=identity,
     )
     _validate_receipt(receipt)
-    _atomic_write_json(deferred_restart_receipt_path(Path(intent.home)), receipt)
-    try:
-        intent_path.unlink()
-    except FileNotFoundError:
-        pass
+    with _intent_lock(intent_path):
+        try:
+            current = _read_intent(intent_path)
+        except Exception:
+            return False
+        if (
+            current.generation != intent.generation
+            or current.owner_token != intent.owner_token
+        ):
+            return False
+        _atomic_write_json(deferred_restart_receipt_path(Path(intent.home)), receipt)
+        try:
+            intent_path.unlink()
+        except FileNotFoundError:
+            pass
+        return True
 
 
 def run_deferred_restart(
@@ -379,7 +501,13 @@ def run_deferred_restart(
     running = asdict(intent)
     running["state"] = "running"
     running["worker_pid"] = os.getpid()
-    _atomic_write_json(intent_path, running)
+    if not _cas_write_intent(
+        intent_path,
+        generation=intent.generation,
+        owner_token=intent.owner_token,
+        payload=running,
+    ):
+        return 1
     intent = _parse_intent(running)
 
     while True:

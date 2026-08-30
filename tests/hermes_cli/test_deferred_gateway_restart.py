@@ -84,6 +84,8 @@ def test_schedule_writes_atomic_intent_and_spawns_worker(tmp_path: Path) -> None
     assert len(spawned) == 1
     assert spawned[0][-2:] == ["--intent", str(deferred_restart_intent_path(tmp_path))]
     payload = json.loads(deferred_restart_intent_path(tmp_path).read_text())
+    assert isinstance(payload.pop("generation"), str)
+    assert isinstance(payload.pop("owner_token"), str)
     assert payload == {
         "schema": 1,
         "state": "pending",
@@ -154,6 +156,34 @@ def test_schedule_replaces_dead_worker_for_exact_target(tmp_path: Path) -> None:
 
     assert result.reason == "worker-replaced"
     assert json.loads(deferred_restart_intent_path(tmp_path).read_text())["worker_pid"] == 999
+
+
+def test_scheduler_does_not_overwrite_worker_that_claims_intent_during_spawn(
+    tmp_path: Path,
+) -> None:
+    path = deferred_restart_intent_path(tmp_path)
+
+    def spawn(_argv):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["state"] = "running"
+        payload["worker_pid"] = 777
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return 321
+
+    result = schedule_deferred_restart(
+        home=tmp_path,
+        port=8642,
+        expected_sha="a" * 40,
+        old_identity=identity(tmp_path),
+        reason="active-work:1",
+        spawn=spawn,
+        now=lambda: 1_000.0,
+    )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert result.scheduled is True
+    assert payload["state"] == "running"
+    assert payload["worker_pid"] == 777
 
 
 def test_schedule_fails_closed_on_corrupt_existing_intent(tmp_path: Path) -> None:
@@ -322,3 +352,51 @@ def test_worker_expires_without_restart(tmp_path: Path) -> None:
     assert receipt is not None
     assert receipt["state"] == "expired"
     assert receipt["reason"] == "deadline-exceeded"
+
+
+def test_stale_worker_cannot_overwrite_receipt_or_delete_newer_intent(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    old = identity(tmp_path)
+    first = schedule_deferred_restart(
+        home=tmp_path,
+        port=8642,
+        expected_sha="a" * 40,
+        old_identity=old,
+        reason="active-work:1",
+        spawn=lambda _argv: 321,
+        now=clock.now,
+    )
+    assert first.scheduled
+    replacement_generation: list[str] = []
+
+    def replace_then_fail(_intent):
+        replacement = schedule_deferred_restart(
+            home=tmp_path,
+            port=8642,
+            expected_sha="a" * 40,
+            old_identity=old,
+            reason="active-work:2",
+            spawn=lambda _argv: 999,
+            process_alive=lambda _pid: False,
+            now=lambda: clock.now() + 1,
+        )
+        assert replacement.scheduled
+        replacement_generation.append(
+            json.loads(deferred_restart_intent_path(tmp_path).read_text())["generation"]
+        )
+        return RestartProbe(False, "active-work-unknown", old)
+
+    assert run_deferred_restart(
+        deferred_restart_intent_path(tmp_path),
+        probe=replace_then_fail,
+        restart=lambda _intent: pytest.fail("restart must not run"),
+        now=clock.now,
+        sleep=clock.sleep,
+    ) == 1
+
+    surviving = json.loads(deferred_restart_intent_path(tmp_path).read_text())
+    assert surviving["generation"] == replacement_generation[0]
+    assert surviving["worker_pid"] == 999
+    assert not deferred_restart_receipt_path(tmp_path).exists()
