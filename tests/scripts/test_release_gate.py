@@ -514,6 +514,72 @@ def test_evidence_first_append_rejects_hardlink_created_during_open(
     assert outside.stat().st_mode & 0o777 == original_mode
 
 
+def test_evidence_append_rejects_existing_hardlink_before_chmod_or_append(
+    repo: Path, tmp_path: Path
+) -> None:
+    manifest = tmp_path / "evidence.jsonl"
+    outside = tmp_path / "outside.jsonl"
+    outside.write_bytes(b"")
+    outside.chmod(0o640)
+    os.link(outside, manifest)
+    original_mode = outside.stat().st_mode & 0o777
+    frozen = git(repo, "rev-parse", "HEAD")
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
+
+    with pytest.raises(ValueError, match="evidence-target-hardlink"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=frozen,
+            command="tests",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+    assert outside.read_bytes() == b""
+    assert outside.stat().st_mode & 0o777 == original_mode
+
+
+def test_evidence_append_rechecks_hardlink_count_after_lock_before_mutation(
+    monkeypatch, repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    manifest.write_bytes(b"")
+    manifest.chmod(0o640)
+    outside = tmp_path / "outside.jsonl"
+    original_mode = manifest.stat().st_mode & 0o777
+    frozen = git(repo, "rev-parse", "HEAD")
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
+    real_lock = release_gate._evidence_file_lock
+
+    @contextmanager
+    def add_hardlink_after_lock(path, handle):
+        with real_lock(path, handle):
+            os.link(manifest, outside)
+            yield
+
+    monkeypatch.setattr(release_gate, "_evidence_file_lock", add_hardlink_after_lock)
+
+    with pytest.raises(ValueError, match="evidence-target-hardlink"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=frozen,
+            command="tests",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+    assert outside.read_bytes() == b""
+    assert outside.stat().st_mode & 0o777 == original_mode
+
+
 def test_evidence_append_rejects_path_replacement_after_lock(
     monkeypatch, repo: Path, tmp_path: Path
 ) -> None:

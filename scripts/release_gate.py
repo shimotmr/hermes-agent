@@ -668,6 +668,8 @@ def append_evidence(
             raise ValueError("evidence-target-symlink")
         if not stat.S_ISREG(target_status.st_mode):
             raise ValueError("evidence-target-not-regular")
+        if target_status.st_nlink != 1:
+            raise ValueError("evidence-target-hardlink")
     open_flags = os.O_RDWR | os.O_APPEND
     if target_status is None:
         open_flags |= os.O_CREAT | os.O_EXCL
@@ -686,6 +688,8 @@ def append_evidence(
         opened_status = os.fstat(descriptor)
         if not stat.S_ISREG(opened_status.st_mode):
             raise ValueError("evidence-target-not-regular")
+        if opened_status.st_nlink != 1:
+            raise ValueError("evidence-target-hardlink")
         try:
             current_status = target.lstat()
         except OSError as exc:
@@ -702,11 +706,6 @@ def append_evidence(
             or opened_status.st_ino != target_status.st_ino
         ):
             raise ValueError("evidence-target-replaced")
-        fchmod = getattr(os, "fchmod", None)
-        if fchmod is not None:
-            fchmod(descriptor, 0o600)
-        else:
-            os.chmod(target, 0o600)
         with os.fdopen(descriptor, "r+b", closefd=False) as handle:
             with _evidence_file_lock(target, handle):
                 def verify_target_identity() -> None:
@@ -721,7 +720,16 @@ def append_evidence(
                         or locked_status.st_ino != opened_status.st_ino
                     ):
                         raise ValueError("evidence-target-replaced")
+                    descriptor_status = os.fstat(handle.fileno())
+                    if descriptor_status.st_nlink != 1:
+                        raise ValueError("evidence-target-hardlink")
 
+                verify_target_identity()
+                fchmod = getattr(os, "fchmod", None)
+                if fchmod is not None:
+                    fchmod(descriptor, 0o600)
+                else:
+                    os.chmod(target, 0o600)
                 verify_target_identity()
                 handle.seek(0)
                 events = _read_evidence_bytes(handle.read(), repo=Path(repo))
