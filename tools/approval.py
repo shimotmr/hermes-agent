@@ -2495,9 +2495,21 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    declared_temp_dir = os.path.abspath(tempfile.gettempdir())
+    temp_dir = os.path.realpath(declared_temp_dir)
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    allowed_temp_dirs = {temp_dir}
+    # macOS exposes the root-owned /tmp alias at /private/tmp. Accept that
+    # fixed system alias without trusting arbitrary symlinked TMPDIRs.
+    if (
+        sys.platform == "darwin"
+        and declared_temp_dir == "/tmp"
+        and temp_dir == "/private/tmp"
+    ):
+        allowed_temp_dirs.add(declared_temp_dir)
+    if operand not in {
+        os.path.join(directory, basename) for directory in allowed_temp_dirs
+    }:
         return False
 
     target = os.path.realpath(operand)
