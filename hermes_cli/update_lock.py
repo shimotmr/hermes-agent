@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -242,25 +243,56 @@ class UpdateLock:
         the parent's marker untouched. The ancestry path exists because staged
         updaters older than the HANDOFF_PID_ENV export never send the env var.
         """
-        existing = read_live_update(path=self.path)
-        if existing is not None:
-            if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
+        for _attempt in range(3):
+            existing = read_live_update(path=self.path)
+            if existing is not None:
+                if existing.pid == _handoff_pid() or _is_ancestor_pid(existing.pid):
+                    return True
+                self.holder = existing
+                return False
+
+            temporary_path: str | None = None
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                descriptor, temporary_path = tempfile.mkstemp(
+                    prefix=f".{self.path.name}.", dir=self.path.parent
+                )
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    handle.write(f"{os.getpid()}\n{int(time.time())}\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                # Publish a complete marker with one atomic no-replace link.
+                # Exactly one simultaneous claimant can create the destination.
+                os.link(temporary_path, self.path)
+            except FileExistsError as exc:
+                if temporary_path is None:
+                    # Failure happened while preparing the private claim, not
+                    # because another claimant published the destination.
+                    logger.debug("Could not write update marker %s: %s", self.path, exc)
+                    return True
+                # Another claimant won after our live-holder probe. Re-read its
+                # complete claim rather than overwriting it.
+                continue
+            except OSError as exc:
+                # Best-effort, exactly like the Rust guard: an unwritable marker
+                # must not block the update itself (that would be a worse failure
+                # than the race it prevents). Degrade to the pre-lock behavior.
+                logger.debug("Could not write update marker %s: %s", self.path, exc)
                 return True
-            self.holder = existing
-            return False
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8"
-            )
-        except OSError as exc:
-            # Best-effort, exactly like the Rust guard: an unwritable marker
-            # must not block the update itself (that would be a worse failure
-            # than the race it prevents). Degrade to the pre-lock behavior.
-            logger.debug("Could not write update marker %s: %s", self.path, exc)
+            finally:
+                if temporary_path is not None:
+                    try:
+                        Path(temporary_path).unlink()
+                    except OSError:
+                        pass
+
+            self.acquired = True
             return True
-        self.acquired = True
-        return True
+
+        # Repeated replacement means ownership cannot be proven. Fail closed
+        # instead of allowing two update processes to mutate the checkout.
+        self.holder = read_live_update(path=self.path)
+        return False
 
     def release(self) -> None:
         """Drop the marker if this process still owns it. Never raises."""

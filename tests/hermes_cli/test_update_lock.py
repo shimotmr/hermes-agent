@@ -17,6 +17,7 @@ disk.
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 import pytest
@@ -73,6 +74,40 @@ def test_second_acquire_is_refused_while_the_first_is_live(marker):
     assert second.holder is not None
     assert second.holder.pid == os.getpid()
     assert second.acquired is False
+
+
+def test_simultaneous_claims_have_exactly_one_owner(marker, monkeypatch):
+    """Two claimants that both observe no marker must still serialize."""
+    import hermes_cli.update_lock as update_lock_module
+
+    real_read_live_update = update_lock_module.read_live_update
+    first_reads = 0
+    first_reads_lock = threading.Lock()
+    both_observed_absent = threading.Barrier(2)
+
+    def synchronized_initial_read(*, path=None):
+        nonlocal first_reads
+        with first_reads_lock:
+            first_reads += 1
+            synchronize = first_reads <= 2
+        if synchronize:
+            assert not marker.exists()
+            both_observed_absent.wait(timeout=2)
+            return None
+        return real_read_live_update(path=path)
+
+    monkeypatch.setattr(update_lock_module, "read_live_update", synchronized_initial_read)
+    locks = [UpdateLock(path=marker), UpdateLock(path=marker)]
+    results: list[bool] = []
+    threads = [threading.Thread(target=lambda lock=lock: results.append(lock.acquire())) for lock in locks]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(results) == [False, True]
 
 
 def test_refused_lock_does_not_delete_the_live_owners_marker(marker):
