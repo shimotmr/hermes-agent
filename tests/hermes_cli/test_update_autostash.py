@@ -41,6 +41,41 @@ def _patch_managed_uv(request):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_update_orchestrator(monkeypatch):
+    """Keep cmd_update tests away from live install, skill, and service state."""
+    import hermes_cli.gateway as hermes_gateway
+    import hermes_cli.profiles as profiles
+    import hermes_cli.update_inventory as update_inventory
+    import tools.skills_sync as skills_sync
+
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(hermes_main, "_capture_active_tool_dependencies", lambda: [])
+    monkeypatch.setattr(hermes_main, "_run_pre_update_backup", lambda *a, **k: None)
+    monkeypatch.setattr(hermes_main, "_finish_dashboard_update_cleanup", lambda *a, **k: None)
+    monkeypatch.setattr(update_cmd, "_editable_install_is_current", lambda *a, **k: True)
+    monkeypatch.setattr(update_cmd, "_restart_macos_launchd_gateways", lambda *a, **k: None)
+    monkeypatch.setattr(
+        update_inventory,
+        "collect_runtime_inventory",
+        lambda: SimpleNamespace(runtimes=()),
+    )
+    monkeypatch.setattr(update_inventory, "record_plan_in_receipt", lambda *a, **k: None)
+    monkeypatch.setattr(
+        skills_sync,
+        "sync_skills",
+        lambda **k: {key: [] for key in ("copied", "updated", "user_modified", "cleaned", "relocated")},
+    )
+    monkeypatch.setattr(profiles, "list_profiles", lambda: [])
+    monkeypatch.setattr(profiles, "backfill_profile_envs", lambda **k: [])
+    monkeypatch.setattr(hermes_gateway, "find_gateway_pids", lambda **k: [])
+    monkeypatch.setattr(hermes_gateway, "_get_service_pids", lambda **k: set())
+    monkeypatch.setattr(hermes_gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: [])
+    monkeypatch.setattr("hermes_cli.update_receipt.collect_fleet_versions", lambda **k: [])
+
+
 
 
 
@@ -131,6 +166,8 @@ def _make_update_side_effect(
             if fetch_fails:
                 return SimpleNamespace(stdout="", stderr=fetch_stderr, returncode=128)
             return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if "rev-parse" in joined and "^{commit}" in joined:
+            return SimpleNamespace(stdout=f"{'f' * 40}\n", stderr="", returncode=0)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
         if "checkout" in joined and "main" in joined:
