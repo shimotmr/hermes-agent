@@ -1,0 +1,29 @@
+{
+  "schema_version": "hermes.update.acceptance-matrix.v1",
+  "criteria": [
+    {
+      "id": "gateway-restart-contract",
+      "required": true,
+      "path_rules": ["gateway/", "hermes_cli/", "tests/gateway/", "tests/hermes_cli/"],
+      "status": "pending"
+    },
+    {
+      "id": "release-gate-harness",
+      "required": true,
+      "path_rules": ["scripts/release_gate.py", "docs/release-gate-critical-paths.json", "docs/update-acceptance-matrix.json", "tests/scripts/test_release_gate.py"],
+      "status": "pending"
+    },
+    {
+      "id": "dependency-integrity",
+      "required": true,
+      "path_rules": ["pyproject.toml", "requirements.txt"],
+      "status": "pending"
+    },
+    {
+      "id": "documentation",
+      "required": false,
+      "path_rules": ["docs/"],
+      "status": "pending"
+    }
+  ]
+}

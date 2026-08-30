@@ -1,0 +1,12 @@
+{
+  "schema_version": "hermes.update.critical-paths.v1",
+  "paths": [
+    "gateway/",
+    "hermes_cli/",
+    "tests/gateway/",
+    "tests/hermes_cli/",
+    "pyproject.toml",
+    "requirements.txt",
+    "run_agent.py"
+  ]
+}
