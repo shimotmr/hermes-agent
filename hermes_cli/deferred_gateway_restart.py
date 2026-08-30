@@ -45,6 +45,7 @@ class DeferredRestartIntent:
     deadline_at: float
     reason: str
     worker_pid: int | None
+    worker_start_time: int | None
     generation: str
     owner_token: str
 
@@ -82,6 +83,7 @@ def _parse_intent(payload: object) -> DeferredRestartIntent:
         "deadline_at",
         "reason",
         "worker_pid",
+        "worker_start_time",
         "generation",
         "owner_token",
     }
@@ -119,8 +121,15 @@ def _parse_intent(payload: object) -> DeferredRestartIntent:
     if not isinstance(reason, str) or _ACTIVE_WORK_RE.fullmatch(reason) is None:
         raise ValueError("intent-reason-invalid")
     worker_pid = payload.get("worker_pid")
+    worker_start_time = payload.get("worker_start_time")
     if worker_pid is not None and (type(worker_pid) is not int or worker_pid <= 0):
         raise ValueError("intent-worker-pid-invalid")
+    if worker_start_time is not None and (
+        type(worker_start_time) is not int or worker_start_time <= 0
+    ):
+        raise ValueError("intent-worker-start-invalid")
+    if (worker_pid is None) != (worker_start_time is None):
+        raise ValueError("intent-worker-identity-incomplete")
     generation = payload.get("generation")
     owner_token = payload.get("owner_token")
     if not isinstance(generation, str) or not generation:
@@ -140,6 +149,7 @@ def _parse_intent(payload: object) -> DeferredRestartIntent:
         deadline_at=float(deadline_at),
         reason=reason,
         worker_pid=worker_pid,
+        worker_start_time=worker_start_time,
         generation=generation,
         owner_token=owner_token,
     )
@@ -210,6 +220,10 @@ def _cas_write_intent(
             return False
         if current.generation != generation or current.owner_token != owner_token:
             return False
+        try:
+            deferred_restart_receipt_path(Path(str(payload["home"]))).unlink()
+        except FileNotFoundError:
+            pass
         _atomic_write_json(path, payload)
         return True
 
@@ -220,6 +234,7 @@ def _claim_worker_intent(
     generation: str,
     owner_token: str,
     worker_pid: int,
+    worker_start_time: int,
 ) -> DeferredRestartIntent | None:
     """Move only this scheduler-published worker from pending to running."""
     with _intent_lock(path):
@@ -232,6 +247,7 @@ def _claim_worker_intent(
             or current.owner_token != owner_token
             or current.state != "pending"
             or current.worker_pid != worker_pid
+            or current.worker_start_time != worker_start_time
         ):
             return None
         payload = asdict(current)
@@ -267,12 +283,21 @@ def _create_intent_if_absent(path: Path, payload: dict[str, Any]) -> bool:
     with _intent_lock(path):
         if path.exists():
             return False
+        try:
+            deferred_restart_receipt_path(Path(str(payload["home"]))).unlink()
+        except FileNotFoundError:
+            pass
         _atomic_write_json(path, payload)
         return True
 
 
 def _publish_spawned_worker(
-    path: Path, *, generation: str, owner_token: str, worker_pid: int
+    path: Path,
+    *,
+    generation: str,
+    owner_token: str,
+    worker_pid: int,
+    worker_start_time: int,
 ) -> bool:
     """Publish a spawned PID without regressing a worker's running claim."""
     with _intent_lock(path):
@@ -288,6 +313,7 @@ def _publish_spawned_worker(
             return False
         payload = asdict(current)
         payload["worker_pid"] = worker_pid
+        payload["worker_start_time"] = worker_start_time
         _atomic_write_json(path, payload)
         return True
 
@@ -298,6 +324,16 @@ def _process_alive(pid: int) -> bool:
     except (OSError, ValueError):
         return False
     return True
+
+
+def _process_start_time(pid: int) -> int | None:
+    try:
+        import psutil
+
+        value = int(psutil.Process(pid).create_time() * 1_000_000)
+    except Exception:
+        return None
+    return value if value > 0 else None
 
 
 def _spawn_worker(argv: list[str]) -> int:
@@ -321,6 +357,7 @@ def schedule_deferred_restart(
     reason: str,
     spawn: Callable[[list[str]], int] = _spawn_worker,
     process_alive: Callable[[int], bool] = _process_alive,
+    process_start_time: Callable[[int], int | None] = _process_start_time,
     now: Callable[[], float] = time.time,
     timeout: float = 3600.0,
 ) -> ScheduleResult:
@@ -357,7 +394,13 @@ def schedule_deferred_restart(
             and current.old_pid == old_identity.pid
             and current.old_start_time == old_identity.start_time
         )
-        if current.worker_pid is not None and process_alive(current.worker_pid):
+        worker_identity_matches = (
+            current.worker_pid is not None
+            and current.worker_start_time is not None
+            and process_alive(current.worker_pid)
+            and process_start_time(current.worker_pid) == current.worker_start_time
+        )
+        if worker_identity_matches:
             if current.state == "restarting" or (
                 same_target and current.deadline_at > created_at
             ):
@@ -385,6 +428,7 @@ def schedule_deferred_restart(
         "deadline_at": created_at + float(timeout),
         "reason": reason,
         "worker_pid": None,
+        "worker_start_time": None,
         "generation": uuid.uuid4().hex,
         "owner_token": uuid.uuid4().hex,
     }
@@ -416,11 +460,15 @@ def schedule_deferred_restart(
         return ScheduleResult(False, "worker-spawn-failed", path)
     if type(worker_pid) is not int or worker_pid <= 0:
         return ScheduleResult(False, "worker-pid-invalid", path)
+    worker_start_time = process_start_time(worker_pid)
+    if type(worker_start_time) is not int or worker_start_time <= 0:
+        return ScheduleResult(False, "worker-identity-invalid", path)
     if not _publish_spawned_worker(
         path,
         generation=str(payload["generation"]),
         owner_token=str(payload["owner_token"]),
         worker_pid=worker_pid,
+        worker_start_time=worker_start_time,
     ):
         return ScheduleResult(False, "intent-replaced-after-spawn", path)
     return ScheduleResult(True, "worker-replaced" if replacement else "scheduled", path)
@@ -451,6 +499,8 @@ def _terminal_payload(
         "control_health": "verified" if success else "unverified",
         "http_health": "verified" if success else "unverified",
         "finished_at": float(finished_at),
+        "generation": intent.generation,
+        "owner_token": intent.owner_token,
     }
 
 
@@ -461,9 +511,13 @@ def _validate_receipt(payload: object) -> dict[str, Any]:
         "schema", "state", "reason", "home", "port", "expected_sha",
         "serving_sha", "old_pid", "old_start_time", "new_pid",
         "new_start_time", "listener_owner_pid", "control_health",
-        "http_health", "finished_at",
+        "http_health", "finished_at", "generation", "owner_token",
     }
-    if set(payload) != required or payload.get("schema") != 1:
+    if (
+        set(payload) != required
+        or type(payload.get("schema")) is not int
+        or payload.get("schema") != 1
+    ):
         raise ValueError("receipt-shape-invalid")
     if payload.get("state") not in {"completed", "failed", "expired"}:
         raise ValueError("receipt-state-invalid")
@@ -475,8 +529,17 @@ def _validate_receipt(payload: object) -> dict[str, Any]:
         raise ValueError("receipt-port-invalid")
     if not isinstance(payload.get("expected_sha"), str) or not _SHA_RE.fullmatch(payload["expected_sha"]):
         raise ValueError("receipt-expected-sha-invalid")
-    if type(payload.get("old_pid")) is not int or type(payload.get("old_start_time")) is not int:
+    if (
+        type(payload.get("old_pid")) is not int
+        or payload["old_pid"] <= 0
+        or type(payload.get("old_start_time")) is not int
+        or payload["old_start_time"] <= 0
+    ):
         raise ValueError("receipt-old-identity-invalid")
+    if not isinstance(payload.get("generation"), str) or not payload["generation"]:
+        raise ValueError("receipt-generation-invalid")
+    if not isinstance(payload.get("owner_token"), str) or not payload["owner_token"]:
+        raise ValueError("receipt-owner-invalid")
     if not _is_number(payload.get("finished_at")):
         raise ValueError("receipt-time-invalid")
     if payload["state"] == "completed":
@@ -494,14 +557,24 @@ def _validate_receipt(payload: object) -> dict[str, Any]:
     else:
         if any(payload.get(key) is not None for key in ("serving_sha", "new_pid", "new_start_time", "listener_owner_pid")):
             raise ValueError("receipt-failure-claims-replacement")
+        if (
+            payload.get("control_health") != "unverified"
+            or payload.get("http_health") != "unverified"
+        ):
+            raise ValueError("receipt-failure-health-invalid")
     return dict(payload)
 
 
-def read_deferred_restart_receipt(home: Path) -> dict[str, Any] | None:
+def read_deferred_restart_receipt(
+    home: Path, *, expected_generation: str
+) -> dict[str, Any] | None:
     try:
-        return _validate_receipt(
+        receipt = _validate_receipt(
             json.loads(deferred_restart_receipt_path(home).read_text(encoding="utf-8"))
         )
+        if receipt["generation"] != expected_generation:
+            return None
+        return receipt
     except Exception:
         return None
 
@@ -551,6 +624,7 @@ def run_deferred_restart(
     now: Callable[[], float] = time.time,
     sleep: Callable[[float], Any] = time.sleep,
     poll_interval: float = 2.0,
+    process_start_time: Callable[[int], int | None] = _process_start_time,
 ) -> int:
     """Wait for verified idle authority, then execute the existing restart contract."""
     try:
@@ -562,12 +636,16 @@ def run_deferred_restart(
     if intent_path.is_symlink() or supplied_path != canonical_path:
         return 1
     intent = None
+    worker_start_time = process_start_time(os.getpid())
+    if type(worker_start_time) is not int or worker_start_time <= 0:
+        return 1
     for _attempt in range(500):
         intent = _claim_worker_intent(
             intent_path,
             generation=generation,
             owner_token=owner_token,
             worker_pid=os.getpid(),
+            worker_start_time=worker_start_time,
         )
         if intent is not None:
             break
@@ -625,9 +703,16 @@ def run_deferred_restart(
             claim_time = float(now())
             if not _claim_restart_authority(intent_path, intent, now=claim_time):
                 return 1
-            replacement = restart(_read_intent(intent_path))
+            try:
+                replacement = restart(_read_intent(intent_path))
+            except Exception as exc:
+                replacement = None
+                failure_reason = f"restart-failed:{type(exc).__name__}"
+            else:
+                failure_reason = "restart-result-invalid"
             if (
-                replacement.ready
+                isinstance(replacement, RestartProbe)
+                and replacement.ready
                 and replacement.identity is not None
                 and (replacement.identity.pid, replacement.identity.start_time) != old_tuple
                 and replacement.identity.code_sha == intent.expected_sha
@@ -641,7 +726,11 @@ def run_deferred_restart(
                 intent_path,
                 intent,
                 state="failed",
-                reason=replacement.reason if isinstance(replacement, RestartProbe) else "restart-result-invalid",
+                reason=(
+                    replacement.reason
+                    if isinstance(replacement, RestartProbe)
+                    else failure_reason
+                ),
                 finished_at=float(now()),
             )
             return 1

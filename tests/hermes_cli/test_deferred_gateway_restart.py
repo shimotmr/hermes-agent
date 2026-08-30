@@ -11,7 +11,7 @@ from hermes_cli.deferred_gateway_restart import (
     deferred_restart_receipt_path,
     read_deferred_restart_receipt,
     run_deferred_restart as _run_deferred_restart,
-    schedule_deferred_restart,
+    schedule_deferred_restart as _schedule_deferred_restart,
 )
 from hermes_cli.gateway_restart_contract import RestartProbe, ServingIdentity
 
@@ -27,6 +27,12 @@ class Clock:
         self.value += seconds
 
 
+def schedule_deferred_restart(**kwargs):
+    """Give fake worker PIDs stable identities unless a test overrides them."""
+    kwargs.setdefault("process_start_time", lambda pid: pid * 10)
+    return _schedule_deferred_restart(**kwargs)
+
+
 def identity(home: Path, *, pid: int = 100, start: int = 200, sha: str = "old") -> ServingIdentity:
     return ServingIdentity(pid, start, home, sha)
 
@@ -36,11 +42,13 @@ def run_deferred_restart(intent_path: Path, **kwargs) -> int:
     payload = json.loads(intent_path.read_text(encoding="utf-8"))
     if payload.get("state") == "pending":
         payload["worker_pid"] = os.getpid()
+        payload["worker_start_time"] = os.getpid() * 10
         intent_path.write_text(json.dumps(payload), encoding="utf-8")
     return _run_deferred_restart(
         intent_path,
         generation=payload["generation"],
         owner_token=payload["owner_token"],
+        process_start_time=lambda pid: pid * 10,
         **kwargs,
     )
 
@@ -121,6 +129,7 @@ def test_schedule_writes_atomic_intent_and_spawns_worker(tmp_path: Path) -> None
         "deadline_at": 1_600.0,
         "reason": "active-work:2",
         "worker_pid": 321,
+        "worker_start_time": 3210,
     }
     assert not list(deferred_restart_intent_path(tmp_path).parent.glob("*.tmp"))
 
@@ -189,6 +198,7 @@ def test_scheduler_does_not_overwrite_worker_that_claims_intent_during_spawn(
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["state"] = "running"
         payload["worker_pid"] = 777
+        payload["worker_start_time"] = 7770
         path.write_text(json.dumps(payload), encoding="utf-8")
         return 321
 
@@ -272,6 +282,7 @@ def test_worker_waits_for_active_work_then_records_verified_replacement(tmp_path
         now=clock.now,
         timeout=60.0,
     )
+    intent_payload = json.loads(deferred_restart_intent_path(tmp_path).read_text())
     probes = iter(
         [
             RestartProbe(False, "active-work:1", old),
@@ -293,7 +304,9 @@ def test_worker_waits_for_active_work_then_records_verified_replacement(tmp_path
 
     assert exit_code == 0
     assert len(restart_calls) == 1
-    receipt = read_deferred_restart_receipt(tmp_path)
+    receipt = read_deferred_restart_receipt(
+        tmp_path, expected_generation=intent_payload["generation"]
+    )
     assert receipt == {
         "schema": 1,
         "state": "completed",
@@ -310,6 +323,8 @@ def test_worker_waits_for_active_work_then_records_verified_replacement(tmp_path
         "control_health": "verified",
         "http_health": "verified",
         "finished_at": 1_002.0,
+        "generation": intent_payload["generation"],
+        "owner_token": intent_payload["owner_token"],
     }
     assert not deferred_restart_intent_path(tmp_path).exists()
     assert deferred_restart_receipt_path(tmp_path).is_file()
@@ -327,6 +342,7 @@ def test_worker_fails_closed_on_unknown_authority_without_restart(tmp_path: Path
         spawn=lambda _argv: 321,
         now=clock.now,
     )
+    generation = json.loads(deferred_restart_intent_path(tmp_path).read_text())["generation"]
     restart_calls: list[object] = []
 
     exit_code = run_deferred_restart(
@@ -340,7 +356,7 @@ def test_worker_fails_closed_on_unknown_authority_without_restart(tmp_path: Path
 
     assert exit_code == 1
     assert restart_calls == []
-    receipt = read_deferred_restart_receipt(tmp_path)
+    receipt = read_deferred_restart_receipt(tmp_path, expected_generation=generation)
     assert receipt is not None
     assert receipt["state"] == "failed"
     assert receipt["reason"] == "active-work-unknown"
@@ -361,6 +377,7 @@ def test_worker_expires_without_restart(tmp_path: Path) -> None:
         timeout=1.0,
     )
 
+    generation = json.loads(deferred_restart_intent_path(tmp_path).read_text())["generation"]
     exit_code = run_deferred_restart(
         deferred_restart_intent_path(tmp_path),
         probe=lambda _intent: RestartProbe(False, "active-work:1", old),
@@ -371,7 +388,7 @@ def test_worker_expires_without_restart(tmp_path: Path) -> None:
     )
 
     assert exit_code == 1
-    receipt = read_deferred_restart_receipt(tmp_path)
+    receipt = read_deferred_restart_receipt(tmp_path, expected_generation=generation)
     assert receipt is not None
     assert receipt["state"] == "expired"
     assert receipt["reason"] == "deadline-exceeded"
@@ -544,6 +561,7 @@ def test_worker_waits_for_parent_to_publish_its_pid(tmp_path: Path) -> None:
     path = deferred_restart_intent_path(tmp_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["worker_pid"] = None
+    payload["worker_start_time"] = None
     path.write_text(json.dumps(payload), encoding="utf-8")
     published = False
 
@@ -551,6 +569,7 @@ def test_worker_waits_for_parent_to_publish_its_pid(tmp_path: Path) -> None:
         nonlocal published
         current = json.loads(path.read_text(encoding="utf-8"))
         current["worker_pid"] = os.getpid()
+        current["worker_start_time"] = os.getpid() * 10
         path.write_text(json.dumps(current), encoding="utf-8")
         published = True
 
@@ -562,7 +581,122 @@ def test_worker_waits_for_parent_to_publish_its_pid(tmp_path: Path) -> None:
         restart=lambda _intent: RestartProbe(True, "replacement-healthy", new),
         now=lambda: 1_000.0,
         sleep=publish_pid,
+        process_start_time=lambda pid: pid * 10,
     )
 
     assert exit_code == 0
     assert published is True
+
+
+@pytest.mark.parametrize("restart_result", [None, object()])
+def test_restart_adapter_invalid_result_writes_failed_terminal_receipt(
+    tmp_path: Path, restart_result: object
+) -> None:
+    old = identity(tmp_path)
+    result = schedule_deferred_restart(
+        home=tmp_path, port=8642, expected_sha="a" * 40, old_identity=old,
+        reason="active-work:1", spawn=lambda _argv: os.getpid(), now=lambda: 1_000.0,
+    )
+    generation = json.loads(result.path.read_text())["generation"]
+
+    assert run_deferred_restart(
+        result.path, probe=lambda _intent: RestartProbe(True, "idle", old),
+        restart=lambda _intent: restart_result, now=lambda: 1_001.0,
+    ) == 1
+    receipt = read_deferred_restart_receipt(tmp_path, expected_generation=generation)
+    assert receipt is not None
+    assert receipt["state"] == "failed"
+    assert receipt["reason"] == "restart-result-invalid"
+
+
+def test_restart_adapter_exception_writes_failed_terminal_receipt(tmp_path: Path) -> None:
+    old = identity(tmp_path)
+    result = schedule_deferred_restart(
+        home=tmp_path, port=8642, expected_sha="a" * 40, old_identity=old,
+        reason="active-work:1", spawn=lambda _argv: os.getpid(), now=lambda: 1_000.0,
+    )
+    generation = json.loads(result.path.read_text())["generation"]
+
+    def explode(_intent):
+        raise RuntimeError("adapter failed")
+
+    assert run_deferred_restart(
+        result.path, probe=lambda _intent: RestartProbe(True, "idle", old),
+        restart=explode, now=lambda: 1_001.0,
+    ) == 1
+    receipt = read_deferred_restart_receipt(tmp_path, expected_generation=generation)
+    assert receipt is not None
+    assert receipt["state"] == "failed"
+    assert receipt["reason"] == "restart-failed:RuntimeError"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema", True), ("old_pid", 0), ("old_pid", -1),
+        ("old_start_time", 0), ("old_start_time", -1),
+        ("control_health", True), ("control_health", "verified"),
+        ("http_health", "unknown"),
+    ],
+)
+def test_receipt_rejects_malformed_schema_identity_and_failure_health(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    generation = "generation-one"
+    payload = {
+        "schema": 1, "state": "failed", "reason": "restart-result-invalid",
+        "home": str(tmp_path.resolve()), "port": 8642, "expected_sha": "a" * 40,
+        "serving_sha": None, "old_pid": 100, "old_start_time": 200,
+        "new_pid": None, "new_start_time": None, "listener_owner_pid": None,
+        "control_health": "unverified", "http_health": "unverified",
+        "finished_at": 1_001.0, "generation": generation, "owner_token": "owner-one",
+    }
+    payload[field] = value
+    path = deferred_restart_receipt_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert read_deferred_restart_receipt(tmp_path, expected_generation=generation) is None
+
+
+def test_new_generation_cannot_read_stale_receipt(tmp_path: Path) -> None:
+    old = identity(tmp_path)
+    first = schedule_deferred_restart(
+        home=tmp_path, port=8642, expected_sha="a" * 40, old_identity=old,
+        reason="active-work:1", spawn=lambda _argv: os.getpid(), now=lambda: 1_000.0,
+    )
+    first_generation = json.loads(first.path.read_text())["generation"]
+    assert run_deferred_restart(
+        first.path, probe=lambda _intent: RestartProbe(False, "active-work-unknown", old),
+        restart=lambda _intent: pytest.fail("restart must not run"), now=lambda: 1_001.0,
+    ) == 1
+    assert read_deferred_restart_receipt(tmp_path, expected_generation=first_generation) is not None
+
+    second = schedule_deferred_restart(
+        home=tmp_path, port=8642, expected_sha="a" * 40, old_identity=old,
+        reason="active-work:1", spawn=lambda _argv: 999, now=lambda: 1_002.0,
+    )
+    second_generation = json.loads(second.path.read_text())["generation"]
+    assert second_generation != first_generation
+    assert read_deferred_restart_receipt(tmp_path, expected_generation=second_generation) is None
+
+
+def test_reused_worker_pid_does_not_count_as_same_live_worker(tmp_path: Path) -> None:
+    old = identity(tmp_path)
+    first = schedule_deferred_restart(
+        home=tmp_path, port=8642, expected_sha="a" * 40, old_identity=old,
+        reason="active-work:1", spawn=lambda _argv: 321,
+        process_start_time=lambda _pid: 10, now=lambda: 1_000.0,
+    )
+    assert first.scheduled
+
+    second = schedule_deferred_restart(
+        home=tmp_path, port=8642, expected_sha="a" * 40, old_identity=old,
+        reason="active-work:1", spawn=lambda _argv: 999,
+        process_start_time=lambda pid: 20 if pid == 321 else 30, now=lambda: 1_001.0,
+    )
+    assert second.scheduled
+    assert second.reason == "worker-replaced"
+    payload = json.loads(second.path.read_text())
+    assert payload["worker_pid"] == 999
+    assert payload["worker_start_time"] == 30
