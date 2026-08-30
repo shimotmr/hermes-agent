@@ -992,9 +992,8 @@ def _ensure_current_event_loop(request):
 #    a hard ``RuntimeError`` so the offending test gets a stack trace
 #    instead of silently murdering the real gateway.
 #  • ``subprocess.run`` / ``subprocess.Popen`` / ``call`` / ``check_call`` /
-#    ``check_output`` reject any ``systemctl ... <verb> hermes-gateway``
-#    invocation that would mutate the live unit. Read-only systemctl
-#    calls (``status``, ``show``, ``list-units``) still pass through.
+#    ``check_output`` reject any systemctl or launchctl invocation that would
+#    mutate a Hermes Gateway service. Read-only status/print/list calls pass.
 #
 # We intentionally do NOT stub ``find_gateway_pids`` / ``_scan_gateway_pids``
 # here — tests of those functions themselves need the real implementation.
@@ -1293,7 +1292,7 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
 
 @pytest.fixture(autouse=True)
 def _live_system_guard(request, monkeypatch):
-    """Block real os.kill / systemctl / gateway-pid scans during tests.
+    """Block real os.kill / service mutation / gateway-pid scans during tests.
 
     See block comment above for the why. Tests that genuinely need
     real signal delivery (e.g. PTY tests that SIGINT their own child)
@@ -1412,6 +1411,7 @@ def _live_system_guard(request, monkeypatch):
     _HERMES_TOKENS = (
         "hermes-gateway",
         "hermes.service",
+        "ai.hermes.gateway",
         "hermes_cli.main gateway",
         "hermes_cli/main.py gateway",
         "gateway/run.py",
@@ -1421,6 +1421,10 @@ def _live_system_guard(request, monkeypatch):
         "restart", "start", "stop", "kill", "reload",
         "reset-failed", "enable", "disable", "mask", "unmask",
         "daemon-reload", "try-restart", "reload-or-restart",
+    )
+    _LAUNCHCTL_MUTATING_VERBS = (
+        "bootstrap", "bootout", "disable", "enable", "kickstart", "kill",
+        "load", "remove", "restart", "start", "stop", "submit", "unload",
     )
     _PROCESS_KILLERS = ("pkill", "killall", "taskkill", "skill", "fuser")
     # Shell/launcher executables whose arguments are themselves commands —
@@ -1463,6 +1467,18 @@ def _live_system_guard(request, monkeypatch):
             tokens = cmd_str.split()
         return any(verb in tokens for verb in _MUTATING_VERBS)
 
+    def _is_blocked_launchctl(cmd) -> bool:
+        cmd_str = _cmd_to_string(cmd)
+        if "launchctl" not in cmd_str.lower():
+            return False
+        if not _matches_hermes_gateway(cmd_str):
+            return False
+        try:
+            tokens = _shlex.split(cmd_str)
+        except ValueError:
+            tokens = cmd_str.split()
+        return any(verb in tokens for verb in _LAUNCHCTL_MUTATING_VERBS)
+
     def _is_process_killer(cmd) -> bool:
         cmd_str = _cmd_to_string(cmd)
         try:
@@ -1504,6 +1520,14 @@ def _live_system_guard(request, monkeypatch):
                 "live hermes-gateway systemd unit. Mock "
                 "subprocess.run / _run_systemctl in the test, or "
                 "mark with @pytest.mark.live_system_guard_bypass."
+            )
+        if _is_blocked_launchctl(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — would mutate the live "
+                "Hermes Gateway launchd job. Mock subprocess/service adapters "
+                "in the test, or mark with "
+                "@pytest.mark.live_system_guard_bypass."
             )
         if _is_process_killer(cmd):
             raise RuntimeError(
