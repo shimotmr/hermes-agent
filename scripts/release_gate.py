@@ -114,21 +114,10 @@ def _exclusive_file_lock(
         if windows_lock_module is None:
             import msvcrt as windows_lock_module
 
-        handle.seek(0, os.SEEK_END)
-        was_empty = handle.tell() == 0
-        if was_empty:
-            handle.write(b"\n")
-            handle.flush()
         handle.seek(0)
         windows_lock_module.locking(
             handle.fileno(), windows_lock_module.LK_LOCK, 1
         )
-        if was_empty:
-            handle.seek(0)
-            contents_after_lock = handle.read()
-            if contents_after_lock and not contents_after_lock.strip(b"\n"):
-                handle.seek(0)
-                handle.truncate(0)
         try:
             yield
         finally:
@@ -144,6 +133,34 @@ def _exclusive_file_lock(
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _evidence_lock_path(target: Path, *, is_windows: bool | None = None) -> Path:
+    """Keep Windows' mandatory lock byte outside the JSONL manifest."""
+    use_sidecar = os.name == "nt" if is_windows is None else is_windows
+    return target.with_name(f"{target.name}.lock") if use_sidecar else target
+
+
+@contextmanager
+def _evidence_file_lock(target: Path, manifest_handle):
+    lock_target = _evidence_lock_path(target)
+    if lock_target == target:
+        with _exclusive_file_lock(manifest_handle):
+            yield
+        return
+
+    descriptor = os.open(lock_target, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        with os.fdopen(descriptor, "r+b", closefd=False) as lock_handle:
+            lock_handle.seek(0, os.SEEK_END)
+            if lock_handle.tell() == 0:
+                lock_handle.write(b"\0")
+                lock_handle.flush()
+                os.fsync(lock_handle.fileno())
+            with _exclusive_file_lock(lock_handle):
+                yield
+    finally:
+        os.close(descriptor)
 
 
 def _changed_paths(repo: Path, old_sha: str, new_sha: str) -> tuple[str, ...]:
@@ -254,6 +271,13 @@ def classify_overlap(
             raise ValueError("critical-paths-empty")
         if not _is_sha(from_sha) or not _is_sha(latest_sha):
             raise ValueError("git-diff-failed:sha-invalid")
+        for sha in (from_sha, latest_sha):
+            try:
+                resolved = _git_text(Path(repo), "rev-parse", f"{sha}^{{commit}}")
+            except ValueError as exc:
+                raise ValueError(f"git-diff-failed:{exc}") from exc
+            if resolved != sha:
+                raise ValueError("git-diff-failed:commit-invalid")
         if from_sha == latest_sha:
             return OverlapReport(
                 _SCHEMA_OVERLAP,
@@ -569,7 +593,7 @@ def append_evidence(
         else:
             os.chmod(target, 0o600)
         with os.fdopen(descriptor, "r+b", closefd=False) as handle:
-            with _exclusive_file_lock(handle):
+            with _evidence_file_lock(target, handle):
                 handle.seek(0)
                 events = _read_evidence_bytes(handle.read(), repo=Path(repo))
                 snapshot_payload = asdict(snapshot)

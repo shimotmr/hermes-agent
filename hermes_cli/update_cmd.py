@@ -588,7 +588,7 @@ def _reset_hard_if_head_matches(
         errors="replace",
     )
     checkout = subprocess.run(
-        git_cmd + ["checkout", "-f", branch],
+        git_cmd + ["checkout", branch],
         cwd=cwd,
         capture_output=True,
         text=True,

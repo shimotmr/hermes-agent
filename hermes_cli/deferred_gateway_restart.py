@@ -214,6 +214,32 @@ def _cas_write_intent(
         return True
 
 
+def _claim_worker_intent(
+    path: Path,
+    *,
+    generation: str,
+    owner_token: str,
+    worker_pid: int,
+) -> DeferredRestartIntent | None:
+    """Move only this scheduler-published worker from pending to running."""
+    with _intent_lock(path):
+        try:
+            current = _read_intent(path)
+        except Exception:
+            return None
+        if (
+            current.generation != generation
+            or current.owner_token != owner_token
+            or current.state != "pending"
+            or current.worker_pid != worker_pid
+        ):
+            return None
+        payload = asdict(current)
+        payload["state"] = "running"
+        _atomic_write_json(path, payload)
+        return _parse_intent(payload)
+
+
 def _claim_restart_authority(
     path: Path, intent: DeferredRestartIntent, *, now: float
 ) -> bool:
@@ -373,7 +399,17 @@ def schedule_deferred_restart(
     else:
         if not _create_intent_if_absent(path, payload):
             return ScheduleResult(False, "intent-created-concurrently", path)
-    argv = [sys.executable, "-m", "hermes_cli.deferred_gateway_restart", "--intent", str(path)]
+    argv = [
+        sys.executable,
+        "-m",
+        "hermes_cli.deferred_gateway_restart",
+        "--intent",
+        str(path),
+        "--generation",
+        str(payload["generation"]),
+        "--owner-token",
+        str(payload["owner_token"]),
+    ]
     try:
         worker_pid = spawn(argv)
     except Exception:
@@ -508,6 +544,8 @@ def _write_terminal(
 def run_deferred_restart(
     intent_path: Path,
     *,
+    generation: str,
+    owner_token: str,
     probe: Callable[[DeferredRestartIntent], RestartProbe],
     restart: Callable[[DeferredRestartIntent], RestartProbe],
     now: Callable[[], float] = time.time,
@@ -523,17 +561,30 @@ def run_deferred_restart(
     supplied_path = Path(os.path.abspath(intent_path))
     if intent_path.is_symlink() or supplied_path != canonical_path:
         return 1
-    running = asdict(intent)
-    running["state"] = "running"
-    running["worker_pid"] = os.getpid()
-    if not _cas_write_intent(
-        intent_path,
-        generation=intent.generation,
-        owner_token=intent.owner_token,
-        payload=running,
-    ):
+    intent = None
+    for _attempt in range(500):
+        intent = _claim_worker_intent(
+            intent_path,
+            generation=generation,
+            owner_token=owner_token,
+            worker_pid=os.getpid(),
+        )
+        if intent is not None:
+            break
+        try:
+            waiting = _read_intent(intent_path)
+        except Exception:
+            return 1
+        if (
+            waiting.generation != generation
+            or waiting.owner_token != owner_token
+            or waiting.state != "pending"
+            or waiting.worker_pid is not None
+        ):
+            return 1
+        sleep(0.01)
+    if intent is None:
         return 1
-    intent = _parse_intent(running)
 
     while True:
         current_time = float(now())
@@ -571,7 +622,8 @@ def run_deferred_restart(
                     finished_at=current_time,
                 )
                 return 1
-            if not _claim_restart_authority(intent_path, intent, now=current_time):
+            claim_time = float(now())
+            if not _claim_restart_authority(intent_path, intent, now=claim_time):
                 return 1
             replacement = restart(_read_intent(intent_path))
             if (
@@ -649,9 +701,13 @@ def _default_restart(intent: DeferredRestartIntent) -> RestartProbe:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--intent", type=Path, required=True)
+    parser.add_argument("--generation", required=True)
+    parser.add_argument("--owner-token", required=True)
     args = parser.parse_args(argv)
     return run_deferred_restart(
         args.intent,
+        generation=args.generation,
+        owner_token=args.owner_token,
         probe=_default_probe,
         restart=_default_restart,
     )

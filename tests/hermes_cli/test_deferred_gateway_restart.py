@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,7 @@ from hermes_cli.deferred_gateway_restart import (
     deferred_restart_intent_path,
     deferred_restart_receipt_path,
     read_deferred_restart_receipt,
-    run_deferred_restart,
+    run_deferred_restart as _run_deferred_restart,
     schedule_deferred_restart,
 )
 from hermes_cli.gateway_restart_contract import RestartProbe, ServingIdentity
@@ -28,6 +29,20 @@ class Clock:
 
 def identity(home: Path, *, pid: int = 100, start: int = 200, sha: str = "old") -> ServingIdentity:
     return ServingIdentity(pid, start, home, sha)
+
+
+def run_deferred_restart(intent_path: Path, **kwargs) -> int:
+    """Run the scheduled worker as the PID published by the parent fixture."""
+    payload = json.loads(intent_path.read_text(encoding="utf-8"))
+    if payload.get("state") == "pending":
+        payload["worker_pid"] = os.getpid()
+        intent_path.write_text(json.dumps(payload), encoding="utf-8")
+    return _run_deferred_restart(
+        intent_path,
+        generation=payload["generation"],
+        owner_token=payload["owner_token"],
+        **kwargs,
+    )
 
 
 @pytest.mark.parametrize(
@@ -82,8 +97,15 @@ def test_schedule_writes_atomic_intent_and_spawns_worker(tmp_path: Path) -> None
     assert result.scheduled is True
     assert result.reason == "scheduled"
     assert len(spawned) == 1
-    assert spawned[0][-2:] == ["--intent", str(deferred_restart_intent_path(tmp_path))]
     payload = json.loads(deferred_restart_intent_path(tmp_path).read_text())
+    assert spawned[0][-6:] == [
+        "--intent",
+        str(deferred_restart_intent_path(tmp_path)),
+        "--generation",
+        payload["generation"],
+        "--owner-token",
+        payload["owner_token"],
+    ]
     assert isinstance(payload.pop("generation"), str)
     assert isinstance(payload.pop("owner_token"), str)
     assert payload == {
@@ -310,7 +332,8 @@ def test_worker_fails_closed_on_unknown_authority_without_restart(tmp_path: Path
     exit_code = run_deferred_restart(
         deferred_restart_intent_path(tmp_path),
         probe=lambda _intent: RestartProbe(False, "active-work-unknown", old),
-        restart=lambda intent: restart_calls.append(intent),
+        restart=lambda intent: restart_calls.append(intent)
+        or RestartProbe(False, "unexpected-restart", old),
         now=clock.now,
         sleep=clock.sleep,
     )
@@ -439,3 +462,107 @@ def test_worker_losing_authority_during_ready_probe_cannot_restart(tmp_path: Pat
 
     assert exit_code == 1
     assert restart_calls == []
+
+
+def test_second_worker_cannot_regress_restarting_intent_to_running(
+    tmp_path: Path,
+) -> None:
+    old = identity(tmp_path)
+    schedule_deferred_restart(
+        home=tmp_path,
+        port=8642,
+        expected_sha="a" * 40,
+        old_identity=old,
+        reason="active-work:1",
+        spawn=lambda _argv: os.getpid(),
+        now=lambda: 1_000.0,
+    )
+    path = deferred_restart_intent_path(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["state"] = "restarting"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    restart_calls: list[object] = []
+
+    exit_code = run_deferred_restart(
+        path,
+        probe=lambda _intent: RestartProbe(True, "idle", old),
+        restart=lambda intent: restart_calls.append(intent)
+        or RestartProbe(False, "unexpected-restart", old),
+        now=lambda: 1_001.0,
+    )
+
+    assert exit_code == 1
+    assert restart_calls == []
+    assert json.loads(path.read_text(encoding="utf-8"))["state"] == "restarting"
+
+
+def test_worker_rechecks_deadline_after_ready_probe_before_restart(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    old = identity(tmp_path)
+    schedule_deferred_restart(
+        home=tmp_path,
+        port=8642,
+        expected_sha="a" * 40,
+        old_identity=old,
+        reason="active-work:1",
+        spawn=lambda _argv: os.getpid(),
+        now=clock.now,
+        timeout=1.0,
+    )
+    restart_calls: list[object] = []
+
+    def probe_after_deadline(_intent):
+        clock.value = 1_002.0
+        return RestartProbe(True, "idle", old)
+
+    exit_code = run_deferred_restart(
+        deferred_restart_intent_path(tmp_path),
+        probe=probe_after_deadline,
+        restart=lambda intent: restart_calls.append(intent)
+        or RestartProbe(False, "unexpected-restart", old),
+        now=clock.now,
+    )
+
+    assert exit_code == 1
+    assert restart_calls == []
+
+
+def test_worker_waits_for_parent_to_publish_its_pid(tmp_path: Path) -> None:
+    old = identity(tmp_path)
+    new = identity(tmp_path, pid=101, start=201, sha="a" * 40)
+    schedule_deferred_restart(
+        home=tmp_path,
+        port=8642,
+        expected_sha="a" * 40,
+        old_identity=old,
+        reason="active-work:1",
+        spawn=lambda _argv: os.getpid(),
+        now=lambda: 1_000.0,
+    )
+    path = deferred_restart_intent_path(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["worker_pid"] = None
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    published = False
+
+    def publish_pid(_seconds: float) -> None:
+        nonlocal published
+        current = json.loads(path.read_text(encoding="utf-8"))
+        current["worker_pid"] = os.getpid()
+        path.write_text(json.dumps(current), encoding="utf-8")
+        published = True
+
+    exit_code = _run_deferred_restart(
+        path,
+        generation=payload["generation"],
+        owner_token=payload["owner_token"],
+        probe=lambda _intent: RestartProbe(True, "idle", old),
+        restart=lambda _intent: RestartProbe(True, "replacement-healthy", new),
+        now=lambda: 1_000.0,
+        sleep=publish_pid,
+    )
+
+    assert exit_code == 0
+    assert published is True

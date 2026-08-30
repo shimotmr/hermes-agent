@@ -184,3 +184,67 @@ def test_destructive_reset_refuses_when_head_advanced_after_observation(
     assert result.returncode != 0
     assert git(repo, "rev-parse", "HEAD") == raced
     assert (repo / "local.txt").read_text() == "local\n"
+
+
+def _reset_race_repo(tmp_path: Path) -> tuple[Path, Path, str, str]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.name", "Updater Test")
+    git(repo, "config", "user.email", "updater@example.invalid")
+    tracked = repo / "tracked.txt"
+    tracked.write_text("base\n", encoding="utf-8")
+    git(repo, "add", "tracked.txt")
+    git(repo, "commit", "-m", "base")
+    observed = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "--detach", observed)
+    tracked.write_text("target\n", encoding="utf-8")
+    git(repo, "commit", "-am", "target")
+    target = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "main")
+    return repo, tracked, observed, target
+
+
+def test_destructive_reset_preserves_edit_created_when_ref_cas_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo, tracked, observed, target = _reset_race_repo(tmp_path)
+    real_run = subprocess.run
+
+    def fail_ref_cas(cmd, *args, **kwargs):
+        if "update-ref" in cmd:
+            tracked.write_text("raced edit\n", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 1, "", "ref raced")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", fail_ref_cas)
+
+    result = update_cmd._reset_hard_if_head_matches(
+        ["git"], repo, target, expected_head=observed
+    )
+
+    assert result.returncode != 0
+    assert tracked.read_text(encoding="utf-8") == "raced edit\n"
+    assert git(repo, "rev-parse", "main") == observed
+
+
+def test_destructive_reset_preserves_edit_racing_successful_ref_cas(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo, tracked, observed, target = _reset_race_repo(tmp_path)
+    real_run = subprocess.run
+
+    def race_after_ref_cas(cmd, *args, **kwargs):
+        result = real_run(cmd, *args, **kwargs)
+        if "update-ref" in cmd and result.returncode == 0:
+            tracked.write_text("raced edit\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", race_after_ref_cas)
+
+    result = update_cmd._reset_hard_if_head_matches(
+        ["git"], repo, target, expected_head=observed
+    )
+
+    assert result.returncode != 0
+    assert tracked.read_text(encoding="utf-8") == "raced edit\n"

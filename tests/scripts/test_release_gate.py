@@ -530,6 +530,19 @@ def test_release_gate_imports_when_fcntl_is_unavailable() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_windows_evidence_lock_uses_sidecar_and_never_sentinels_manifest(
+    tmp_path: Path,
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    lock_path = release_gate._evidence_lock_path(manifest, is_windows=True)
+
+    assert lock_path != manifest
+    assert lock_path == tmp_path / "evidence.jsonl.lock"
+    assert not manifest.exists()
+
+
 def test_windows_first_append_does_not_truncate_writer_that_won_lock(
 ) -> None:
     from scripts import release_gate
@@ -558,6 +571,22 @@ def test_windows_first_append_does_not_truncate_writer_that_won_lock(
         assert handle.read() == b"first-writer-event\n"
 
     assert lock_calls == 1
+
+
+def test_overlap_classification_rejects_identical_nonexistent_commits(
+    repo: Path,
+) -> None:
+    missing = "f" * 40
+
+    report = classify_overlap(
+        repo,
+        missing,
+        missing,
+        critical_paths=("hermes_cli/update_cmd.py",),
+    )
+
+    assert report.classification == "indeterminate"
+    assert "git-" in report.reason
 
 
 def test_evidence_append_works_without_fchmod(monkeypatch, repo: Path, tmp_path: Path) -> None:
