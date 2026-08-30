@@ -2,7 +2,101 @@
 
 from __future__ import annotations
 
+import os
+import shlex
+import socket
+import subprocess
+from pathlib import Path
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _update_scope_boundary_guard(request, monkeypatch, tmp_path):
+    """Fail closed when an updater test omits an external-boundary fake."""
+    if request.node.get_closest_marker("update_orchestration") is None:
+        yield
+        return
+
+    def forbid(name):
+        def blocked(*args, **kwargs):
+            raise AssertionError(f"live updater boundary called: {name}")
+
+        return blocked
+
+    from hermes_cli import gateway as hermes_gateway
+    from hermes_cli import main as hermes_main
+    from hermes_cli import managed_uv, profiles, update_cmd, update_inventory
+    from hermes_cli import update_receipt
+    from tools import skills_sync
+
+    boundaries = {
+        hermes_main: (
+            "_run_pre_update_backup",
+            "_install_python_dependencies_with_optional_fallback",
+            "_refresh_active_lazy_features",
+            "_restore_active_tool_dependencies",
+            "_pause_windows_gateways_for_update",
+            "_resume_windows_gateways_after_update",
+            "_finish_dashboard_update_cleanup",
+        ),
+        update_cmd: (
+            "_update_node_dependencies",
+            "_sync_with_upstream_if_needed",
+            "_restart_macos_launchd_gateways",
+        ),
+        managed_uv: ("update_managed_uv", "ensure_uv"),
+        update_inventory: ("collect_runtime_inventory", "record_plan_in_receipt"),
+        skills_sync: ("sync_skills",),
+        profiles: ("list_profiles", "backfill_profile_envs"),
+        hermes_gateway: (
+            "find_gateway_pids",
+            "_get_service_pids",
+            "find_profile_gateway_processes",
+            "_request_gateway_self_restart",
+            "_graceful_restart_via_sigusr1",
+            "_spawn_gateway_restart_watcher",
+            "stop_profile_gateway",
+        ),
+        update_receipt: (
+            "collect_fleet_versions",
+            "begin_update_receipt",
+            "record_plan",
+            "record_step",
+            "finalize_update_receipt",
+        ),
+    }
+    for owner, names in boundaries.items():
+        for name in names:
+            if hasattr(owner, name):
+                monkeypatch.setattr(owner, name, forbid(name))
+
+    real_run = subprocess.run
+
+    def guarded_run(command, *args, **kwargs):
+        parts = shlex.split(command) if isinstance(command, str) else [str(p) for p in command]
+        lowered = [Path(part).name.lower() for part in parts]
+        package_driver = any(
+            name in {"pip", "pip3", "uv", "npm", "pnpm", "yarn"}
+            for name in lowered
+        )
+        package_action = any(
+            action in lowered for action in ("install", "sync", "update", "upgrade")
+        )
+        if package_driver and package_action:
+            raise AssertionError("package install subprocess blocked in updater test")
+        if "git" in lowered and any(action in lowered for action in ("fetch", "pull")):
+            cwd = Path(kwargs.get("cwd", os.getcwd())).resolve()
+            try:
+                cwd.relative_to(tmp_path.resolve())
+            except ValueError as exc:
+                raise AssertionError("network-capable git subprocess blocked in updater test") from exc
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", guarded_run)
+    monkeypatch.setattr(socket, "create_connection", forbid("network create_connection"))
+    monkeypatch.setattr(socket.socket, "connect", forbid("network socket.connect"))
+    yield
 
 
 @pytest.fixture

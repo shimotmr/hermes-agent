@@ -18,7 +18,10 @@ from hermes_cli import main as hermes_main
 from hermes_cli import update_cmd
 from hermes_cli.main import cmd_update
 
-pytestmark = pytest.mark.usefixtures("isolated_update_orchestrator")
+pytestmark = [
+    pytest.mark.update_orchestration,
+    pytest.mark.usefixtures("isolated_update_orchestrator"),
+]
 
 def _make_run_side_effect(
     branch="main", verify_ok=True, commit_count="1", dirty=False

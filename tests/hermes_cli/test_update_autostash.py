@@ -9,7 +9,10 @@ from hermes_cli import config as hermes_config
 from hermes_cli import main as hermes_main
 from hermes_cli import update_cmd
 
-pytestmark = pytest.mark.usefixtures("isolated_update_orchestrator")
+pytestmark = [
+    pytest.mark.update_orchestration,
+    pytest.mark.usefixtures("isolated_update_orchestrator"),
+]
 
 
 # ---------------------------------------------------------------------------
