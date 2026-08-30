@@ -106,3 +106,50 @@ def test_target_checkout_anchors_frozen_sha_without_discarding_local_commits(
     assert git(repo, "rev-parse", "main") == local_tip
     assert git(repo, "merge-base", "--is-ancestor", local_tip, "main") == ""
     assert git(repo, "rev-list", "--count", f"{frozen}..main") == "1"
+
+
+def test_target_checkout_does_not_overwrite_branch_advanced_after_probe(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.name", "Updater Test")
+    git(repo, "config", "user.email", "updater@example.invalid")
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    git(repo, "add", "base.txt")
+    git(repo, "commit", "-m", "base")
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "--detach", base)
+    (repo / "remote.txt").write_text("remote\n", encoding="utf-8")
+    git(repo, "add", "remote.txt")
+    git(repo, "commit", "-m", "frozen remote commit")
+    frozen = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-b", "parked", base)
+
+    real_run = subprocess.run
+    raced_tip: list[str] = []
+
+    def run_with_branch_race(cmd, *args, **kwargs):
+        result = real_run(cmd, *args, **kwargs)
+        if cmd[-3:] == ["rev-list", "--count", f"{frozen}..refs/heads/main"]:
+            tree = git(repo, "rev-parse", "main^{tree}")
+            local_tip = real_run(
+                ["git", "commit-tree", tree, "-p", "main", "-m", "raced local commit"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            git(repo, "update-ref", "refs/heads/main", local_tip, base)
+            raced_tip.append(local_tip)
+        return result
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", run_with_branch_race)
+
+    result = update_cmd._checkout_target_at_frozen(["git"], repo, "main", frozen)
+
+    assert result.returncode == 0
+    assert raced_tip
+    assert git(repo, "rev-parse", "main") == raced_tip[0]
+    assert git(repo, "branch", "--show-current") == "main"

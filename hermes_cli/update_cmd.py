@@ -1385,9 +1385,10 @@ def _checkout_target_at_frozen(
 ) -> subprocess.CompletedProcess[str]:
     """Checkout the target without letting its mutable ref redefine this run.
 
-    A target branch with local-only commits is checked out unchanged so the
-    subsequent frozen-SHA merge can preserve them.  Otherwise the branch is
-    anchored directly to the already-frozen commit.
+    An existing target branch is always checked out unchanged so a concurrent
+    ref advance cannot be overwritten after the local-only probe.  A missing
+    branch is created at the already-frozen commit with ``checkout -b``;
+    creation fails closed if another process creates it first.
     """
     local_only = subprocess.run(
         git_cmd
@@ -1404,26 +1405,26 @@ def _checkout_target_at_frozen(
     )
     if local_only.returncode == 0:
         try:
-            if int(local_only.stdout.strip()) > 0:
-                return subprocess.run(
-                    git_cmd + ["checkout", target_branch],
-                    cwd=cwd,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
+            int(local_only.stdout.strip())
         except ValueError:
             return subprocess.CompletedProcess(
                 local_only.args, 1, local_only.stdout, "invalid local-only count"
             )
+        return subprocess.run(
+            git_cmd + ["checkout", target_branch],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
     elif (
         "unknown revision" not in local_only.stderr
         and "ambiguous argument" not in local_only.stderr
     ):
         return local_only
     return subprocess.run(
-        git_cmd + ["checkout", "-B", target_branch, frozen_target_sha],
+        git_cmd + ["checkout", "-b", target_branch, frozen_target_sha],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -8315,31 +8316,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 == frozen_target_sha
             )
             if checkout_result.returncode != 0:
-                # Local checkout doesn't have this branch yet. Try to set
-                # it up as a tracking branch of origin/<branch>. This is
-                # the common case when the requested branch exists upstream
-                # but was never checked out locally.
-                track_result = subprocess.run(
-                    git_cmd + ["checkout", "-B", branch, frozen_target_sha],
-                    cwd=_m().PROJECT_ROOT,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                )
-                if track_result.returncode != 0:
-                    # Restore the user's prior stash before bailing
-                    # so we don't leave them stranded in a weird state.
-                    if auto_stash_ref is not None:
-                        _m()._restore_stashed_changes(
-                            git_cmd,
-                            _m().PROJECT_ROOT,
-                            auto_stash_ref,
-                            prompt_user=False,
-                            input_fn=gw_input_fn,
-                        )
-                    print(f"✗ Branch '{branch}' does not exist locally or on origin.")
-                    if track_result.stderr.strip():
-                        print(f"  {track_result.stderr.strip().splitlines()[0]}")
-                    sys.exit(1)
+                # Restore the user's prior stash before bailing so a failed
+                # or raced branch creation cannot strand the checkout.
+                if auto_stash_ref is not None:
+                    _m()._restore_stashed_changes(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=False,
+                        input_fn=gw_input_fn,
+                    )
+                print(f"✗ Branch '{branch}' does not exist locally or on origin.")
+                if checkout_result.stderr.strip():
+                    print(f"  {checkout_result.stderr.strip().splitlines()[0]}")
+                sys.exit(1)
         elif auto_stash_ref is None:
             auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
 
