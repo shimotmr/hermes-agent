@@ -397,12 +397,28 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
     blocks. Never raises.
     """
     marker = path or update_marker_path()
+    unknown = UpdateHolder(pid=0, age_seconds=float("inf"))
     try:
         raw = marker.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return unknown
+        else:
+            return unknown
+        guard = _operation_guard_path(marker)
+        try:
+            guard.lstat()
+        except FileNotFoundError:
+            return unknown if _guard_quarantine_present(guard) else None
+        except OSError:
+            return unknown
+        return unknown
     except OSError:
-        if _operation_guard_path(marker).exists():
-            return UpdateHolder(pid=0, age_seconds=float("inf"))
-        return None
+        return unknown
 
     lines = raw.splitlines()
     try:

@@ -313,6 +313,47 @@ def test_absent_marker_reports_no_live_update(marker):
     assert read_live_update(path=marker) is None
 
 
+def test_marker_read_error_fails_closed(marker, monkeypatch):
+    real_read_text = Path.read_text
+
+    def deny_marker_read(path, *args, **kwargs):
+        if path == marker:
+            raise PermissionError("simulated marker ACL denial")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deny_marker_read)
+
+    holder = read_live_update(path=marker)
+    assert holder is not None
+    assert holder.pid == 0
+
+
+def test_dangling_marker_symlink_fails_closed(marker):
+    marker.symlink_to(marker.with_name("missing-marker-target"))
+
+    holder = read_live_update(path=marker)
+    assert holder is not None
+    assert holder.pid == 0
+
+
+def test_guard_inspection_error_fails_closed_for_absent_marker(marker, monkeypatch):
+    import hermes_cli.update_lock as update_lock_module
+
+    guard = update_lock_module._operation_guard_path(marker)
+    real_lstat = Path.lstat
+
+    def deny_guard_inspection(path, *args, **kwargs):
+        if path == guard:
+            raise PermissionError("simulated guard ACL denial")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", deny_guard_inspection)
+
+    holder = read_live_update(path=marker)
+    assert holder is not None
+    assert holder.pid == 0
+
+
 def test_operation_guard_is_not_visible_until_owner_identity_is_complete(marker, monkeypatch):
     """A crash while building the private guard must not publish ambiguity."""
     import hermes_cli.update_lock as update_lock_module
@@ -408,6 +449,9 @@ def test_operation_guard_restore_failure_keeps_canonical_namespace_blocked(
     assert update_lock_module._reclaim_dead_guard(guard) is False
     assert not guard.exists()
     assert list(guard.parent.glob(f".{guard.name}.stale-*"))
+    holder = read_live_update(path=marker)
+    assert holder is not None
+    assert holder.pid == 0
     with update_lock_module._marker_operation(marker) as operation:
         assert operation is False
 
