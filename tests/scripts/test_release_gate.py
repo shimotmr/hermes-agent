@@ -62,6 +62,15 @@ def test_freeze_snapshot_is_immutable_after_ref_advances(repo: Path) -> None:
     assert len(snapshot.snapshot_id) == 64
 
 
+def test_freeze_snapshot_resolves_symbolic_base_to_commit(repo: Path) -> None:
+    expected = git(repo, "rev-parse", "HEAD")
+
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha="HEAD")
+
+    assert snapshot.local_base_sha == expected
+    assert snapshot.target_sha == expected
+
+
 def test_docs_only_drift_is_disjoint(repo: Path) -> None:
     reviewed = git(repo, "rev-parse", "HEAD")
     latest = commit(repo, "docs/readme.md", "docs\n", "docs")

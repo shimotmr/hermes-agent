@@ -154,7 +154,8 @@ def freeze_snapshot(
 ) -> ReleaseSnapshot:
     """Resolve a mutable ref once and return a content-addressed snapshot."""
     repo = Path(repo)
-    base = local_base_sha or _git_text(repo, "rev-parse", "HEAD^{commit}")
+    base_ref = local_base_sha or "HEAD"
+    base = _git_text(repo, "rev-parse", f"{base_ref}^{{commit}}")
     target = _git_text(repo, "rev-parse", f"{remote_ref}^{{commit}}")
     if not _is_sha(base) or not _is_sha(target):
         raise ValueError("snapshot-sha-invalid")
