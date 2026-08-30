@@ -751,3 +751,41 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
         assert (pkg / "hermes-agent.rb").read_text() == "formula\n"
     finally:
         os.chmod(pkg, 0o755)
+
+
+def test_partial_stash_failure_does_not_reset_for_concurrent_foreign_stash(
+    monkeypatch, tmp_path
+):
+    """A raced refs/stash update is not proof that this invocation saved edits."""
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        joined = " ".join(command)
+        if "status --porcelain" in joined:
+            return SimpleNamespace(returncode=0, stdout=" M tracked.txt\n", stderr="")
+        if "ls-files --unmerged" in joined:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "stash push" in joined:
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="warning: failed to remove foreign-owned file",
+                args=command,
+            )
+        if "stash list" in joined:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{'b' * 40}\x00On main: somebody-elses-stash\n",
+                stderr="",
+            )
+        if "reset --hard" in joined:
+            pytest.fail("foreign stash must never authorize destructive reset")
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", run)
+
+    with pytest.raises(CalledProcessError):
+        update_cmd._stash_local_changes_if_needed(["git"], tmp_path)
+
+    assert not any("reset --hard" in " ".join(command) for command in commands)

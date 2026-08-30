@@ -2489,15 +2489,9 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     from datetime import datetime, timezone
 
     stash_name = datetime.now(timezone.utc).strftime(
-        "hermes-update-autostash-%Y%m%d-%H%M%S"
-    )
+        "hermes-update-autostash-%Y%m%d-%H%M%S-"
+    ) + os.urandom(16).hex()
     print("→ Local changes detected — stashing before update...")
-    prev_stash = subprocess.run(
-        git_cmd + ["rev-parse", "--verify", "refs/stash"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    ).stdout.strip()
     push = subprocess.run(
         git_cmd + ["stash", "push", "--include-untracked", "-m", stash_name],
         cwd=cwd,
@@ -2507,15 +2501,24 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     if push.stdout.strip():
         print(push.stdout.strip())
     stash_probe = subprocess.run(
-        git_cmd + ["rev-parse", "--verify", "refs/stash"],
+        git_cmd + ["stash", "list", "--format=%H%x00%gs"],
         cwd=cwd,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
     )
-    stash_ref = stash_probe.stdout.strip()
-    stash_created = (
-        stash_probe.returncode == 0 and bool(stash_ref) and stash_ref != prev_stash
-    )
+    stash_ref = None
+    if stash_probe.returncode == 0:
+        for line in stash_probe.stdout.splitlines():
+            commit, separator, subject = line.partition("\0")
+            if (
+                separator
+                and len(commit) == 40
+                and all(character in "0123456789abcdef" for character in commit)
+                and (subject == stash_name or subject.endswith(f": {stash_name}"))
+            ):
+                stash_ref = commit
+                break
+    stash_created = stash_ref is not None
 
     if push.returncode != 0:
         if stash_created:
@@ -2557,6 +2560,14 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
             raise subprocess.CalledProcessError(
                 push.returncode, push.args, output=push.stdout, stderr=push.stderr
             )
+
+    if not stash_created:
+        raise subprocess.CalledProcessError(
+            1,
+            push.args,
+            output=push.stdout,
+            stderr="autostash ownership could not be verified",
+        )
 
     return stash_ref
 
