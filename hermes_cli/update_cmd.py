@@ -550,6 +550,25 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
     except (subprocess.CalledProcessError, OSError):
         return None
 
+
+def _capture_fetched_target_sha(git_cmd, cwd, remote_ref: str) -> str | None:
+    """Resolve a fetched mutable ref once; reject missing or malformed SHAs."""
+    try:
+        result = subprocess.run(
+            git_cmd + ["rev-parse", f"{remote_ref}^{{commit}}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    value = result.stdout.strip()
+    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+        return None
+    return value
+
+
 # Files that define the editable install. A pull that touches none of them
 # cannot have invalidated it.
 _INSTALL_DEFINING_FILES = (
@@ -8055,6 +8074,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _print_fetch_failure(fetch_result.stderr)
             sys.exit(1)
 
+        frozen_remote_ref = f"origin/{branch}"
+        frozen_target_sha = _capture_fetched_target_sha(
+            git_cmd, _m().PROJECT_ROOT, frozen_remote_ref
+        )
+        if frozen_target_sha is None:
+            print(
+                f"✗ Could not freeze fetched target {frozen_remote_ref} to an immutable SHA."
+            )
+            print("  Refusing to apply a moving or malformed update target.")
+            sys.exit(1)
+
         # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
             git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
@@ -8135,7 +8165,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # previously surfaced through the checkout failing, which
                     # does not run on this path.
                     verify_ref = subprocess.run(
-                        git_cmd + ["rev-parse", "--verify", "--quiet", f"origin/{branch}"],
+                        git_cmd + ["rev-parse", "--verify", "--quiet", frozen_target_sha],
                         cwd=_m().PROJECT_ROOT,
                         capture_output=True,
                         text=True, encoding="utf-8", errors="replace",
@@ -8182,7 +8212,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # the common case when the requested branch exists upstream
                 # but was never checked out locally.
                 track_result = subprocess.run(
-                    git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
+                    git_cmd + ["checkout", "-B", branch, frozen_target_sha],
                     cwd=_m().PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
@@ -8218,7 +8248,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # 0), so keep it, but treat the shallow NUMBER as unknown and recover
         # the real one via the GitHub compare API when possible.
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{frozen_target_sha}", "--count"],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -8243,11 +8273,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 cwd=_m().PROJECT_ROOT, capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
             ).stdout.strip()
-            target_sha = subprocess.run(
-                git_cmd + ["rev-parse", f"origin/{branch}"],
-                cwd=_m().PROJECT_ROOT, capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            ).stdout.strip()
+            target_sha = frozen_target_sha
             counted = _github_compare_behind(head_sha, target_sha)
             # counted == 0 means local-ahead (remote tip reachable from HEAD):
             # not behind, fall through to the up-to-date path.
@@ -8477,7 +8503,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # `pull --ff-only origin <branch>` given the fresh tracking ref;
             # the divergence fallback below is unchanged.
             pull_result = subprocess.run(
-                git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+                git_cmd + ["merge", "--ff-only", frozen_target_sha],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -8498,7 +8524,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     ).stdout
                     or ""
                 ).strip()
-                _remote_ref = f"origin/{branch}"
+                _remote_ref = frozen_target_sha
                 _same_branch_local_commits: Optional[bool] = False
                 if not _cur_branch or _cur_branch == branch:
                     _same_branch_local_commits = _same_branch_has_local_only_commits(
@@ -8751,13 +8777,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _m()._record_bytecode_fingerprint()
         _m()._refresh_bootstrap_cache_scripts(branch)
 
-        # Fork upstream sync logic (only for main branch on forks)
+        # A second fork/upstream fetch here would advance beyond the immutable
+        # target reviewed and applied above. Defer upstream sync to the next
+        # update run; its existing no-origin-update path performs that sync
+        # before deciding whether the checkout is current.
         if is_fork and branch == "main":
-            _m()._sync_with_upstream_if_needed(
-                git_cmd,
-                _m().PROJECT_ROOT,
-                assume_yes=assume_yes,
-                input_fn=gw_input_fn,
+            print(
+                "  ℹ Fork upstream sync deferred to the next update run so this "
+                "run remains pinned to its fetched SHA."
             )
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra

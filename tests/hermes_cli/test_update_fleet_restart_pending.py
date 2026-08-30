@@ -74,6 +74,11 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     """Patch ``_cmd_update_impl`` helpers. Mirrors test_update_head_moved_gate."""
     monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
+    monkeypatch.setattr(
+        update_cmd,
+        "_capture_fetched_target_sha",
+        lambda *args, **kwargs: "f" * 40,
+    )
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     (tmp_path / ".git").mkdir()
     monkeypatch.setattr(hermes_main, "_resolve_update_branch", lambda args: "main")

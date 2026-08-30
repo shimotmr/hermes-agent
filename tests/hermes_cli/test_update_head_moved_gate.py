@@ -14,13 +14,16 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import main as hermes_main
+from hermes_cli import update_cmd
 
 
-def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
+def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456", calls_seen=None):
     """Simulate git commands where HEAD advances from pre_sha to post_sha."""
     calls = {"n": 0}
 
     def side_effect(cmd, **kwargs):
+        if calls_seen is not None:
+            calls_seen.append(tuple(str(c) for c in cmd))
         joined = " ".join(str(c) for c in cmd)
 
         # git rev-parse --abbrev-ref HEAD  (get current branch)
@@ -72,9 +75,18 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     attributes on that module is the canonical test surface (matches
     tests/hermes_cli/test_cmd_update.py).
     """
+    dangerous_calls = []
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
+    monkeypatch.setattr(
+        update_cmd,
+        "_capture_fetched_target_sha",
+        lambda *args, **kwargs: "f" * 40,
+    )
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     (tmp_path / ".git").mkdir()  # pass the "is a git repo" gate
+    monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(hermes_main, "_capture_active_tool_dependencies", lambda: [])
     monkeypatch.setattr(
         hermes_main, "_resolve_update_branch", lambda args: "main"
     )
@@ -103,6 +115,40 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     # Short-circuit the long tail: dependency install + desktop build.
     monkeypatch.setattr(hermes_main, "_write_update_incomplete_marker", lambda: None)
     monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(update_cmd, "_editable_install_is_current", lambda *a, **k: True)
+    monkeypatch.setattr(
+        update_cmd,
+        "_restart_macos_launchd_gateways",
+        lambda *a, **k: dangerous_calls.append("fake-launchd-restart-adapter"),
+    )
+    monkeypatch.setattr(update_cmd.shutil, "which", lambda name: None if name == "cua-driver" else "/usr/bin/true")
+
+    import hermes_cli.managed_uv as managed_uv
+    import hermes_cli.profiles as profiles
+    import hermes_cli.update_inventory as update_inventory
+    import tools.skills_sync as skills_sync
+
+    monkeypatch.setattr(managed_uv, "update_managed_uv", lambda *a, **k: None)
+    monkeypatch.setattr(managed_uv, "ensure_uv", lambda *a, **k: "/usr/bin/true")
+    monkeypatch.setattr(
+        update_inventory,
+        "collect_runtime_inventory",
+        lambda: SimpleNamespace(runtimes=()),
+    )
+    monkeypatch.setattr(update_inventory, "record_plan_in_receipt", lambda *a, **k: None)
+    monkeypatch.setattr(
+        skills_sync,
+        "sync_skills",
+        lambda **kwargs: {
+            "copied": [],
+            "updated": [],
+            "user_modified": [],
+            "cleaned": [],
+            "relocated": [],
+        },
+    )
+    monkeypatch.setattr(profiles, "list_profiles", lambda: [])
+    monkeypatch.setattr(profiles, "backfill_profile_envs", lambda **kwargs: [])
     # Gateway restart path (called after a successful update).
     monkeypatch.setattr(hermes_main, "_finish_dashboard_update_cleanup", lambda *a: None)
     # Keep the (now surfaced — #78574) gateway auto-restart phase away from
@@ -114,23 +160,43 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
         hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
     )
     monkeypatch.setattr(
+        hermes_gateway, "_get_service_pids", lambda all_profiles=False: set()
+    )
+    monkeypatch.setattr(
         hermes_gateway, "supports_systemd_services", lambda: False
     )
     monkeypatch.setattr(
         hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
     )
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **kwargs: [],
+    )
+
+    return dangerous_calls
 
 
 def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
     """When the pull advances HEAD, the update proceeds normally."""
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
-    _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect())
+    calls_seen = []
+    dangerous_calls = _patch_update_deps(
+        monkeypatch,
+        tmp_path,
+        _make_head_moved_side_effect(calls_seen=calls_seen),
+    )
 
     hermes_main.cmd_update(args)  # completes normally (no SystemExit)
 
     out = capsys.readouterr().out
     assert "✓ Code updated!" in out
     assert "Code did not move" not in out
+    frozen = "f" * 40
+    assert ("git", "merge", "--ff-only", frozen) in calls_seen
+    assert ("git", "rev-list", f"HEAD..{frozen}", "--count") in calls_seen
+    assert not any("origin/main" in command for call in calls_seen for command in call if "merge" in call)
+    assert dangerous_calls == ["fake-launchd-restart-adapter"]
+    assert not any("launchctl" in command for call in calls_seen for command in call)
 
 
 def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
