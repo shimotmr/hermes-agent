@@ -1,10 +1,14 @@
 {
   "schema_version": "hermes.update.critical-paths.v1",
   "paths": [
+    "docs/release-gate-critical-paths.json",
+    "docs/update-acceptance-matrix.json",
     "gateway/",
     "hermes_cli/",
+    "scripts/release_gate.py",
     "tests/gateway/",
     "tests/hermes_cli/",
+    "tests/scripts/test_release_gate.py",
     "pyproject.toml",
     "requirements.txt",
     "run_agent.py"

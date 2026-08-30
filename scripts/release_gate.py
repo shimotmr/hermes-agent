@@ -20,8 +20,10 @@ from typing import Any, Literal, Sequence
 
 _SCHEMA_SNAPSHOT = "hermes.update.release-snapshot.v1"
 _SCHEMA_OVERLAP = "hermes.update.overlap-report.v1"
-_SCHEMA_EVIDENCE = "hermes.update.evidence-event.v2"
-_SCHEMA_EVIDENCE_LEGACY = "hermes.update.evidence-event.v1"
+_SCHEMA_EVIDENCE = "hermes.update.evidence-event.v3"
+_SCHEMA_EVIDENCE_LEGACY = frozenset(
+    {"hermes.update.evidence-event.v1", "hermes.update.evidence-event.v2"}
+)
 _SHA_LEN = 40
 
 
@@ -94,10 +96,14 @@ def _git_text(repo: Path, *args: str) -> str:
 
 
 @contextmanager
-def _exclusive_file_lock(handle):
+def _exclusive_file_lock(
+    handle, *, is_windows: bool | None = None, windows_lock_module: Any = None
+):
     """Serialize appends with the host's native advisory file lock."""
-    if os.name == "nt":
-        import msvcrt
+    use_windows_lock = os.name == "nt" if is_windows is None else is_windows
+    if use_windows_lock:
+        if windows_lock_module is None:
+            import msvcrt as windows_lock_module
 
         handle.seek(0, os.SEEK_END)
         was_empty = handle.tell() == 0
@@ -105,15 +111,22 @@ def _exclusive_file_lock(handle):
             handle.write(b"\n")
             handle.flush()
         handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        windows_lock_module.locking(
+            handle.fileno(), windows_lock_module.LK_LOCK, 1
+        )
         if was_empty:
             handle.seek(0)
-            handle.truncate(0)
+            contents_after_lock = handle.read()
+            if contents_after_lock and not contents_after_lock.strip(b"\n"):
+                handle.seek(0)
+                handle.truncate(0)
         try:
             yield
         finally:
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            windows_lock_module.locking(
+                handle.fileno(), windows_lock_module.LK_UNLCK, 1
+            )
     else:
         import fcntl
 
@@ -401,7 +414,7 @@ def _validate_event_shape(
     if not isinstance(event, dict):
         raise EvidenceCorrupt(f"event-not-object:{expected_sequence}")
     schema = event.get("schema_version")
-    if schema not in {_SCHEMA_EVIDENCE, _SCHEMA_EVIDENCE_LEGACY}:
+    if schema != _SCHEMA_EVIDENCE and schema not in _SCHEMA_EVIDENCE_LEGACY:
         raise EvidenceCorrupt(f"schema-invalid:{expected_sequence}")
     if event.get("sequence") != expected_sequence:
         raise EvidenceCorrupt(f"sequence-invalid:{expected_sequence}")
@@ -417,6 +430,8 @@ def _validate_event_shape(
     if not isinstance(event.get("recorded_at"), str) or not event["recorded_at"]:
         raise EvidenceCorrupt(f"recorded-at-invalid:{expected_sequence}")
     if schema == _SCHEMA_EVIDENCE:
+        if not isinstance(event.get("gate_id"), str) or not event["gate_id"]:
+            raise EvidenceCorrupt(f"gate-id-invalid:{expected_sequence}")
         if repo is None:
             raise EvidenceCorrupt(f"evidence-repo-required:{expected_sequence}")
         _validate_git_binding(repo, event, expected_sequence)
@@ -452,6 +467,41 @@ def validate_evidence(path: Path, *, repo: Path | None = None) -> list[dict[str,
     return _read_evidence_bytes(Path(path).read_bytes(), repo=repo)
 
 
+def validate_release_evidence(
+    path: Path,
+    *,
+    repo: Path,
+    required_gate_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Validate one complete, successful release authority chain."""
+    required = tuple(required_gate_ids)
+    if not required or any(not isinstance(gate, str) or not gate for gate in required):
+        raise EvidenceCorrupt("required-gates-empty-or-invalid")
+    events = validate_evidence(path, repo=repo)
+    if not events:
+        raise EvidenceCorrupt("release-evidence-empty")
+    authority = {
+        (event.get("frozen_sha"), event.get("candidate_sha"), event.get("snapshot_id"))
+        for event in events
+    }
+    if len(authority) != 1:
+        raise EvidenceCorrupt("release-authority-mixed")
+    gates: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if event.get("schema_version") != _SCHEMA_EVIDENCE:
+            raise EvidenceCorrupt("release-evidence-legacy-schema")
+        gate_id = event["gate_id"]
+        if gate_id in gates:
+            raise EvidenceCorrupt(f"release-gate-duplicate:{gate_id}")
+        gates[gate_id] = event
+        if event["exit_code"] != 0:
+            raise EvidenceCorrupt(f"required-gate-failed:{gate_id}")
+    missing = sorted(set(required) - gates.keys())
+    if missing:
+        raise EvidenceCorrupt(f"required-gates-missing:{','.join(missing)}")
+    return events
+
+
 def append_evidence(
     path: Path,
     *,
@@ -459,6 +509,7 @@ def append_evidence(
     snapshot: ReleaseSnapshot,
     frozen_sha: str,
     candidate_sha: str,
+    gate_id: str = "unspecified",
     command: str,
     exit_code: int,
     recorded_at: str,
@@ -467,6 +518,8 @@ def append_evidence(
         raise ValueError("evidence-sha-invalid")
     if not isinstance(command, str) or not command:
         raise ValueError("evidence-command-invalid")
+    if not isinstance(gate_id, str) or not gate_id:
+        raise ValueError("evidence-gate-id-invalid")
     if type(exit_code) is not int:
         raise ValueError("evidence-exit-code-invalid")
     if not isinstance(recorded_at, str) or not recorded_at:
@@ -507,6 +560,7 @@ def append_evidence(
                     "snapshot": snapshot_payload,
                     "frozen_tree_sha": frozen_tree,
                     "candidate_tree_sha": candidate_tree,
+                    "gate_id": gate_id,
                     "command": command,
                     "exit_code": exit_code,
                     "recorded_at": recorded_at,
@@ -563,6 +617,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     append.add_argument("--snapshot", type=Path, required=True)
     append.add_argument("--frozen-sha", required=True)
     append.add_argument("--candidate-sha", required=True)
+    append.add_argument("--gate-id", required=True)
     append.add_argument("--command-text", required=True)
     append.add_argument("--exit-code", type=int, required=True)
     append.add_argument("--recorded-at", required=True)
@@ -570,6 +625,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     validate = subparsers.add_parser("validate-evidence")
     validate.add_argument("--path", type=Path, required=True)
     validate.add_argument("--repo", type=Path, required=True)
+    validate.add_argument("--required-gate", action="append", required=True)
 
     args = parser.parse_args(argv)
     if args.command == "freeze":
@@ -592,13 +648,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 snapshot=_load_snapshot(args.snapshot),
                 frozen_sha=args.frozen_sha,
                 candidate_sha=args.candidate_sha,
+                gate_id=args.gate_id,
                 command=args.command_text,
                 exit_code=args.exit_code,
                 recorded_at=args.recorded_at,
             )
         )
         return 0
-    _print_json(validate_evidence(args.path, repo=args.repo))
+    _print_json(
+        validate_release_evidence(
+            args.path, repo=args.repo, required_gate_ids=args.required_gate
+        )
+    )
     return 0
 
 

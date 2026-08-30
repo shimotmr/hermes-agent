@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 import subprocess
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -95,6 +97,25 @@ def test_critical_drift_requires_full_review(repo: Path) -> None:
 
     assert report.classification == "overlap"
     assert report.overlapping_paths == ("hermes_cli/update_cmd.py",)
+
+
+def test_critical_policy_covers_every_required_acceptance_path() -> None:
+    matrix = load_acceptance_matrix(Path("docs/update-acceptance-matrix.json"))
+    critical_paths = load_critical_paths(Path("docs/release-gate-critical-paths.json"))
+
+    required_rules = {
+        rule
+        for criterion in matrix["criteria"]
+        if criterion.get("required") is True
+        for rule in criterion["path_rules"]
+    }
+
+    uncovered = {
+        rule
+        for rule in required_rules
+        if not any(rule == critical or rule.startswith(critical) for critical in critical_paths)
+    }
+    assert uncovered == set()
 
 
 def test_rename_across_critical_boundary_includes_old_and_new_paths(repo: Path) -> None:
@@ -312,6 +333,89 @@ def test_evidence_append_binds_real_commits_snapshot_trees_and_ancestry(
     assert validate_evidence(manifest, repo=repo) == [first, second]
 
 
+def test_release_evidence_rejects_a_failed_required_gate(repo: Path, tmp_path: Path) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    frozen = git(repo, "rev-parse", "HEAD")
+    git(repo, "branch", "frozen", frozen)
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=frozen)
+    candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
+    append_evidence(
+        manifest,
+        repo=repo,
+        snapshot=snapshot,
+        frozen_sha=frozen,
+        candidate_sha=candidate,
+        gate_id="tests",
+        command="tests",
+        exit_code=0,
+        recorded_at="2026-08-30T04:00:00Z",
+    )
+    append_evidence(
+        manifest,
+        repo=repo,
+        snapshot=snapshot,
+        frozen_sha=frozen,
+        candidate_sha=candidate,
+        gate_id="ruff",
+        command="ruff",
+        exit_code=1,
+        recorded_at="2026-08-30T04:01:00Z",
+    )
+
+    with pytest.raises(EvidenceCorrupt, match="required-gate-failed:ruff"):
+        release_gate.validate_release_evidence(
+            manifest, repo=repo, required_gate_ids=("tests", "ruff")
+        )
+
+
+def test_release_evidence_rejects_missing_gate_and_mixed_authority(
+    repo: Path, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    frozen = git(repo, "rev-parse", "HEAD")
+    git(repo, "branch", "frozen", frozen)
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=frozen)
+    first_candidate = commit(repo, "candidate-1.txt", "one\n", "candidate one")
+    append_evidence(
+        manifest,
+        repo=repo,
+        snapshot=snapshot,
+        frozen_sha=frozen,
+        candidate_sha=first_candidate,
+        gate_id="tests",
+        command="tests",
+        exit_code=0,
+        recorded_at="2026-08-30T04:00:00Z",
+    )
+
+    with pytest.raises(EvidenceCorrupt, match="required-gates-missing:ruff"):
+        release_gate.validate_release_evidence(
+            manifest, repo=repo, required_gate_ids=("tests", "ruff")
+        )
+
+    second_candidate = commit(repo, "candidate-2.txt", "two\n", "candidate two")
+    append_evidence(
+        manifest,
+        repo=repo,
+        snapshot=snapshot,
+        frozen_sha=frozen,
+        candidate_sha=second_candidate,
+        gate_id="ruff",
+        command="ruff",
+        exit_code=0,
+        recorded_at="2026-08-30T04:01:00Z",
+    )
+
+    with pytest.raises(EvidenceCorrupt, match="release-authority-mixed"):
+        release_gate.validate_release_evidence(
+            manifest, repo=repo, required_gate_ids=("tests", "ruff")
+        )
+
+
 def test_evidence_tampering_is_detected_without_rewriting(repo: Path, tmp_path: Path) -> None:
     manifest = tmp_path / "evidence.jsonl"
     frozen = git(repo, "rev-parse", "HEAD")
@@ -423,3 +527,33 @@ def test_release_gate_imports_when_fcntl_is_unavailable() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_windows_first_append_does_not_truncate_writer_that_won_lock(
+) -> None:
+    from scripts import release_gate
+
+    class LockBuffer(io.BytesIO):
+        def fileno(self) -> int:
+            return 123
+
+    handle = LockBuffer()
+    lock_calls = 0
+
+    def locking(_fd: int, mode: int, _length: int) -> None:
+        nonlocal lock_calls
+        if mode == 1:
+            lock_calls += 1
+            handle.seek(0)
+            handle.write(b"first-writer-event\n")
+            handle.truncate()
+
+    windows_lock = SimpleNamespace(LK_LOCK=1, LK_UNLCK=2, locking=locking)
+
+    with release_gate._exclusive_file_lock(
+        handle, is_windows=True, windows_lock_module=windows_lock
+    ):
+        handle.seek(0)
+        assert handle.read() == b"first-writer-event\n"
+
+    assert lock_calls == 1
