@@ -135,6 +135,83 @@ class TestRunningJobGuard:
         assert "queued-job" not in sched._running_job_ids
 
 
+    def test_worker_restart_pause_rejection_converges_claims_and_ledger(self, monkeypatch):
+        """A pause acquired after ticker registration must not strand state."""
+        import cron.scheduler as sched
+
+        sched._running_job_ids.clear()
+        job = {
+            "id": "pause-after-claim",
+            "name": "pause-after-claim",
+            "prompt": "test",
+            "schedule": {"kind": "once", "at": "2026-08-30T00:00:00+00:00"},
+            "enabled": True,
+            "next_run_at": "2020-01-01T00:00:00",
+            "deliver": "local",
+        }
+        pause_tokens = []
+        finished = []
+        released = []
+        cleared = []
+
+        def claim_after_registration(job_id, **kwargs):
+            token, _running = sched.reserve_restart_dispatch()
+            pause_tokens.append(token)
+            return {
+                **job,
+                "fire_claim": {"by": "ticker-owner", "at": "now"},
+            }
+
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
+        monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: 0)
+        monkeypatch.setattr(sched, "load_config", lambda: {})
+        monkeypatch.setattr(
+            sched,
+            "create_execution",
+            lambda *_a, **_kw: {"id": "execution-paused"},
+        )
+        monkeypatch.setattr(sched, "claim_job_for_fire", claim_after_registration)
+        monkeypatch.setattr(
+            sched,
+            "finish_execution",
+            lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+        )
+        monkeypatch.setattr(
+            sched,
+            "release_fire_claim",
+            lambda job_id, **kwargs: released.append((job_id, kwargs)) or True,
+        )
+        monkeypatch.setattr(
+            sched,
+            "clear_run_claim",
+            lambda job_id: cleared.append(job_id) or True,
+        )
+
+        try:
+            assert sched.tick(verbose=False, sync=True) == 0
+        finally:
+            for token in pause_tokens:
+                sched.release_restart_dispatch(token)
+            sched._shutdown_parallel_pool()
+
+        assert finished == [
+            (
+                "execution-paused",
+                {
+                    "success": False,
+                    "error": (
+                        "Execution was not started because gateway restart "
+                        "dispatch is paused."
+                    ),
+                },
+            )
+        ]
+        assert released == [
+            ("pause-after-claim", {"expected_owner": "ticker-owner"})
+        ]
+        assert cleared == ["pause-after-claim"]
+        assert job["id"] not in sched.get_running_job_ids()
+
     def test_create_execution_failure_does_not_wedge_running_set(self, tmp_path, monkeypatch):
         """create_execution failures clear the running lock and still allow next jobs."""
         import cron.scheduler as sched

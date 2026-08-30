@@ -247,14 +247,13 @@ class ChronosCronScheduler(CronScheduler):
             loop=loop,
             cancel_event=cancel_event,
         )
-        if ran:
-            from cron.jobs import get_job
-            job = get_job(job_id)
-            if job and job.get("enabled") and job.get("next_run_at"):
-                try:
-                    self._arm_one_shot(job)
-                except Exception as e:
-                    logger.warning("Chronos failed to re-arm job %s after fire: %s", job_id, e)
+        from cron.jobs import get_job
+        job = get_job(job_id)
+        if job and job.get("enabled") and job.get("next_run_at"):
+            try:
+                self._arm_one_shot(job)
+            except Exception as e:
+                logger.warning("Chronos failed to re-arm job %s after fire: %s", job_id, e)
         return ran
 
 

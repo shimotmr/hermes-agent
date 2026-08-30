@@ -1871,17 +1871,21 @@ def _launchd_print_service_pid(domain: str, label: str) -> tuple[bool, int | Non
     propagates — fleet-restart callers own per-label failure accounting (a
     wedged launchctl call must be reported, not read as "unloaded").
     """
-    try:
-        result = subprocess.run(
-            ["launchctl", "print", f"{domain}/{label}"],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=5,
-        )
-    except FileNotFoundError:
-        return (False, None)
+    result = subprocess.run(
+        ["launchctl", "print", f"{domain}/{label}"],
+        capture_output=True,
+        text=True, encoding='utf-8', errors='replace',
+        timeout=5,
+    )
     if result.returncode != 0:
-        return (False, None)
+        if result.returncode in {3, 113}:
+            return (False, None)
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            result.args,
+            output=result.stdout,
+            stderr=result.stderr,
+        )
     return (True, _parse_launchd_pid_from_print_output(result.stdout))
 
 
@@ -1902,7 +1906,16 @@ def _launchd_service_registered(label: str) -> bool:
         text=True, encoding='utf-8', errors='replace',
         timeout=5,
     )
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True
+    if result.returncode in {3, 113}:
+        return False
+    raise subprocess.CalledProcessError(
+        result.returncode,
+        result.args,
+        output=result.stdout,
+        stderr=result.stderr,
+    )
 
 
 def _locate_launchd_gateway_service(label: str) -> tuple[str | None, int | None]:
@@ -1918,10 +1931,30 @@ def _locate_launchd_gateway_service(label: str) -> tuple[str | None, int | None]
     ``TimeoutExpired`` propagates (see ``_launchd_print_service_pid``).
     """
     uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    query_error: subprocess.CalledProcessError | None = None
+    registrations: list[tuple[str, int | None]] = []
     for domain in (f"gui/{uid}", f"user/{uid}"):
-        loaded, pid = _launchd_print_service_pid(domain, label)
+        try:
+            loaded, pid = _launchd_print_service_pid(domain, label)
+        except subprocess.CalledProcessError as exc:
+            query_error = query_error or exc
+            continue
         if loaded:
-            return (domain, pid)
+            registrations.append((domain, pid))
+    if len(registrations) > 1:
+        domains = ", ".join(domain for domain, _pid in registrations)
+        raise RuntimeError(
+            f"{label} is registered in multiple launchd domains: {domains}"
+        )
+    if registrations:
+        domain, pid = registrations[0]
+        if pid is None and query_error is not None:
+            # A stopped registration is not positive liveness evidence. The
+            # errored domain could still own a running or duplicate service.
+            raise query_error
+        return (domain, pid)
+    if query_error is not None:
+        raise query_error
     return (None, None)
 
 
@@ -5741,7 +5774,12 @@ def _launchd_kickstart(label: str, domain: str) -> None:
 
 
 def _wait_for_launchd_service_pid(
-    label: str, old_pid: int | None, timeout: float = 10.0, *, domain: str
+    label: str,
+    old_pid: int | None,
+    timeout: float = 10.0,
+    *,
+    domain: str,
+    expected_pid: int | None = None,
 ) -> bool:
     """Poll ``domain/label`` until the service runs on a fresh PID.
 
@@ -5755,7 +5793,12 @@ def _wait_for_launchd_service_pid(
     deadline = time.monotonic() + max(timeout, 0.5)
     while True:
         _loaded, pid = _launchd_print_service_pid(domain, label)
-        if pid is not None and pid > 0 and pid != old_pid:
+        if (
+            pid is not None
+            and pid > 0
+            and pid != old_pid
+            and (expected_pid is None or pid == expected_pid)
+        ):
             return True
         if time.monotonic() >= deadline:
             return False

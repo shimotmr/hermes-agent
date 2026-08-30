@@ -10,13 +10,15 @@ gateway process creates at startup and removes on clean shutdown, answering
 versioned JSON verbs. A connectable socket with a well-formed ``identify``
 answer IS liveness — no PID-reuse heuristics.
 
-v1 verbs (observation only — no behavior change for the gateway):
+v1 verbs:
 
 - ``identify`` → pid, profile label, hermes_home, code_sha/code_version
   (the #91283 stamps, now queryable live), supervisor kind, served profiles,
   start_time, protocol version.
 - ``status``   → the live runtime-status payload (what ``gateway_state.json``
   holds today, but answered by the process itself, race-free).
+- ``restart-if-idle`` → after exact request/process/runtime identity and idle
+  checks, asks this serving gateway to restart itself via SIGUSR1.
 
 Transport:
 
@@ -51,10 +53,12 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import socket
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -76,6 +80,22 @@ _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 512 * 1024
 
 _DEFAULT_CLIENT_TIMEOUT = 2.0
+
+
+@dataclass(frozen=True)
+class DeferredControlResult:
+    """Successful result whose side effect may run only after ACK drain."""
+
+    result: dict[str, Any]
+    after_drain: Callable[[], None]
+    on_abort: Optional[Callable[[], None]] = None
+
+
+@dataclass(frozen=True)
+class PreparedControlReply:
+    payload: bytes
+    after_drain: Optional[Callable[[], None]] = None
+    on_abort: Optional[Callable[[], None]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -219,12 +239,76 @@ def build_status_payload() -> dict[str, Any]:
     return payload
 
 
+def restart_if_idle(
+    request: dict[str, Any],
+    *,
+    try_reserve: Callable[[], bool],
+    confirm_reservation: Callable[[], bool],
+    cancel_reservation: Callable[[], None],
+) -> DeferredControlResult:
+    """Reserve an idle restart and defer SIGUSR1 until its ACK is drained.
+
+    Identity is checked in the serving process. Idle authorization is injected
+    by the runner and must reserve the no-new-work gate on its event-loop thread.
+    """
+    from gateway.status import get_process_start_time
+
+    allowed_fields = {
+        "verb",
+        "id",
+        "protocol",
+        "expected_pid",
+        "expected_start_time",
+    }
+    if request.get("verb") != "restart-if-idle":
+        raise ValueError("restart-if-idle verb mismatch")
+    if (
+        type(request.get("protocol")) is not int
+        or request.get("protocol") != CONTROL_PROTOCOL_VERSION
+    ):
+        raise ValueError("restart-if-idle protocol mismatch")
+    if type(request.get("id")) is not int or request.get("id") != 1:
+        raise ValueError("restart-if-idle request id mismatch")
+    if set(request) - allowed_fields:
+        raise ValueError("restart-if-idle request has unexpected fields")
+
+    pid = os.getpid()
+    start_time = get_process_start_time(pid)
+    expected_pid = request.get("expected_pid")
+    expected_start_time = request.get("expected_start_time")
+
+    if type(start_time) is not int:
+        raise RuntimeError("gateway process start time unavailable")
+    if type(expected_pid) is not int or type(expected_start_time) is not int:
+        raise ValueError("expected_pid and expected_start_time must be integers")
+    if expected_pid != pid or expected_start_time != start_time:
+        raise RuntimeError("gateway identity mismatch")
+    if not try_reserve():
+        raise RuntimeError("gateway is not idle")
+
+    def _signal_if_still_reserved() -> None:
+        if not confirm_reservation():
+            cancel_reservation()
+            return
+        os.kill(pid, signal.SIGUSR1)
+
+    return DeferredControlResult(
+        result={
+            "accepted": True,
+            "identity": {"pid": pid, "start_time": start_time},
+            "signal": "SIGUSR1",
+        },
+        after_drain=_signal_if_still_reserved,
+        on_abort=cancel_reservation,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Server
 # ---------------------------------------------------------------------------
 
 class GatewayControlServer:
-    """Gateway-owned control socket server (identify/status, v1).
+    """Gateway-owned control socket server (v1 observation/control verbs).
 
     Lifecycle is owned by the gateway process: ``start()`` after the PID-file
     claim (the point where this process becomes the authoritative gateway for
@@ -238,6 +322,12 @@ class GatewayControlServer:
         home: Optional[Path] = None,
         *,
         verb_handlers: Optional[dict[str, Callable[[], dict[str, Any]]]] = None,
+        request_handlers: Optional[
+            dict[
+                str,
+                Callable[[dict[str, Any]], dict[str, Any] | DeferredControlResult],
+            ]
+        ] = None,
     ) -> None:
         if home is None:
             from gateway.status import _get_process_hermes_home
@@ -254,6 +344,7 @@ class GatewayControlServer:
         }
         if verb_handlers:
             self._handlers.update(verb_handlers)
+        self._request_handlers = dict(request_handlers or {})
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -339,13 +430,10 @@ class GatewayControlServer:
 
     # -- request handling ----------------------------------------------------
 
-    def handle_request_line(self, raw: bytes) -> bytes:
-        """Process one JSON request line, return one JSON response line.
-
-        Shared by the POSIX stream handler and the Windows pipe protocol.
-        Never raises.
-        """
+    def prepare_request_line(self, raw: bytes) -> PreparedControlReply:
+        """Dispatch and serialize a request without running deferred side effects."""
         request_id: Any = None
+        deferred: DeferredControlResult | None = None
         try:
             request = json.loads(raw.decode("utf-8"))
             if not isinstance(request, dict):
@@ -353,18 +441,35 @@ class GatewayControlServer:
             request_id = request.get("id")
             verb = request.get("verb")
             handler = self._handlers.get(verb) if isinstance(verb, str) else None
-            if handler is None:
+            request_handler = (
+                self._request_handlers.get(verb) if isinstance(verb, str) else None
+            )
+            if handler is None and request_handler is None:
                 response: dict[str, Any] = {
                     "ok": False,
                     "error": f"unknown verb: {verb!r}",
                     "protocol": CONTROL_PROTOCOL_VERSION,
-                    "supported_verbs": sorted(self._handlers),
+                    "supported_verbs": sorted(
+                        set(self._handlers) | set(self._request_handlers)
+                    ),
                 }
             else:
+                if request_handler is not None:
+                    result = request_handler(request)
+                else:
+                    assert handler is not None
+                    result = handler()
+                if isinstance(result, DeferredControlResult):
+                    if _IS_WINDOWS:
+                        if result.on_abort is not None:
+                            result.on_abort()
+                        raise RuntimeError("deferred control actions are unsupported")
+                    deferred = result
+                    result = result.result
                 response = {
                     "ok": True,
                     "protocol": CONTROL_PROTOCOL_VERSION,
-                    "result": handler(),
+                    "result": result,
                 }
         except Exception as exc:
             response = {
@@ -378,13 +483,35 @@ class GatewayControlServer:
             encoded = json.dumps(response, default=str).encode("utf-8")
         except Exception:
             encoded = b'{"ok": false, "error": "response serialization failed"}'
-        if len(encoded) > _MAX_RESPONSE_BYTES:
+            if deferred is not None and deferred.on_abort is not None:
+                with contextlib.suppress(Exception):
+                    deferred.on_abort()
+            deferred = None
+        if len(encoded) + 1 > _MAX_RESPONSE_BYTES:
             encoded = b'{"ok": false, "error": "response too large"}'
-        return encoded + b"\n"
+            if deferred is not None and deferred.on_abort is not None:
+                with contextlib.suppress(Exception):
+                    deferred.on_abort()
+            deferred = None
+        return PreparedControlReply(
+            payload=encoded + b"\n",
+            after_drain=deferred.after_drain if deferred else None,
+            on_abort=deferred.on_abort if deferred else None,
+        )
+
+    def handle_request_line(self, raw: bytes) -> bytes:
+        """Compatibility wrapper for synchronous non-transport callers.
+
+        Deferred state changes are deliberately not executed here: only a real
+        transport that has drained the ACK may run them.
+        """
+        return self.prepare_request_line(raw).payload
 
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        prepared: PreparedControlReply | None = None
+        action_completed = False
         try:
             raw = await asyncio.wait_for(
                 reader.readline(), timeout=_DEFAULT_CLIENT_TIMEOUT
@@ -395,16 +522,27 @@ class GatewayControlServer:
             # gateway's event loop (the same loop drives every platform
             # adapter), so a fast-polling consumer can't stall heartbeats.
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None, self.handle_request_line, raw.rstrip(b"\n")
+            reply = await loop.run_in_executor(
+                None, self.prepare_request_line, raw.rstrip(b"\n")
             )
-            writer.write(response)
+            prepared = reply
+            writer.write(reply.payload)
             await writer.drain()
+            if reply.after_drain is not None:
+                reply.after_drain()
+            action_completed = True
         except (asyncio.TimeoutError, ConnectionError, OSError):
             pass
         except Exception:
             logger.debug("Control socket connection handler error", exc_info=True)
         finally:
+            if (
+                not action_completed
+                and prepared is not None
+                and prepared.on_abort is not None
+            ):
+                with contextlib.suppress(Exception):
+                    prepared.on_abort()
             with contextlib.suppress(Exception):
                 writer.close()
 
@@ -428,7 +566,8 @@ class _PipeControlProtocol(asyncio.Protocol):
         if b"\n" in self._buffer:
             line, _, _ = bytes(self._buffer).partition(b"\n")
             try:
-                self._transport.write(self._server.handle_request_line(line))
+                prepared = self._server.prepare_request_line(line)
+                self._transport.write(prepared.payload)
             finally:
                 self._transport.close()
 
@@ -442,6 +581,7 @@ def query_gateway_control(
     verb: str,
     *,
     timeout: float = _DEFAULT_CLIENT_TIMEOUT,
+    request_fields: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     """Ask the gateway serving ``home`` a control verb; None when unanswered.
 
@@ -450,12 +590,12 @@ def query_gateway_control(
     ``ok: false`` — returns None so callers fall back to the scan layer.
     Never raises.
     """
-    request = (
-        json.dumps({"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION})
-        .encode("utf-8")
-        + b"\n"
-    )
     try:
+        request_payload = dict(request_fields or {})
+        request_payload.update(
+            {"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION}
+        )
+        request = json.dumps(request_payload).encode("utf-8") + b"\n"
         if _IS_WINDOWS:
             raw = _query_windows_pipe(Path(home), request, timeout)
         else:
@@ -468,7 +608,14 @@ def query_gateway_control(
         response = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         return None
-    if not isinstance(response, dict) or response.get("ok") is not True:
+    if (
+        not isinstance(response, dict)
+        or response.get("ok") is not True
+        or type(response.get("protocol")) is not int
+        or response.get("protocol") != CONTROL_PROTOCOL_VERSION
+        or type(response.get("id")) is not int
+        or response.get("id") != 1
+    ):
         return None
     result = response.get("result")
     return result if isinstance(result, dict) else None
@@ -495,10 +642,10 @@ def _query_unix_socket(home: Path, request: bytes, timeout: float) -> Optional[b
             if not chunk:
                 break
             chunks.append(chunk)
-            if b"\n" in chunk:
-                break
             if sum(len(c) for c in chunks) > _MAX_RESPONSE_BYTES:
                 return None
+            if b"\n" in chunk:
+                break
         data = b"".join(chunks)
         line, _, _ = data.partition(b"\n")
         return line or None
@@ -528,10 +675,10 @@ def _query_windows_pipe(
             if not chunk:
                 break
             chunks.append(chunk)
-            if b"\n" in chunk:
-                break
             if sum(len(c) for c in chunks) > _MAX_RESPONSE_BYTES:
                 return None
+            if b"\n" in chunk:
+                break
         data = b"".join(chunks)
         line, _, _ = data.partition(b"\n")
         return line or None

@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import time as _time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -3209,6 +3210,7 @@ def _run_pending_fleet_restart() -> bool:
         pass
     try:
         from hermes_cli.gateway import (
+            _get_service_pids,
             find_gateway_pids,
             is_macos,
             is_windows,
@@ -3255,7 +3257,20 @@ def _run_pending_fleet_restart() -> bool:
             leftover = list(find_gateway_pids(all_profiles=True))
         except Exception:
             leftover = list(pids or [])
-        if leftover:
+        if leftover and is_macos():
+            try:
+                service_pids = set(_get_service_pids(all_profiles=True))
+            except Exception as exc:
+                logger.debug(
+                    "Pending fleet restart: service PID probe failed: %s", exc
+                )
+                service_pids = set()
+            failed.extend(
+                f"manual-gateway-pid:{pid}"
+                for pid in leftover
+                if pid not in service_pids
+            )
+        elif leftover:
             try:
                 kill_gateway_processes(all_profiles=True)
                 _wait_for_gateway_exit(timeout=5.0, force_after=None)
@@ -6342,16 +6357,11 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
     for name in ordered:
         print(f"    - {name}")
     if is_macos():
-        # A launchd label reaches this list when launchd was not supervising a
-        # live process after the restart (#88848), so the unit is not merely
-        # stale — it is very likely deregistered, and `launchctl kickstart`
-        # cannot revive a job launchd no longer knows about.
-        print("  Listed services may be deregistered from launchd, or still")
-        print("  running pre-update code (mixed sys.modules). Recover with:")
-        print("    hermes gateway status")
-        print("    launchctl list | grep <label>")
-        print("    launchctl bootstrap gui/$(id -u) "
-              "~/Library/LaunchAgents/<label>.plist")
+        print("  One or more gateways may still be serving pre-update code.")
+        print("  Wait until active work and compression are idle, then retry:")
+        print("    hermes update --gateway")
+        print("  The updater will re-check control-socket identity and will not")
+        print("  use launchctl force, bootout, or bootstrap fallbacks.")
         return
     print("  Skipped units may still be running pre-update code (mixed")
     print("  sys.modules). Restart them manually, then verify:")
@@ -6363,81 +6373,303 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
         print("    launchctl kickstart -k gui/$UID/<label>   # macOS (or user/$UID)")
 
 
+@dataclass(frozen=True)
+class _LaunchdGatewayContractTarget:
+    label: str
+    home: Path
+    port: int
+
+
+def _gateway_adapter_port(value: object) -> int | None:
+    """Mirror APIServerAdapter._coerce_port(): integer conversion, no range clamp."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _profile_gateway_port(home: Path) -> int | None:
+    """Resolve the exact profile API port without mutating process globals."""
+    env_values: dict[str, object] = {}
+    env_port_present = False
+    env_port: int | None = None
+    try:
+        env_path = home / ".env"
+        if env_path.exists():
+            from dotenv import dotenv_values
+
+            env_values = dict(dotenv_values(env_path))
+            from hermes_cli.auth import has_usable_secret
+
+            env_port_present = "API_SERVER_PORT" in env_values
+            env_port = _gateway_adapter_port(env_values.get("API_SERVER_PORT"))
+            if has_usable_secret(
+                env_values.get("API_SERVER_KEY"), min_length=16
+            ) and env_port is not None:
+                return env_port
+
+        legacy: dict = {}
+        gateway_json_path = home / "gateway.json"
+        if gateway_json_path.exists():
+            try:
+                with gateway_json_path.open(encoding="utf-8") as handle:
+                    loaded = json.load(handle) or {}
+            except Exception:
+                loaded = {}
+            if not isinstance(loaded, dict):
+                # GatewayConfig.from_dict() coerces a malformed legacy root to
+                # an empty mapping. YAML processing cannot merge into that
+                # malformed root before the final coercion.
+                return env_port if env_port is not None else 8642
+            legacy = loaded
+
+        from hermes_cli import managed_scope
+
+        config_path = home / "config.yaml"
+        try:
+            if config_path.exists():
+                import yaml
+
+                with config_path.open(encoding="utf-8") as handle:
+                    raw = yaml.safe_load(handle) or {}
+            else:
+                raw = {}
+            raw = managed_scope.apply_managed_overlay(raw)
+            if not isinstance(raw, dict):
+                raise TypeError("managed config root is not a mapping")
+        except Exception:
+            # The gateway loader logs and retains the legacy base. Discovery
+            # stays read-only: fast_safe_load() would create a corrupt backup.
+            raw = {}
+
+        gateway = raw.get("gateway", {})
+        gateway = gateway if isinstance(gateway, dict) else {}
+        gateway_platforms = gateway.get("platforms", {})
+        gateway_platforms = (
+            gateway_platforms if isinstance(gateway_platforms, dict) else {}
+        )
+        platforms = raw.get("platforms", {})
+        platforms = platforms if isinstance(platforms, dict) else {}
+        legacy_platforms = legacy.get("platforms", {})
+        legacy_platforms = (
+            legacy_platforms if isinstance(legacy_platforms, dict) else {}
+        )
+
+        # Reproduce gateway/config.py's PlatformConfig merge exactly: legacy
+        # platforms are the base, then gateway.platforms and top-level
+        # platforms deep-merge ``extra``, then gateway.api_server is merged.
+        legacy_api = legacy_platforms.get("api_server")
+        if legacy_api is not None and not isinstance(legacy_api, dict):
+            legacy_api = {}
+        merged_api = dict(legacy_api or {})
+        legacy_extra = merged_api.get("extra", {})
+        if isinstance(legacy_extra, dict) and legacy_extra:
+            merged_api["extra"] = dict(legacy_extra)
+
+        def _partially_merged_runtime_port() -> int:
+            raw_extra = merged_api.get("extra", {})
+            if isinstance(raw_extra, dict) and "port" in raw_extra:
+                parsed = _gateway_adapter_port(raw_extra.get("port"))
+                return parsed if parsed is not None else 8642
+            return env_port if env_port is not None else 8642
+
+        for api_server in (
+            gateway_platforms.get("api_server"),
+            platforms.get("api_server"),
+            gateway.get("api_server"),
+        ):
+            if api_server is None:
+                continue
+            if not isinstance(api_server, dict):
+                continue
+            existing_extra = merged_api.get("extra", {})
+            incoming_extra = api_server.get("extra", {})
+            if not isinstance(existing_extra, dict) or not isinstance(
+                incoming_extra, dict
+            ):
+                # The real loader mutates this map incrementally. A late
+                # malformed block aborts processing but retains earlier merges.
+                return _partially_merged_runtime_port()
+            merged_extra = {**existing_extra, **incoming_extra}
+            merged_api = {**merged_api, **api_server}
+            if merged_extra:
+                merged_api["extra"] = merged_extra
+
+        extra = merged_api.get("extra", {})
+        if not isinstance(extra, dict):
+            extra = {}
+        extra = dict(extra)
+        if "port" in merged_api and "port" not in extra:
+            extra["port"] = merged_api.get("port")
+
+        # The runtime then runs a second shared-key bridge. It selects the
+        # top-level api_server block when present; otherwise it falls back to
+        # gateway.platforms first, then top-level platforms. A direct port in
+        # that selected source overwrites the already-merged extra.port unless
+        # the selected source has its own extra.port.
+        shared_api = raw.get("api_server")
+        if not isinstance(shared_api, dict):
+            shared_api = None
+            for source in (gateway_platforms, platforms):
+                candidate = source.get("api_server")
+                if isinstance(candidate, dict):
+                    shared_api = candidate
+                    break
+        if isinstance(shared_api, dict):
+            shared_extra = shared_api.get("extra", {})
+            try:
+                extra_has_port = "port" in shared_extra
+            except TypeError:
+                extra_has_port = True
+            if "port" in shared_api and not extra_has_port:
+                extra["port"] = shared_api.get("port")
+
+        if "port" not in extra and env_port_present:
+            # With no config port, APIServerAdapter falls back to the process
+            # API_SERVER_PORT even when the API key came from config.yaml.
+            return env_port if env_port is not None else 8642
+        if "port" not in extra:
+            return 8642
+        adapter_port = _gateway_adapter_port(extra.get("port"))
+        return adapter_port if adapter_port is not None else 8642
+    except Exception:
+        return None
+
+
+def _resolve_launchd_gateway_contract_target(
+    label: str,
+) -> _LaunchdGatewayContractTarget | None:
+    """Bind a launchd label to the exact profile home and configured port."""
+    from hermes_cli.profiles import list_profiles
+
+    for profile in list_profiles():
+        expected = (
+            "ai.hermes.gateway"
+            if profile.is_default
+            else f"ai.hermes.gateway-{profile.name}"
+        )
+        if label != expected:
+            continue
+        home = Path(profile.path).resolve()
+        port = _profile_gateway_port(home)
+        if port is None:
+            return None
+        return _LaunchdGatewayContractTarget(
+            label=label,
+            home=home,
+            port=port,
+        )
+    return None
+
+
+def _verified_graceful_restart_launchd_target(
+    target: _LaunchdGatewayContractTarget,
+    *,
+    timeout: float | None = None,
+):
+    from hermes_cli.gateway import _get_restart_drain_timeout
+    from hermes_cli.gateway_restart_contract import (
+        RestartProbe,
+        perform_verified_graceful_restart,
+    )
+
+    wait_budget = (
+        max(45.0, float(_get_restart_drain_timeout()))
+        if timeout is None
+        else max(45.0, float(timeout))
+    )
+    expected_code_sha = _current_checkout_sha()
+    if not expected_code_sha:
+        return RestartProbe(False, "checkout-code-sha-unavailable", None)
+    return perform_verified_graceful_restart(
+        target.home,
+        port=target.port,
+        health_url=f"http://127.0.0.1:{target.port}/health",
+        expected_code_sha=expected_code_sha,
+        timeout=wait_budget,
+    )
+
+
+def _verified_graceful_restart_current_launchd_gateway():
+    """Restart the current profile through the control-socket contract only.
+
+    No launchctl fallback is permitted here. Unknown or active work fails
+    closed, and the replacement must report the checkout's current code SHA.
+    """
+    from hermes_cli.gateway import get_launchd_label
+    from hermes_cli.gateway_restart_contract import RestartProbe
+
+    target = _resolve_launchd_gateway_contract_target(get_launchd_label())
+    if target is None:
+        return RestartProbe(False, "launchd-profile-target-missing", None)
+    return _verified_graceful_restart_launchd_target(target)
+
+
 def _restart_launchd_gateway_after_update(
     *, supervision_verify: bool = True
 ) -> tuple[list, list]:
-    """Restart the invoking profile's launchd gateway after an update.
+    """Gracefully restart and verify the invoking profile after an update.
 
-    #74973 (salvage #75021 by @jeff-mettel): the restart used to be gated on
-    ``launchctl list <label>`` exiting 0. A *booted-out* job — plist present,
-    definition deregistered from launchd (crashed helper, manual bootout,
-    failed prior update) — fails that check, so the whole branch silently
-    skipped: no restart, no message, ``KeepAlive`` unable to revive a
-    definition launchd no longer knows, and the update still printed
-    "Update complete!". ``launchctl list`` is also session-scoped and can
-    exit non-zero while the job is alive in its gui/user domain, so it is
-    not a reliable classifier at all.
-
-    The fix performs NO list-based classification: when the plist exists,
-    ``launchd_restart()`` always runs — it drains a live PID, kickstarts
-    with ``-k``, and owns the bootout/bootstrap/kickstart ladder for the
-    genuinely unloaded state. Every failure path is loud and names the
-    manual recovery command.
-
-    Returns ``(restarted_labels, failed_labels)``. With
-    ``supervision_verify`` (the update path), success additionally requires
-    launchd reporting a fresh supervised PID (#88848 — "the call returned"
-    is not "the gateway is supervised").
+    A plist only establishes that launchd supervision is expected. It does not
+    identify the serving process. The control-socket contract proves the exact
+    serving PID is idle twice, signals that PID with SIGUSR1, then verifies the
+    old process exited and a healthy replacement owns the listener, platform
+    writers, and expected code SHA. Failure is loud and has no force fallback.
     """
     from hermes_cli.gateway import (
+        _launchd_service_registered,
+        _locate_launchd_gateway_service,
+        _wait_for_launchd_service_pid,
         get_launchd_label,
         get_launchd_plist_path,
-        launchd_restart,
-        wait_for_launchd_gateway_supervision,
     )
 
     current_label = get_launchd_label()
     try:
         if not get_launchd_plist_path().exists():
             return [], []  # not a launchd install — nothing to do or warn
-        try:
-            launchd_restart()
-        except subprocess.CalledProcessError as e:
-            stderr = (getattr(e, "stderr", "") or "").strip()
+        domain, old_pid = _locate_launchd_gateway_service(current_label)
+        if domain is None:
+            if not _launchd_service_registered(current_label):
+                return [], []  # intentionally unloaded; never bootstrap it
             print(
-                f"  ⚠ Gateway restart failed: {stderr}\n"
-                "    The gateway may be DOWN on pre-update code. "
-                "Recover manually: hermes gateway restart"
+                f"  ⚠ {current_label}: launchd registration exists but its "
+                "serving state is unknown. No signal was attempted."
             )
             return [], [current_label]
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        # A plist exists, so a gateway is SUPPOSED to be supervised here —
-        # a broken/missing/wedged launchctl is not proof nothing needs
-        # restarting. The old code `pass`ed here (#74973's second silent
-        # variant); count it and tell the operator.
+        if old_pid is None or old_pid <= 0:
+            return [], []  # loaded but intentionally stopped
+        probe = _verified_graceful_restart_current_launchd_gateway()
+    except Exception as exc:
         print(
-            "  ⚠ Could not restart the gateway "
-            f"({e.__class__.__name__}: {e}).\n"
-            "    Recover manually: hermes gateway restart"
+            "  ⚠ Could not verify a graceful gateway restart "
+            f"({exc.__class__.__name__}: {exc}).\n"
+            "    No force fallback was attempted. Retry after the gateway is idle."
+        )
+        return [], [current_label]
+
+    if not probe.ready:
+        print(
+            f"  ⚠ Gateway restart deferred: {probe.reason}.\n"
+            "    No force fallback was attempted. Retry after the gateway is idle."
         )
         return [], [current_label]
 
     if not supervision_verify:
         return [current_label], []
 
-    # launchd_restart() returning is only "restart REQUESTED" — the
-    # self-restart branch hands work to the running gateway, a plist reload
-    # to a detached helper; both asynchronous. A helper that dies before its
-    # first bootstrap (#88848), or a bootstrap that exits 0 without
-    # registering (measured on macOS 26.6.1), otherwise reaches "Update
-    # complete!" with nothing supervising the gateway. Verified
-    # domain-agnostically (a domain locate fails on macOS-26 hosts whose
-    # per-user domains reject service management).
-    if wait_for_launchd_gateway_supervision(label=current_label):
+    if probe.identity is not None and _wait_for_launchd_service_pid(
+        current_label,
+        old_pid=old_pid,
+        timeout=10.0,
+        domain=domain,
+        expected_pid=probe.identity.pid,
+    ):
         return [current_label], []
     print(
-        f"  ✗ {current_label} restarted but launchd is not supervising it.\n"
-        "    Check logs, then: hermes gateway restart"
+        f"  ✗ {current_label} has a verified replacement but launchd is not "
+        "supervising it.\n"
+        "    Check logs; do not force-restart while work is active."
     )
     return [], [current_label]
 
@@ -6447,33 +6679,23 @@ def _restart_macos_launchd_gateways(
     failed_or_stale_units: list,
     drain_budget: float,
 ) -> None:
-    """Restart every launchd-managed gateway after an update (macOS).
+    """Restart every running launchd-managed gateway after an update.
 
-    The code update (git pull) is shared across all profiles, so every
-    ``ai.hermes.gateway*`` LaunchAgent must reload it — restarting only the
-    invoking profile's service leaves siblings on pre-update ``sys.modules``
-    until their next agent turn imports a symbol the old module generation
-    doesn't have (#41403).  Parity with the systemd fleet path.
-
-    The invoking profile keeps the existing ``launchd_restart()`` treatment
-    (self-restart request → graceful drain → kickstart).  Siblings get the
-    same drain-first sequence, with their launchd domain resolved per label:
-    a sibling bootstrapped in the other supported domain (``gui/<uid>`` vs
-    ``user/<uid>``) must not be kickstarted in the current profile's domain.
-    ``subprocess.TimeoutExpired`` is isolated per label so one wedged
-    launchctl call cannot leave the rest of the fleet on old code (#68523).
+    The code update is shared across profiles, so every running profile must
+    reload it. For each sibling, launchd is used only to establish whether a
+    label is currently supervised and to verify that the replacement is again
+    supervised. Serving identity, double idle preflight, SIGUSR1, old-process
+    exit, listener ownership, platform writers, health, and expected code SHA
+    are all owned by the profile-scoped control-socket contract. Missing,
+    active, or unknown state fails closed; there is no kickstart, bootout,
+    bootstrap, SIGTERM, or SIGKILL fallback.
     """
     from hermes_cli.gateway import (
         get_launchd_label,
-        get_launchd_plist_path,
-        launchd_restart,
         launchd_gateway_labels_for_install,
-        _graceful_restart_via_sigusr1,
-        _launchd_kickstart,
-        _launchd_service_registered,
         _locate_launchd_gateway_service,
+        _launchd_service_registered,
         _wait_for_launchd_service_pid,
-        wait_for_launchd_gateway_supervision,
     )
 
     # --- Current profile: unchanged single-service path ---------------------
@@ -6495,47 +6717,73 @@ def _restart_macos_launchd_gateways(
             # probed in one domain and restarted in another.
             domain, old_pid = _locate_launchd_gateway_service(label)
             if domain is None:
-                # Installed but not bootstrapped (stopped/uninstalled
-                # mid-way) — nothing is running old code here.
+                if _launchd_service_registered(label):
+                    failed_or_stale_units.append(label)
+                    print(
+                        f"  ⚠ {label}: launchd registration exists but its serving "
+                        "state is unknown.\n"
+                        "    No signal or force fallback was attempted."
+                    )
+                # Definitely unregistered profiles stay stopped. A registered
+                # but unlocatable profile is unknown and fails closed above.
                 continue
-            graceful_ok = False
-            if old_pid is not None and old_pid > 0:
-                print(f"  → {label}: draining (up to {int(drain_budget)}s)...")
-                graceful_ok = _graceful_restart_via_sigusr1(
-                    old_pid, drain_timeout=drain_budget
-                )
-            if graceful_ok and _wait_for_launchd_service_pid(
-                label, old_pid=old_pid, timeout=10.0, domain=domain
-            ):
-                # Unconditional KeepAlive already respawned it on the new
-                # code — a hard kickstart now would kill the fresh process.
-                restarted_services.append(label)
+            if old_pid is None or old_pid <= 0:
+                # Registered but intentionally stopped: no process is serving
+                # old code, and the updater must not start it as a side effect.
                 continue
-            try:
-                _launchd_kickstart(label, domain)
-            except subprocess.CalledProcessError as e:
-                stderr = (getattr(e, "stderr", "") or "").strip()
+            target = _resolve_launchd_gateway_contract_target(label)
+            if target is None:
                 failed_or_stale_units.append(label)
                 print(
-                    f"  ⚠ Failed to restart {label}: {stderr}\n"
-                    f"    Recover manually: launchctl kickstart -k {domain}/{label}"
+                    f"  ⚠ {label}: profile target could not be resolved.\n"
+                    "    No signal or force fallback was attempted."
+                )
+                continue
+            print(f"  → {label}: waiting for verified idle restart...")
+            probe = _verified_graceful_restart_launchd_target(
+                target, timeout=drain_budget
+            )
+            if not probe.ready:
+                failed_or_stale_units.append(label)
+                print(
+                    f"  ⚠ {label}: restart deferred: {probe.reason}.\n"
+                    "    No force fallback was attempted."
+                )
+                continue
+            if probe.identity is None:
+                failed_or_stale_units.append(label)
+                print(
+                    f"  ⚠ {label}: verified restart returned no serving identity.\n"
+                    "    No signal or force fallback was attempted."
                 )
                 continue
             if _wait_for_launchd_service_pid(
-                label, old_pid=old_pid, timeout=15.0, domain=domain
+                label,
+                old_pid=old_pid,
+                timeout=10.0,
+                domain=domain,
+                expected_pid=probe.identity.pid,
             ):
                 restarted_services.append(label)
             else:
                 failed_or_stale_units.append(label)
                 print(
-                    f"  ✗ {label} failed to come back after restart.\n"
-                    f"    Check logs, then: launchctl kickstart -k {domain}/{label}"
+                    f"  ✗ {label} has a verified replacement but launchd is not "
+                    "supervising a fresh PID.\n"
+                    "    No force fallback was attempted."
                 )
         except subprocess.TimeoutExpired:
             failed_or_stale_units.append(label)
             print(
                 f"  ⚠ launchctl timed out restarting {label}; "
                 "continuing with remaining gateways"
+            )
+        except Exception as exc:
+            failed_or_stale_units.append(label)
+            print(
+                f"  ⚠ {label}: restart verification unavailable "
+                f"({type(exc).__name__}: {exc}).\n"
+                "    No signal or force fallback was attempted; continuing."
             )
 
 
@@ -9550,8 +9798,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         failed_or_stale_units,
                         _drain_budget,
                     )
-                except (FileNotFoundError, ImportError):
-                    pass
+                except (FileNotFoundError, ImportError) as exc:
+                    failed_or_stale_units.append("macos-launchd-fleet")
+                    print(
+                        "  ⚠ macOS gateway restart verification unavailable "
+                        f"({type(exc).__name__}: {exc}). No force fallback was attempted."
+                    )
 
             # --- Manual (non-service) gateways ---
             # Kill any remaining gateway processes not managed by a service.
@@ -9737,7 +9989,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # started AFTER our restart attempt — respecting user
                 # intent, we don't kill those.
                 _stuck = [pid for pid in _surviving if pid in killed_pids]
-                if _stuck:
+                if _stuck and not _should_force_stuck_gateway_survivors(
+                    is_macos_host=is_macos()
+                ):
+                    for pid in _stuck:
+                        marker = f"manual-gateway-pid:{pid}"
+                        if marker not in failed_or_stale_units:
+                            failed_or_stale_units.append(marker)
+                    print()
+                    print(
+                        f"  ⚠ {len(_stuck)} manual gateway process(es) remain; "
+                        "macOS force fallback is disabled."
+                    )
+                elif _stuck:
                     print()
                     print(
                         f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
@@ -10147,6 +10411,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             sys.exit(1)
 
 # --- Hoisted from the body of _cmd_update_impl (self-contained, no closure state) ---
+
+def _should_force_stuck_gateway_survivors(*, is_macos_host: bool) -> bool:
+    """Keep the legacy survivor force path off macOS update flows."""
+    return not is_macos_host
+
 
 def _restart_phase_failure_is_incomplete(surviving, pre_restart_pids) -> bool:
     """Whether an escaped gateway-restart-phase exception must fail the update.

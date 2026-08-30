@@ -26,9 +26,78 @@ import pytest
 
 import hermes_cli.gateway as gateway_cli
 import hermes_cli.update_cmd as update_cmd
+from hermes_cli.gateway_restart_contract import RestartProbe, ServingIdentity
 from hermes_cli.update_cmd import _warn_incomplete_gateway_fleet_restart
 
 LABEL = "ai.hermes.gateway"
+
+
+@pytest.mark.parametrize("returncode", [3, 113])
+def test_launchd_print_not_found_is_definitely_absent(monkeypatch, returncode):
+    monkeypatch.setattr(
+        gateway_cli.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], returncode, "", "not found"),
+    )
+
+    assert gateway_cli._launchd_print_service_pid("gui/501", LABEL) == (False, None)
+
+
+@pytest.mark.parametrize("returncode", [1, 125])
+def test_launchd_print_query_error_is_unknown(monkeypatch, returncode):
+    monkeypatch.setattr(
+        gateway_cli.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], returncode, "", "denied"),
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        gateway_cli._launchd_print_service_pid("gui/501", LABEL)
+
+
+def test_launchd_locator_uses_positive_domain_after_other_domain_error(monkeypatch):
+    calls = iter(
+        [subprocess.CalledProcessError(125, ["launchctl"]), (True, 4200)]
+    )
+
+    def probe(_domain, _label):
+        result = next(calls)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(gateway_cli, "_launchd_print_service_pid", probe)
+
+    assert gateway_cli._locate_launchd_gateway_service(LABEL) == (
+        f"user/{gateway_cli.os.getuid()}",
+        4200,
+    )
+
+
+def test_launchd_locator_error_plus_absent_is_unknown(monkeypatch):
+    calls = iter([subprocess.CalledProcessError(125, ["launchctl"]), (False, None)])
+
+    def probe(_domain, _label):
+        result = next(calls)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(gateway_cli, "_launchd_print_service_pid", probe)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        gateway_cli._locate_launchd_gateway_service(LABEL)
+
+
+def test_launchd_registration_query_error_is_unknown(monkeypatch):
+    monkeypatch.setattr(
+        gateway_cli.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 125, "", "denied"),
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        gateway_cli._launchd_service_registered(LABEL)
 
 
 class _FakeClock:
@@ -158,6 +227,8 @@ def _patch_launchd_env(
     registered=True,
     restart=None,
     supervised=True,
+    running_pid: int | None = 4321,
+    domain: str | None = "gui/501",
 ):
     """Drive ``_restart_macos_launchd_gateways`` through the invoking profile only.
 
@@ -178,6 +249,11 @@ def _patch_launchd_env(
     monkeypatch.setattr(
         gateway_cli, "launchd_gateway_labels_for_install", lambda: [LABEL]
     )
+    monkeypatch.setattr(
+        gateway_cli,
+        "_locate_launchd_gateway_service",
+        lambda _label: (domain, running_pid),
+    )
 
     calls = {"restart": 0, "verify": 0, "label": None}
 
@@ -188,13 +264,22 @@ def _patch_launchd_env(
 
     monkeypatch.setattr(gateway_cli, "launchd_restart", _restart)
 
-    def _verify(*, label=None, **_kw):
+    def _verify(label, *, old_pid, timeout, domain, expected_pid=None):
         calls["verify"] += 1
         calls["label"] = label
+        calls["expected_pid"] = expected_pid
         return supervised
 
     monkeypatch.setattr(
-        gateway_cli, "wait_for_launchd_gateway_supervision", _verify
+        gateway_cli, "_wait_for_launchd_service_pid", _verify
+    )
+    identity = ServingIdentity(
+        9876, 12345, update_cmd.get_hermes_home(), "verified-code"
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_verified_graceful_restart_current_launchd_gateway",
+        lambda: RestartProbe(True, "replacement-healthy", identity),
     )
     return calls
 
@@ -212,6 +297,44 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
     counting a label as restarted.  The invoking profile did not, so the two
     halves of the same function disagreed about what "restarted" means."""
 
+    def test_active_gateway_is_deferred_without_launchd_fallback(
+        self, monkeypatch
+    ):
+        calls = _patch_launchd_env(monkeypatch, supervised=True)
+        identity = ServingIdentity(4321, 9876, update_cmd.get_hermes_home(), "old")
+        monkeypatch.setattr(
+            update_cmd,
+            "_verified_graceful_restart_current_launchd_gateway",
+            lambda: RestartProbe(False, "active-work:1", identity),
+            raising=False,
+        )
+
+        restarted, failed_or_stale = _run_fleet_restart()
+
+        assert restarted == []
+        assert failed_or_stale == [LABEL]
+        assert calls["restart"] == 0
+        assert calls["verify"] == 0
+
+    def test_idle_gateway_uses_verified_contract_without_force_fallback(
+        self, monkeypatch
+    ):
+        calls = _patch_launchd_env(monkeypatch, supervised=True)
+        identity = ServingIdentity(9876, 12345, update_cmd.get_hermes_home(), "new")
+        monkeypatch.setattr(
+            update_cmd,
+            "_verified_graceful_restart_current_launchd_gateway",
+            lambda: RestartProbe(True, "replacement-healthy", identity),
+            raising=False,
+        )
+
+        restarted, failed_or_stale = _run_fleet_restart()
+
+        assert restarted == [LABEL]
+        assert failed_or_stale == []
+        assert calls["restart"] == 0
+        assert calls["verify"] == 1
+
     def test_reports_restarted_only_after_supervision_is_confirmed(
         self, monkeypatch
     ):
@@ -221,9 +344,21 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
 
         assert restarted == [LABEL]
         assert failed_or_stale == []
-        assert calls["restart"] == 1
+        assert calls["restart"] == 0
         assert calls["verify"] == 1
         assert calls["label"] == LABEL
+        assert calls["expected_pid"] == 9876
+
+    def test_supervision_of_wrong_fresh_pid_is_not_accepted(
+        self, monkeypatch
+    ):
+        calls = _patch_launchd_env(monkeypatch, supervised=False)
+
+        restarted, failed_or_stale = _run_fleet_restart()
+
+        assert restarted == []
+        assert failed_or_stale == [LABEL]
+        assert calls["expected_pid"] == 9876
 
     def test_unverified_restart_is_not_reported_as_restarted(
         self, monkeypatch, capsys
@@ -255,23 +390,20 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
         """
         assert gateway_cli.LAUNCHD_SUPERVISION_VERIFY_TIMEOUT >= 15.0
 
-    def test_raised_restart_failure_is_not_verified_and_is_reported(
+    def test_contract_exception_is_not_verified_and_is_reported(
         self, monkeypatch, capsys
     ):
-        """A raised restart is a failed restart, and must not be verified.
+        """A failed contract probe is loud and never reaches supervision."""
+        calls = _patch_launchd_env(monkeypatch)
 
-        Every path in ``launchd_restart`` that can still leave a working
-        gateway - the detached fallback on an unmanageable domain - returns
-        rather than raising, so reaching the handler means neither kickstart
-        nor bootstrap brought the service back.
+        def fail_contract():
+            raise OSError("boom")
 
-        This matters for composition with the open PRs that add verification
-        *inside* ``launchd_restart`` (#63304, #72752): they convert this exact
-        failure from silent to raised, so the caller must keep routing it into
-        ``failed_or_stale_units`` rather than falling through to the verifier.
-        """
-        exc = subprocess.CalledProcessError(1, ["launchctl"], stderr="boom")
-        calls = _patch_launchd_env(monkeypatch, restart=exc)
+        monkeypatch.setattr(
+            update_cmd,
+            "_verified_graceful_restart_current_launchd_gateway",
+            fail_contract,
+        )
 
         restarted, failed_or_stale = _run_fleet_restart()
 
@@ -287,31 +419,87 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
         assert calls["restart"] == 0
         assert calls["verify"] == 0
 
-    def test_unregistered_label_is_restarted_not_skipped(self, monkeypatch):
-        """A booted-out job (plist present, deregistered) must be RESTARTED.
+    def test_unregistered_label_is_not_force_bootstrapped(self, monkeypatch):
+        """Missing serving identity fails closed instead of bootstrapping."""
+        calls = _patch_launchd_env(
+            monkeypatch, registered=False, running_pid=None, domain=None
+        )
+        monkeypatch.setattr(
+            update_cmd,
+            "_verified_graceful_restart_current_launchd_gateway",
+            lambda: RestartProbe(False, "control-identity-missing", None),
+        )
 
-        FLIPPED by the #74973 fix (salvage #75021): this test used to pin
-        'registered=False → nothing to restart', which was precisely the
-        silent-skip bug — launchctl list is session-scoped and non-zero
-        for booted-out jobs whose plist very much still wants a gateway;
-        launchd_restart() owns the bootout/bootstrap ladder for that state.
-        """
-        calls = _patch_launchd_env(monkeypatch, registered=False)
+        assert _run_fleet_restart() == ([], [])
+        assert calls["restart"] == 0
+        assert calls["verify"] == 0
 
-        assert _run_fleet_restart() == ([LABEL], [])
-        assert calls["restart"] == 1
+    def test_launchctl_list_failure_does_not_hide_live_current_gateway(
+        self, monkeypatch
+    ):
+        calls = _patch_launchd_env(
+            monkeypatch, registered=False, running_pid=4321, domain="gui/501"
+        )
+
+        restarted, failed = _run_fleet_restart()
+
+        assert (restarted, failed) == ([LABEL], [])
         assert calls["verify"] == 1
+
+    def test_registered_but_unlocatable_current_is_failed_unknown(
+        self, monkeypatch
+    ):
+        calls = _patch_launchd_env(
+            monkeypatch, registered=True, running_pid=None, domain=None
+        )
+
+        restarted, failed = _run_fleet_restart()
+
+        assert (restarted, failed) == ([], [LABEL])
+        assert calls["restart"] == 0
+
+    def test_unexpected_current_contract_exception_is_isolated(
+        self, monkeypatch
+    ):
+        calls = _patch_launchd_env(monkeypatch)
+
+        def explode():
+            raise RuntimeError("adapter exploded")
+
+        monkeypatch.setattr(
+            update_cmd,
+            "_verified_graceful_restart_current_launchd_gateway",
+            explode,
+        )
+
+        restarted, failed = _run_fleet_restart()
+
+        assert (restarted, failed) == ([], [LABEL])
+        assert calls["verify"] == 0
+
+    def test_loaded_but_stopped_current_profile_skips_contract_and_signal(
+        self, monkeypatch
+    ):
+        calls = _patch_launchd_env(monkeypatch, registered=True, running_pid=None)
+
+        restarted, failed = _run_fleet_restart()
+
+        assert (restarted, failed) == ([], [])
+        assert calls["restart"] == 0
+        assert calls["verify"] == 0
 
 
 class TestIncompleteFleetWarningIsPlatformCorrect:
-    def test_macos_recovery_instructions_are_launchctl(self, monkeypatch, capsys):
-        """A launchd label must not be handed systemctl commands."""
+    def test_macos_recovery_instructions_use_safe_retry(self, monkeypatch, capsys):
+        """A launchd label must not be handed force or systemd commands."""
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
 
         _warn_incomplete_gateway_fleet_restart([LABEL])
 
         out = capsys.readouterr().out
-        assert "launchctl bootstrap" in out
+        assert "hermes update --gateway" in out
+        assert "launchctl bootstrap" not in out
+        assert "launchctl kickstart -k" not in out
         assert "systemctl" not in out
 
     def test_linux_recovery_instructions_are_unchanged(self, monkeypatch, capsys):

@@ -20,10 +20,13 @@ selected via the `cron.provider` config key (empty = built-in).
 from __future__ import annotations
 
 import inspect
+import logging
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("cron.scheduler_provider")
 
 # Cap for the exponential tick backoff applied while consecutive ticks fail
 # with fd exhaustion (EMFILE/ENFILE, #87644).  Base is the tick interval
@@ -246,14 +249,49 @@ class CronScheduler(ABC):
         — e.g. the dashboard lifespan drain signalling pending webhook
         fires before the event loop shuts down.
         """
+        from cron.executions import finish_execution
+        from cron.jobs import release_fire_claim
         from cron.scheduler import run_one_job
 
-        run_one_job(
+        dispatched = run_one_job(
             claimed_job,
             adapters=adapters,
             loop=loop,
             cancel_event=cancel_event,
         )
+        if dispatched is not True:
+            execution_id = claimed_job.get("execution_id")
+            if isinstance(execution_id, str) and execution_id:
+                try:
+                    finish_execution(
+                        execution_id,
+                        success=False,
+                        error=(
+                            "Execution was not started because gateway restart "
+                            "dispatch is paused."
+                        ),
+                    )
+                except Exception as execution_err:
+                    logger.warning(
+                        "Could not terminalize rejected execution for job '%s': %s",
+                        claimed_job.get("id", "unknown"),
+                        execution_err,
+                    )
+            claim = claimed_job.get("fire_claim")
+            fire_owner = claim.get("by") if isinstance(claim, dict) else None
+            if isinstance(fire_owner, str) and fire_owner:
+                try:
+                    release_fire_claim(
+                        str(claimed_job.get("id") or ""),
+                        expected_owner=fire_owner,
+                    )
+                except Exception as claim_err:
+                    logger.warning(
+                        "Could not release rejected fire claim for job '%s': %s",
+                        claimed_job.get("id", "unknown"),
+                        claim_err,
+                    )
+            return False
         return True
 
     def reconcile(self) -> None:

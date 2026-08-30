@@ -103,6 +103,22 @@ class TestDispatchFailurePathsClearClaim:
         assert reloaded.get("run_claim") is None
         assert job["id"] not in sched.get_running_job_ids()
 
+    def test_restart_pause_path_clears_claim(self, cron_store):
+        from cron import scheduler as sched
+
+        job = _make_oneshot(claimed=True)
+        token = None
+        try:
+            token, _running = sched.reserve_restart_dispatch()
+            self._tick_one(job)
+        finally:
+            if token is not None:
+                sched.release_restart_dispatch(token)
+
+        reloaded = [j for j in jobs_mod.load_jobs() if j["id"] == job["id"]][0]
+        assert reloaded.get("run_claim") is None
+        assert job["id"] not in sched.get_running_job_ids()
+
     def test_submit_failure_clears_claim(self, cron_store):
         from cron import scheduler as sched
         job = _make_oneshot(claimed=True)

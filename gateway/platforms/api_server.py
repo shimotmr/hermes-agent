@@ -1631,6 +1631,24 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return 0
 
+    def strict_active_agent_work_count(self) -> int:
+        """Return live API work without converting corrupt authority to idle."""
+        pending = self._pending_agent_requests
+        inflight = self._inflight_agent_runs
+        for name, value in (
+            ("pending agent requests", pending),
+            ("inflight agent runs", inflight),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"invalid {name} authority")
+        active_tasks = 0
+        for task in self._active_run_tasks.values():
+            done = task.done()
+            if type(done) is not bool:
+                raise ValueError("invalid active run task authority")
+            active_tasks += int(not done)
+        return pending + inflight + active_tasks
+
     def interrupt_active_runs(self, reason: str) -> int:
         """Cooperatively interrupt every adapter-owned agent during shutdown.
 
