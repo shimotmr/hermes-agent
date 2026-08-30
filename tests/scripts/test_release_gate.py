@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
+from contextlib import contextmanager
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -41,10 +43,19 @@ def commit(repo: Path, path: str, text: str, message: str) -> str:
 
 def authority(repo: Path, frozen: str, candidate: str) -> dict[str, str]:
     return {
+        "expected_reviewed_sha": frozen,
         "expected_candidate_sha": candidate,
         "expected_frozen_sha": frozen,
         "expected_candidate_tree_sha": git(repo, "rev-parse", f"{candidate}^{{tree}}"),
     }
+
+
+def release_authority(
+    repo: Path, reviewed: str, frozen: str, candidate: str
+) -> dict[str, str]:
+    result = authority(repo, frozen, candidate)
+    result["expected_reviewed_sha"] = reviewed
+    return result
 
 
 @pytest.fixture
@@ -387,7 +398,7 @@ def test_evidence_append_rejects_symlink_created_during_open_without_nofollow(
     monkeypatch.setattr(release_gate.os, "O_NOFOLLOW", 0, raising=False)
     monkeypatch.setattr(release_gate.os, "open", racing_open)
 
-    with pytest.raises(ValueError, match="evidence-target-(symlink|replaced)"):
+    with pytest.raises(ValueError, match="evidence-target-(symlink|replaced|exists)"):
         append_evidence(
             manifest,
             repo=repo,
@@ -460,6 +471,121 @@ def test_evidence_append_rejects_existing_replacement_race(
         original_identity.st_dev,
         original_identity.st_ino,
     )
+
+
+def test_evidence_first_append_rejects_hardlink_created_during_open(
+    monkeypatch, repo: Path, tmp_path: Path
+) -> None:
+    """An absent target must never open/chmod/append a raced external inode."""
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    outside = tmp_path / "outside.jsonl"
+    outside.write_bytes(b"")
+    outside.chmod(0o640)
+    original_mode = outside.stat().st_mode & 0o777
+    frozen = git(repo, "rev-parse", "HEAD")
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
+    real_open = release_gate.os.open
+    raced = False
+
+    def hardlink_before_open(path, flags, mode=0o777):
+        nonlocal raced
+        if Path(path) == manifest and not raced:
+            raced = True
+            os.link(outside, manifest)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(release_gate.os, "open", hardlink_before_open)
+
+    with pytest.raises(ValueError, match="evidence-target-(exists|replaced)"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=frozen,
+            command="tests",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+    assert outside.read_bytes() == b""
+    assert outside.stat().st_mode & 0o777 == original_mode
+
+
+def test_evidence_append_rejects_path_replacement_after_lock(
+    monkeypatch, repo: Path, tmp_path: Path
+) -> None:
+    """A successful return requires the locked inode to remain at the pathname."""
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    manifest.write_bytes(b"")
+    frozen = git(repo, "rev-parse", "HEAD")
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
+    real_lock = release_gate._evidence_file_lock
+
+    @contextmanager
+    def replace_after_lock(path, handle):
+        with real_lock(path, handle):
+            manifest.unlink()
+            manifest.write_bytes(b"")
+            yield
+
+    monkeypatch.setattr(release_gate, "_evidence_file_lock", replace_after_lock)
+
+    with pytest.raises(ValueError, match="evidence-target-replaced"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=frozen,
+            command="tests",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+    assert manifest.read_bytes() == b""
+
+
+def test_evidence_append_rejects_path_replacement_at_write(
+    monkeypatch, repo: Path, tmp_path: Path
+) -> None:
+    """Replacing the pathname after the locked pre-write check must fail."""
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    manifest.write_bytes(b"")
+    frozen = git(repo, "rev-parse", "HEAD")
+    snapshot = freeze_snapshot(repo, "HEAD", local_base_sha=frozen)
+    real_write = release_gate.os.write
+    replaced = False
+
+    def replace_before_write(descriptor, data):
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            manifest.unlink()
+            manifest.write_bytes(b"")
+        return real_write(descriptor, data)
+
+    monkeypatch.setattr(release_gate.os, "write", replace_before_write)
+
+    with pytest.raises(ValueError, match="evidence-target-replaced"):
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=frozen,
+            command="tests",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+    assert manifest.read_bytes() == b""
 
 
 def test_release_evidence_rejects_a_failed_required_gate(repo: Path, tmp_path: Path) -> None:
@@ -867,6 +993,7 @@ def test_release_validation_is_bound_to_caller_expected_authority(
             repo=repo,
             required_gate_ids=("freeze",),
             expected_candidate_sha="f" * 40,
+            expected_reviewed_sha=frozen,
             expected_frozen_sha=frozen,
             expected_candidate_tree_sha=git(repo, "rev-parse", f"{candidate}^{{tree}}"),
         )
@@ -909,6 +1036,7 @@ def test_overlap_authority_requires_overlap_compatibility_gate(
             repo=repo,
             required_gate_ids=("freeze",),
             expected_candidate_sha=candidate,
+            expected_reviewed_sha=reviewed,
             expected_frozen_sha=frozen,
             expected_critical_paths=("candidate.txt",),
             expected_candidate_tree_sha=git(repo, "rev-parse", f"{candidate}^{{tree}}"),
@@ -947,6 +1075,7 @@ def test_overlap_authority_rejects_latest_sha_other_than_expected_frozen(
             repo=repo,
             required_gate_ids=("overlap-compatibility",),
             expected_candidate_sha=candidate,
+            expected_reviewed_sha=frozen,
             expected_frozen_sha=frozen,
             expected_critical_paths=("candidate.txt",),
             expected_candidate_tree_sha=git(repo, "rev-parse", f"{candidate}^{{tree}}"),
@@ -985,8 +1114,114 @@ def test_overlap_authority_rejects_event_supplied_critical_path_policy(
             manifest,
             repo=repo,
             required_gate_ids=("overlap-compatibility",),
+            expected_reviewed_sha=reviewed,
             expected_candidate_sha=candidate,
             expected_frozen_sha=frozen,
             expected_critical_paths=("gateway/",),
             expected_candidate_tree_sha=git(repo, "rev-parse", f"{candidate}^{{tree}}"),
+        )
+
+
+@pytest.mark.parametrize("forged_classification", ["unchanged", "disjoint"])
+def test_overlap_authority_rejects_forged_reviewed_sha(
+    repo: Path, tmp_path: Path, forged_classification: str
+) -> None:
+    """A forged from_sha cannot erase reviewed-to-frozen critical drift."""
+    from scripts import release_gate
+
+    manifest = tmp_path / "evidence.jsonl"
+    reviewed = git(repo, "rev-parse", "HEAD")
+    after_critical = commit(repo, "hermes_cli/update_cmd.py", "drift\n", "critical drift")
+    if forged_classification == "unchanged":
+        frozen = after_critical
+        forged_from = frozen
+    else:
+        frozen = commit(repo, "docs/readme.md", "docs\n", "non-critical drift")
+        forged_from = after_critical
+    git(repo, "branch", "frozen", frozen)
+    candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=candidate)
+    forged = classify_overlap(
+        repo, forged_from, frozen, critical_paths=("hermes_cli/",)
+    )
+    assert forged.classification == forged_classification
+    for gate_id in REQUIRED_RELEASE_GATE_IDS:
+        append_evidence(
+            manifest,
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=candidate,
+            gate_id=gate_id,
+            command=gate_id,
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+            overlap_report=forged if gate_id == "freeze" else None,
+            overlap_critical_paths=("hermes_cli/",) if gate_id == "freeze" else (),
+        )
+
+    with pytest.raises(EvidenceCorrupt, match="release-overlap-reviewed-mismatch"):
+        release_gate.validate_release_evidence(
+            manifest,
+            repo=repo,
+            required_gate_ids=(),
+            expected_critical_paths=("hermes_cli/",),
+            **release_authority(repo, reviewed, frozen, candidate),
+        )
+
+
+def test_validate_cli_requires_and_forwards_expected_reviewed_sha(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from scripts import release_gate
+
+    captured = {}
+    policy = tmp_path / "policy.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "schema_version": "hermes.update.critical-paths.v1",
+                    "paths": ["hermes_cli/"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        release_gate,
+        "validate_release_evidence",
+        lambda *args, **kwargs: captured.update(kwargs) or [],
+    )
+
+    assert main(
+        [
+            "validate-evidence",
+            "--path", str(tmp_path / "evidence.jsonl"),
+            "--repo", str(tmp_path),
+            "--required-gate", "freeze",
+            "--expected-reviewed-sha", "1" * 40,
+            "--expected-candidate-sha", "2" * 40,
+            "--expected-frozen-sha", "3" * 40,
+            "--expected-candidate-tree-sha", "4" * 40,
+            "--policy", str(policy),
+        ]
+    ) == 0
+    assert captured["expected_reviewed_sha"] == "1" * 40
+
+
+def test_validate_cli_requires_expected_reviewed_sha(tmp_path: Path) -> None:
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="2"):
+        main(
+            [
+                "validate-evidence",
+                "--path", str(tmp_path / "evidence.jsonl"),
+                "--repo", str(tmp_path),
+                "--required-gate", "freeze",
+                "--expected-candidate-sha", "2" * 40,
+                "--expected-frozen-sha", "3" * 40,
+                "--expected-candidate-tree-sha", "4" * 40,
+                "--policy", str(policy),
+            ]
         )

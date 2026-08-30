@@ -526,6 +526,7 @@ def validate_release_evidence(
     *,
     repo: Path,
     required_gate_ids: Sequence[str],
+    expected_reviewed_sha: str | None = None,
     expected_candidate_sha: str | None = None,
     expected_frozen_sha: str | None = None,
     expected_candidate_tree_sha: str | None = None,
@@ -546,7 +547,9 @@ def validate_release_evidence(
         raise EvidenceCorrupt("release-authority-mixed")
     frozen_sha, candidate_sha, _snapshot_id = next(iter(authority))
     if (
-        expected_candidate_sha is None
+        expected_reviewed_sha is None
+        or not _is_sha(expected_reviewed_sha)
+        or expected_candidate_sha is None
         or expected_frozen_sha is None
         or expected_candidate_tree_sha is None
     ):
@@ -597,6 +600,8 @@ def validate_release_evidence(
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise EvidenceCorrupt("release-overlap-authority-invalid") from exc
+    if expected_overlap.from_sha != expected_reviewed_sha:
+        raise EvidenceCorrupt("release-overlap-reviewed-mismatch")
     if expected_overlap.latest_sha != expected_frozen_sha:
         raise EvidenceCorrupt("release-overlap-frozen-mismatch")
     if asdict(expected_overlap) != asdict(recomputed):
@@ -663,10 +668,16 @@ def append_evidence(
             raise ValueError("evidence-target-symlink")
         if not stat.S_ISREG(target_status.st_mode):
             raise ValueError("evidence-target-not-regular")
-    open_flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+    open_flags = os.O_RDWR | os.O_APPEND
+    if target_status is None:
+        open_flags |= os.O_CREAT | os.O_EXCL
     open_flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(target, open_flags, 0o600)
+    except FileExistsError as exc:
+        if target_status is None:
+            raise ValueError("evidence-target-exists") from exc
+        raise
     except OSError as exc:
         if target.is_symlink():
             raise ValueError("evidence-target-symlink") from exc
@@ -698,6 +709,20 @@ def append_evidence(
             os.chmod(target, 0o600)
         with os.fdopen(descriptor, "r+b", closefd=False) as handle:
             with _evidence_file_lock(target, handle):
+                def verify_target_identity() -> None:
+                    try:
+                        locked_status = target.lstat()
+                    except OSError as exc:
+                        raise ValueError("evidence-target-replaced") from exc
+                    if stat.S_ISLNK(locked_status.st_mode):
+                        raise ValueError("evidence-target-symlink")
+                    if (
+                        locked_status.st_dev != opened_status.st_dev
+                        or locked_status.st_ino != opened_status.st_ino
+                    ):
+                        raise ValueError("evidence-target-replaced")
+
+                verify_target_identity()
                 handle.seek(0)
                 events = _read_evidence_bytes(handle.read(), repo=Path(repo))
                 snapshot_payload = asdict(snapshot)
@@ -732,8 +757,10 @@ def append_evidence(
                 event["event_hash"] = hashlib.sha256(_canonical_bytes(event)).hexdigest()
                 event = json.loads(_canonical_bytes(event))
                 encoded = _canonical_bytes(event) + b"\n"
+                verify_target_identity()
                 os.write(handle.fileno(), encoded)
                 os.fsync(handle.fileno())
+                verify_target_identity()
                 return event
     finally:
         os.close(descriptor)
@@ -809,6 +836,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     validate.add_argument("--path", type=Path, required=True)
     validate.add_argument("--repo", type=Path, required=True)
     validate.add_argument("--required-gate", action="append", required=True)
+    validate.add_argument("--expected-reviewed-sha", required=True)
     validate.add_argument("--expected-candidate-sha", required=True)
     validate.add_argument("--expected-frozen-sha", required=True)
     validate.add_argument("--expected-candidate-tree-sha", required=True)
@@ -855,6 +883,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.path,
             repo=args.repo,
             required_gate_ids=args.required_gate,
+            expected_reviewed_sha=args.expected_reviewed_sha,
             expected_candidate_sha=args.expected_candidate_sha,
             expected_frozen_sha=args.expected_frozen_sha,
             expected_candidate_tree_sha=args.expected_candidate_tree_sha,
