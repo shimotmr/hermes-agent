@@ -64,6 +64,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_HOME="${INSTALL_ROOT:+$(dirname "$INSTALL_ROOT")}"
 HERMES_HOME="${HERMES_HOME:-${TMPDIR:-/tmp}}"
 MARKER="$HERMES_HOME/.hermes-update-in-progress"
+MARKER_GUARD="${MARKER}.lock"
+CLAIM_TOKEN="${HERMES_UPDATE_CLAIM_TOKEN:-}"
 LOG_DIR="$HERMES_HOME/logs"; mkdir -p "$LOG_DIR" 2>/dev/null || true
 LOG="$LOG_DIR/desktop-update-handoff.log"
 RESULT="$HERMES_HOME/.hermes-update-result.json"
@@ -75,6 +77,40 @@ FINAL_MSG="update did not complete"
 DONE_NOTE=""  # set when the update succeeded but the app will NOT reopen itself
 
 log() { echo "$(date +%Y-%m-%dT%H:%M:%S%z) $1" | tee -a "$LOG" 2>/dev/null; }
+
+pid_alive() {
+  case "$1" in ''|*[!0-9]*|0) return 1 ;; esac
+  /usr/bin/python3 - "$1" <<'PY' >/dev/null 2>&1
+import os, sys
+try:
+    os.kill(int(sys.argv[1]), 0)
+except ProcessLookupError:
+    raise SystemExit(1)
+except (PermissionError, OSError, ValueError):
+    raise SystemExit(0)  # unknown authority fails closed
+PY
+}
+
+acquire_marker_guard() {
+  local attempt owner
+  for attempt in 1 2 3; do
+    if mkdir "$MARKER_GUARD" 2>/dev/null; then
+      printf '%s\n' "$$" > "$MARKER_GUARD/owner" 2>/dev/null || true
+      return 0
+    fi
+    owner="$(cat "$MARKER_GUARD/owner" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$owner" ] || return 1
+    pid_alive "$owner" && return 1
+    rm -f "$MARKER_GUARD/owner" 2>/dev/null || return 1
+    rmdir "$MARKER_GUARD" 2>/dev/null || return 1
+  done
+  return 1
+}
+
+release_marker_guard() {
+  rm -f "$MARKER_GUARD/owner" 2>/dev/null || true
+  rmdir "$MARKER_GUARD" 2>/dev/null || true
+}
 
 # Keep a durable signal breadcrumb.  A detached hand-off used to leave only the
 # generic FINAL_MSG when it was terminated while the updater child was running,
@@ -430,10 +466,12 @@ finish() {
   write_result
 
   if [ "$NO_MARKER_CLEANUP" -eq 0 ]; then
+    if acquire_marker_guard; then
     marker_quarantine="${MARKER}.remove-$$-${RANDOM}"
     if mv "$MARKER" "$marker_quarantine" 2>/dev/null; then
       marker_owner="$(head -1 "$marker_quarantine" 2>/dev/null | tr -d '[:space:]')"
-      if [ "$marker_owner" = "$$" ]; then
+      marker_token="$(sed -n '3p' "$marker_quarantine" 2>/dev/null | tr -d '[:space:]')"
+      if [ "$marker_owner" = "$$" ] && { [ -z "$CLAIM_TOKEN" ] || [ "$marker_token" = "$CLAIM_TOKEN" ]; }; then
         rm -f "$marker_quarantine" 2>/dev/null || true
         if [ -e "$marker_quarantine" ]; then
           ln "$marker_quarantine" "$MARKER" 2>/dev/null || true
@@ -443,6 +481,8 @@ finish() {
       elif [ -e "$MARKER" ]; then
         rm -f "$marker_quarantine" 2>/dev/null || true
       fi
+    fi
+    release_marker_guard
     fi
   fi
 
@@ -552,13 +592,40 @@ if [ "${#STARTED_AT}" -ne "${#NOW}" ] \
   STARTED_AT="$NOW"
 fi
 MARKER_TEMP="${MARKER}.write-$$-${RANDOM}"
-if printf '%s\n%s\n' "$$" "$STARTED_AT" > "$MARKER_TEMP" 2>/dev/null \
-    && mv -f "$MARKER_TEMP" "$MARKER" 2>/dev/null; then
-  :
-else
+if [ -z "$CLAIM_TOKEN" ]; then
+  CLAIM_TOKEN="$(uuidgen 2>/dev/null | tr -d '-' || true)"
+  [ -n "$CLAIM_TOKEN" ] || CLAIM_TOKEN="$$-$NOW-$RANDOM-$RANDOM"
+fi
+claim_ok=0
+if acquire_marker_guard; then
+  if [ -e "$MARKER" ]; then
+    current_pid="$(sed -n '1p' "$MARKER" 2>/dev/null | tr -d '[:space:]')"
+    current_started="$(sed -n '2p' "$MARKER" 2>/dev/null | tr -d '[:space:]')"
+    current_token="$(sed -n '3p' "$MARKER" 2>/dev/null | tr -d '[:space:]')"
+    expected_pid="${HERMES_UPDATE_HANDOFF_PID:-}"
+    if [ -n "$expected_pid" ] && [ "$current_pid" = "$expected_pid" ] \
+        && [ "$current_token" = "$CLAIM_TOKEN" ]; then
+      printf '%s\n%s\n%s\n' "$$" "$current_started" "$CLAIM_TOKEN" > "$MARKER_TEMP" 2>/dev/null \
+        && mv -f "$MARKER_TEMP" "$MARKER" 2>/dev/null && claim_ok=1
+    elif [ "$current_pid" = "$$" ] && { [ -z "$current_token" ] || [ "$current_token" = "$CLAIM_TOKEN" ]; }; then
+      claim_ok=1
+    elif ! pid_alive "$current_pid"; then
+      stale="${MARKER}.stale-$$-${RANDOM}"
+      mv "$MARKER" "$stale" 2>/dev/null && rm -f "$stale" 2>/dev/null || true
+    fi
+  fi
+  if [ "$claim_ok" -eq 0 ] && [ ! -e "$MARKER" ]; then
+    printf '%s\n%s\n%s\n' "$$" "$STARTED_AT" "$CLAIM_TOKEN" > "$MARKER_TEMP" 2>/dev/null \
+      && ln "$MARKER_TEMP" "$MARKER" 2>/dev/null && claim_ok=1
+  fi
+  release_marker_guard
+fi
+rm -f "$MARKER_TEMP" 2>/dev/null || true
+if [ "$claim_ok" -ne 1 ]; then
   rm -f "$MARKER_TEMP" 2>/dev/null || true
-  log "ERROR: could not atomically claim update marker"
+  log "ERROR: update marker is owned by another live or unverifiable updater"
   FINAL_CODE=1 FINAL_MSG="Could not claim the update lock safely. Nothing was changed."
+  [ "$SELF_TEST_MARKER" -eq 1 ] && trap - EXIT
   exit "$FINAL_CODE"
 fi
 
