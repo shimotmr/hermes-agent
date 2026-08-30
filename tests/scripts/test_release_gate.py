@@ -14,6 +14,8 @@ from scripts.release_gate import (
     freeze_snapshot,
     load_acceptance_matrix,
     load_critical_paths,
+    main,
+    probe_merge_tree,
     validate_evidence,
 )
 
@@ -127,7 +129,7 @@ def test_critical_path_policy_rejects_unsafe_entries(tmp_path: Path, paths: list
         load_critical_paths(policy)
 
 
-def test_acceptance_matrix_invalidates_only_overlapping_criteria(
+def test_critical_overlap_invalidates_entire_acceptance_matrix(
     repo: Path, tmp_path: Path
 ) -> None:
     matrix_path = tmp_path / "matrix.json"
@@ -163,12 +165,14 @@ def test_acceptance_matrix_invalidates_only_overlapping_criteria(
 
     assert [criterion["status"] for criterion in result["criteria"]] == [
         "invalidated",
-        "passed",
+        "invalidated",
     ]
-    assert result["criteria"][0]["invalidation_reason"] == "path-overlap"
+    assert {criterion["invalidation_reason"] for criterion in result["criteria"]} == {
+        "critical-path-overlap"
+    }
 
 
-def test_indeterminate_overlap_invalidates_every_required_criterion(
+def test_indeterminate_overlap_invalidates_entire_acceptance_matrix(
     repo: Path, tmp_path: Path
 ) -> None:
     matrix_path = tmp_path / "matrix.json"
@@ -202,17 +206,77 @@ def test_indeterminate_overlap_invalidates_every_required_criterion(
 
     assert [criterion["status"] for criterion in result["criteria"]] == [
         "invalidated",
-        "passed",
+        "invalidated",
     ]
     assert result["criteria"][0]["invalidation_reason"] == "overlap-indeterminate"
 
 
-def test_evidence_append_is_prefix_preserving_and_hash_chained(tmp_path: Path) -> None:
+@pytest.mark.parametrize("classification_sha", ["overlap", "indeterminate"])
+def test_blocking_classification_returns_nonzero(
+    repo: Path, tmp_path: Path, classification_sha: str
+) -> None:
+    reviewed = git(repo, "rev-parse", "HEAD")
+    latest = (
+        commit(repo, "hermes_cli/update_cmd.py", "changed\n", "critical")
+        if classification_sha == "overlap"
+        else "f" * 40
+    )
+    policy = tmp_path / "policy.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "schema_version": "hermes.update.critical-paths.v1",
+                "paths": ["hermes_cli/"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(
+        [
+            "classify",
+            "--repo",
+            str(repo),
+            "--from-sha",
+            reviewed,
+            "--latest-sha",
+            latest,
+            "--policy",
+            str(policy),
+        ]
+    ) != 0
+
+
+def test_merge_tree_probe_detects_conflict_without_touching_checkout(repo: Path) -> None:
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-b", "candidate")
+    candidate = commit(repo, "shared.txt", "candidate\n", "candidate")
+    git(repo, "checkout", "main")
+    current = commit(repo, "shared.txt", "main\n", "main")
+    status_before = git(repo, "status", "--porcelain=v1")
+    head_before = git(repo, "rev-parse", "HEAD")
+
+    result = probe_merge_tree(repo, current, candidate)
+
+    assert result.classification == "conflict"
+    assert git(repo, "status", "--porcelain=v1") == status_before
+    assert git(repo, "rev-parse", "HEAD") == head_before
+
+
+def test_evidence_append_binds_real_commits_snapshot_trees_and_ancestry(
+    repo: Path, tmp_path: Path
+) -> None:
     manifest = tmp_path / "evidence.jsonl"
+    frozen = git(repo, "rev-parse", "HEAD")
+    git(repo, "branch", "frozen", frozen)
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=frozen)
+    candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
     first = append_evidence(
         manifest,
-        frozen_sha="a" * 40,
-        candidate_sha="b" * 40,
+        repo=repo,
+        snapshot=snapshot,
+        frozen_sha=frozen,
+        candidate_sha=candidate,
         command="pytest -q tests/unit",
         exit_code=0,
         recorded_at="2026-08-30T04:00:00Z",
@@ -220,8 +284,10 @@ def test_evidence_append_is_prefix_preserving_and_hash_chained(tmp_path: Path) -
     prefix = manifest.read_bytes()
     second = append_evidence(
         manifest,
-        frozen_sha="a" * 40,
-        candidate_sha="b" * 40,
+        repo=repo,
+        snapshot=snapshot,
+        frozen_sha=frozen,
+        candidate_sha=candidate,
         command="ruff check .",
         exit_code=0,
         recorded_at="2026-08-30T04:01:00Z",
@@ -231,15 +297,24 @@ def test_evidence_append_is_prefix_preserving_and_hash_chained(tmp_path: Path) -
     assert first["sequence"] == 1
     assert second["sequence"] == 2
     assert second["previous_event_hash"] == first["event_hash"]
-    assert validate_evidence(manifest) == [first, second]
+    assert first["snapshot_id"] == snapshot.snapshot_id
+    assert first["frozen_tree_sha"] == git(repo, "rev-parse", f"{frozen}^{{tree}}")
+    assert first["candidate_tree_sha"] == git(repo, "rev-parse", f"{candidate}^{{tree}}")
+    assert validate_evidence(manifest, repo=repo) == [first, second]
 
 
-def test_evidence_tampering_is_detected_without_rewriting(tmp_path: Path) -> None:
+def test_evidence_tampering_is_detected_without_rewriting(repo: Path, tmp_path: Path) -> None:
     manifest = tmp_path / "evidence.jsonl"
+    frozen = git(repo, "rev-parse", "HEAD")
+    git(repo, "branch", "frozen", frozen)
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=frozen)
+    candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
     append_evidence(
         manifest,
-        frozen_sha="a" * 40,
-        candidate_sha="b" * 40,
+        repo=repo,
+        snapshot=snapshot,
+        frozen_sha=frozen,
+        candidate_sha=candidate,
         command="pytest -q",
         exit_code=0,
         recorded_at="2026-08-30T04:00:00Z",
@@ -249,17 +324,23 @@ def test_evidence_tampering_is_detected_without_rewriting(tmp_path: Path) -> Non
     tampered = manifest.read_bytes()
 
     with pytest.raises(EvidenceCorrupt, match="event-hash-mismatch"):
-        validate_evidence(manifest)
+        validate_evidence(manifest, repo=repo)
 
     assert manifest.read_bytes() == tampered
 
 
-def test_truncated_tail_is_detected(tmp_path: Path) -> None:
+def test_truncated_tail_is_detected(repo: Path, tmp_path: Path) -> None:
     manifest = tmp_path / "evidence.jsonl"
+    frozen = git(repo, "rev-parse", "HEAD")
+    git(repo, "branch", "frozen", frozen)
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=frozen)
+    candidate = commit(repo, "candidate.txt", "candidate\n", "candidate")
     append_evidence(
         manifest,
-        frozen_sha="a" * 40,
-        candidate_sha="b" * 40,
+        repo=repo,
+        snapshot=snapshot,
+        frozen_sha=frozen,
+        candidate_sha=candidate,
         command="pytest -q",
         exit_code=0,
         recorded_at="2026-08-30T04:00:00Z",
@@ -268,4 +349,68 @@ def test_truncated_tail_is_detected(tmp_path: Path) -> None:
         handle.write(b'{"sequence":2')
 
     with pytest.raises(EvidenceCorrupt, match="invalid-json-line:2"):
-        validate_evidence(manifest)
+        validate_evidence(manifest, repo=repo)
+
+
+def test_evidence_rejects_non_commit_and_non_descendant_candidate(
+    repo: Path, tmp_path: Path
+) -> None:
+    frozen = git(repo, "rev-parse", "HEAD")
+    git(repo, "branch", "frozen", frozen)
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=frozen)
+    git(repo, "checkout", "--orphan", "unrelated")
+    git(repo, "rm", "-rf", ".")
+    unrelated = commit(repo, "other.txt", "other\n", "unrelated")
+
+    with pytest.raises(ValueError, match="candidate-not-descendant"):
+        append_evidence(
+            tmp_path / "evidence.jsonl",
+            repo=repo,
+            snapshot=snapshot,
+            frozen_sha=frozen,
+            candidate_sha=unrelated,
+            command="pytest -q",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+
+def test_evidence_rejects_snapshot_tree_not_bound_to_frozen_commit(
+    repo: Path, tmp_path: Path
+) -> None:
+    frozen = git(repo, "rev-parse", "HEAD")
+    later = commit(repo, "later.txt", "later\n", "later")
+    git(repo, "branch", "frozen", frozen)
+    snapshot = freeze_snapshot(repo, "frozen", local_base_sha=frozen)
+    forged = snapshot.__class__(
+        **{
+            **snapshot.__dict__,
+            "target_tree_sha": git(repo, "rev-parse", f"{later}^{{tree}}"),
+        }
+    )
+
+    with pytest.raises(ValueError, match="snapshot-tree-mismatch"):
+        append_evidence(
+            tmp_path / "evidence.jsonl",
+            repo=repo,
+            snapshot=forged,
+            frozen_sha=frozen,
+            candidate_sha=later,
+            command="pytest -q",
+            exit_code=0,
+            recorded_at="2026-08-30T04:00:00Z",
+        )
+
+
+def test_release_gate_imports_when_fcntl_is_unavailable() -> None:
+    result = subprocess.run(
+        [
+            "python",
+            "-c",
+            "import sys; sys.modules['fcntl']=None; import scripts.release_gate",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
