@@ -30,6 +30,7 @@ test('Windows spawn holds the update mutex across marker check and helper spawn'
   const encoded = command.match(/-EncodedCommand\s+([^\s]+)$/)?.[1]
   const script = encoded ? Buffer.from(encoded, 'base64').toString('utf16le') : ''
   assert.match(script, /\.hermes-update-in-progress/)
+  assert.match(script, /\$markerGuard=\$marker\+"\.lock"/)
   assert.match(script, /\$mutexPath=\$marker\+"\.mutex"/)
   assert.match(script, /\.Lock\(0,1\)/)
   assert.match(script, /windows_ssh_runtime.*spawn/)
@@ -127,6 +128,7 @@ test('Windows relaunch gate uses strict install-wide marker parsing and fail-clo
 
   await assertWindowsRemoteInstallUpdateClear(ssh, 'C:\\Users\\alice\\.hermes\\profiles\\research')
   assert.match(script, /\.hermes-update-in-progress/)
+  assert.match(script, /\$guard=\$marker\+"\.lock"/)
   assert.match(script, /Split-Path -Leaf \$parent.*profiles/)
   assert.match(script, /UTF8Encoding.*true/)
   assert.match(script, /\\A\(\[1-9\]/)

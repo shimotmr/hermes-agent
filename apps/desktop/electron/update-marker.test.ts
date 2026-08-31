@@ -17,10 +17,12 @@ import assert from 'node:assert/strict'
 import os from 'os'
 import path from 'path'
 
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
 
 import {
   isPidAlive,
+  claimUpdateMarker,
+  handoffUpdateMarker,
   markerPath,
   readLiveUpdateMarker,
   UPDATE_MARKER_MAX_AGE_MS,
@@ -52,6 +54,103 @@ test('absent marker => no live update', () => {
   assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
 })
 
+test('operation guard blocks backend gate while canonical marker is absent', () => {
+  const home = tmpHome('guard-only')
+  const guard = `${markerPath(home)}.lock`
+  fs.mkdirSync(guard)
+  fs.writeFileSync(path.join(guard, 'owner'), `${process.pid}\n`)
+
+  const blocked = readLiveUpdateMarker(home, { kill: ALIVE })
+
+  assert.ok(blocked)
+  assert.equal(blocked.pid, 0)
+})
+
+test('operation guard appearing during marker read still blocks backend gate', () => {
+  const home = tmpHome('guard-race')
+  const file = markerPath(home)
+  const guard = `${file}.lock`
+  const read = vi.spyOn(fs, 'readFileSync').mockImplementation(candidate => {
+    assert.equal(candidate, file)
+    fs.writeFileSync(guard, `${process.pid}\n`)
+    const err = new Error('marker temporarily absent')
+
+    ;(err as NodeJS.ErrnoException).code = 'ENOENT'
+    throw err
+  })
+
+  try {
+    assert.ok(readLiveUpdateMarker(home, { kill: ALIVE }))
+  } finally {
+    read.mockRestore()
+  }
+})
+
+test('unknown or corrupt operation guard blocks backend gate', () => {
+  const home = tmpHome('guard-corrupt')
+  fs.mkdirSync(`${markerPath(home)}.lock`)
+
+  assert.ok(readLiveUpdateMarker(home, { kill: DEAD }))
+})
+
+test('operation guard reclaim preserves an ABA replacement published after detach', () => {
+  const home = tmpHome('guard-aba')
+  const guard = `${markerPath(home)}.lock`
+  fs.writeFileSync(guard, '999999\n')
+  const replacement = `${process.pid}\n`
+  const renameSync = fs.renameSync.bind(fs)
+  const rename = vi.spyOn(fs, 'renameSync').mockImplementation((source, destination) => {
+    renameSync(source, destination)
+    if (source === guard) fs.writeFileSync(guard, replacement)
+  })
+
+  try {
+    assert.equal(claimUpdateMarker(home, 4242, { kill: pid => (pid === process.pid ? true : DEAD(pid, 0)) }), null)
+    assert.equal(
+      rename.mock.calls.filter((call: any[]) => call[0] === guard).length,
+      1,
+      'the replacement guard must never be detached'
+    )
+    assert.equal(fs.readFileSync(guard, 'ascii'), replacement)
+  } finally {
+    rename.mockRestore()
+  }
+})
+
+test('operation guard restore failure keeps the canonical namespace blocked', () => {
+  const home = tmpHome('guard-restore-failure')
+  const guard = `${markerPath(home)}.lock`
+  fs.writeFileSync(guard, 'malformed\n')
+  const linkSync = fs.linkSync.bind(fs)
+  const mkdirSync = fs.mkdirSync.bind(fs)
+  const link = vi.spyOn(fs, 'linkSync').mockImplementation((source, destination) => {
+    if (destination === guard && String(source).includes('.stale-')) {
+      const err = new Error('simulated ACL denial')
+      ;(err as NodeJS.ErrnoException).code = 'EACCES'
+      throw err
+    }
+    return linkSync(source, destination)
+  })
+  const mkdir = vi.spyOn(fs, 'mkdirSync').mockImplementation((candidate, options) => {
+    if (candidate === guard) {
+      const err = new Error('simulated namespace denial')
+      ;(err as NodeJS.ErrnoException).code = 'EACCES'
+      throw err
+    }
+    return mkdirSync(candidate, options as any)
+  })
+
+  try {
+    assert.equal(claimUpdateMarker(home, 4242, { kill: DEAD }), null)
+    assert.equal(fs.existsSync(guard), false)
+    assert.ok(fs.readdirSync(path.dirname(guard)).some(name => name.includes(`${path.basename(guard)}.stale-`)))
+    assert.equal(claimUpdateMarker(home, 4242, { kill: DEAD }), null, 'orphan quarantine must block reacquire')
+  } finally {
+    link.mockRestore()
+    mkdir.mockRestore()
+  }
+})
+
 test('live pid within age ceiling => live update reported', () => {
   const home = tmpHome('live')
   const now = 1_000_000_000_000
@@ -70,20 +169,40 @@ test('dead pid => no live update and marker is pruned', () => {
   assert.ok(!fs.existsSync(markerPath(home)), 'a dead-pid marker self-heals (deleted)')
 })
 
-test('expired marker (past age ceiling) => no live update and pruned', () => {
+test('expired marker with a live pid remains authoritative', () => {
   const home = tmpHome('expired')
   const now = 1_000_000_000_000
   writeMarker(home, 4242, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
-  // Even though the pid is "alive", the marker is too old to trust.
-  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
-  assert.ok(!fs.existsSync(markerPath(home)), 'an expired marker self-heals (deleted)')
+  const owner = readLiveUpdateMarker(home, { kill: ALIVE, now: () => now })
+  assert.ok(owner)
+  assert.equal(owner.pid, 4242)
+  assert.ok(fs.existsSync(markerPath(home)), 'age alone must never evict a live updater')
 })
 
-test('malformed marker => no live update and pruned', () => {
+test('claim is atomic no-replace and handoff requires expected owner and token', () => {
+  const home = tmpHome('claim-cas')
+  const first = claimUpdateMarker(home, 1010, { now: () => 1_000_000_000_000, kill: ALIVE })
+  assert.ok(first, 'the first claimant atomically publishes')
+
+  assert.equal(
+    claimUpdateMarker(home, 2020, { now: () => 1_000_000_001_000, kill: ALIVE }),
+    null,
+    'a second claimant must not replace the existing claim'
+  )
+  assert.equal(handoffUpdateMarker(home, 1010, 'wrong-token', 2020), false)
+  assert.equal(handoffUpdateMarker(home, 9999, first.token, 2020), false)
+  assert.equal(handoffUpdateMarker(home, 1010, first.token, 2020), true)
+
+  const lines = fs.readFileSync(markerPath(home), 'utf8').split('\n')
+  assert.equal(Number.parseInt(lines[0], 10), 2020)
+  assert.equal(lines[2], first.token)
+})
+
+test('malformed marker fails closed', () => {
   const home = tmpHome('malformed')
   fs.writeFileSync(markerPath(home), 'not-a-pid\nnonsense')
-  assert.equal(readLiveUpdateMarker(home, { kill: ALIVE }), null)
-  assert.ok(!fs.existsSync(markerPath(home)))
+  assert.ok(readLiveUpdateMarker(home, { kill: ALIVE }))
+  assert.ok(fs.existsSync(markerPath(home)))
 })
 
 test('isPidAlive: own pid is alive, impossible pid is dead', () => {
@@ -104,6 +223,17 @@ test('isPidAlive: EPERM counts as alive (process owned by another user)', () => 
   assert.equal(isPidAlive(4242, eperm), true)
 })
 
+test('isPidAlive: unknown probe errors fail closed', () => {
+  const unknown = () => {
+    const err = new Error('probe failed')
+
+    ;(err as any).code = 'EIO'
+    throw err
+  }
+
+  assert.equal(isPidAlive(4242, unknown), true)
+})
+
 test('writeUpdateMarker writes a marker that readLiveUpdateMarker accepts', () => {
   const home = tmpHome('write')
   const now = 1_000_000_000_000
@@ -120,8 +250,24 @@ test('writeUpdateMarker preserves a live holder age across pid hand-off', () => 
   const now = 1_000_000_000_000
   const startedAt = Math.floor(now / 1000) - 300
 
-  writeMarker(home, 1010, startedAt)
-  writeUpdateMarker(home, 2020, { kill: ALIVE, now: () => now })
+  const claim = claimUpdateMarker(home, 1010, { now: () => now, startedAt })
+  assert.ok(claim)
+  const oldHandle = fs.openSync(markerPath(home), 'r')
+
+  try {
+    assert.equal(handoffUpdateMarker(home, 1010, claim.token, 2020), true)
+
+    const detachedBody = Buffer.alloc(128)
+    const detachedLength = fs.readSync(oldHandle, detachedBody, 0, detachedBody.length, 0)
+
+    assert.match(
+      detachedBody.subarray(0, detachedLength).toString('utf8'),
+      /^1010\n/,
+      'handoff publishes a new inode; an already-open old claim is never rewritten in place'
+    )
+  } finally {
+    fs.closeSync(oldHandle)
+  }
 
   const [pidLine, startedLine] = fs.readFileSync(markerPath(home), 'utf8').split('\n')
   assert.equal(Number.parseInt(pidLine, 10), 2020, 'the hand-off records the new owner')
@@ -158,9 +304,8 @@ test('writeUpdateMarker + dead pid => self-heals on read', () => {
 // updateHandoffConflict (#75778)
 //
 // A retried "Update" click must not spawn a second updater over a still-live
-// one — writeUpdateMarker unconditionally overwrites the marker, so an
-// unchecked hand-off clobbers the original updater's claim while it is still
-// alive and mutating the checkout.
+// one. The diagnostic helper and atomic claim must agree that the original
+// updater remains authoritative.
 // ---------------------------------------------------------------------------
 
 test('no marker => hand-off is not blocked', () => {
@@ -186,11 +331,11 @@ test('a dead-pid marker does not block a hand-off (self-heals)', () => {
   assert.equal(updateHandoffConflict(home, { kill: DEAD }), null)
 })
 
-test('an expired marker does not block a hand-off (self-heals)', () => {
+test('an old marker still blocks a hand-off while its pid is alive', () => {
   const home = tmpHome('conflict-expired')
   const now = 1_000_000_000_000
   writeMarker(home, 1010, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
-  assert.equal(updateHandoffConflict(home, { kill: ALIVE, now: () => now }), null)
+  assert.ok(updateHandoffConflict(home, { kill: ALIVE, now: () => now }))
 })
 
 test('minutes-scale elapsed time is formatted as "Nm Ss"', () => {

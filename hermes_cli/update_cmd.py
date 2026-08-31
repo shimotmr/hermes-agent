@@ -550,6 +550,72 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
     except (subprocess.CalledProcessError, OSError):
         return None
 
+
+def _reset_hard_if_head_matches(
+    git_cmd: list[str], cwd: Path, target_sha: str, *, expected_head: str
+) -> subprocess.CompletedProcess[str]:
+    """Move the checked-out branch only if HEAD still matches the observed SHA."""
+    branch_result = subprocess.run(
+        git_cmd + ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    branch = branch_result.stdout.strip()
+    current = _capture_head_sha(git_cmd, cwd)
+    if branch_result.returncode != 0 or not branch or current != expected_head:
+        return subprocess.CompletedProcess(
+            git_cmd, 1, "", "HEAD changed after destructive-reset authorization"
+        )
+    detach = subprocess.run(
+        git_cmd + ["checkout", "--detach", expected_head],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if detach.returncode != 0:
+        return detach
+    update_ref = subprocess.run(
+        git_cmd + ["update-ref", f"refs/heads/{branch}", target_sha, expected_head],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    checkout = subprocess.run(
+        git_cmd + ["checkout", branch],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return update_ref if update_ref.returncode != 0 else checkout
+
+
+def _capture_fetched_target_sha(git_cmd, cwd, remote_ref: str) -> str | None:
+    """Resolve a fetched mutable ref once; reject missing or malformed SHAs."""
+    try:
+        result = subprocess.run(
+            git_cmd + ["rev-parse", f"{remote_ref}^{{commit}}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    value = result.stdout.strip()
+    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+        return None
+    return value
+
+
 # Files that define the editable install. A pull that touches none of them
 # cannot have invalidated it.
 _INSTALL_DEFINING_FILES = (
@@ -1286,7 +1352,12 @@ def _branch_head_suffix(git_cmd=None, cwd=None) -> str:
 
 
 def _assess_parked_branch_switch(
-    git_cmd: list[str], cwd: Path, current_branch: str, target_branch: str
+    git_cmd: list[str],
+    cwd: Path,
+    current_branch: str,
+    target_branch: str,
+    *,
+    frozen_target_sha: str | None = None,
 ) -> tuple[bool, str]:
     """Decide whether it is safe to auto-switch a parked feature branch back
     to the update target.
@@ -1337,8 +1408,9 @@ def _assess_parked_branch_switch(
     if status.stdout.strip():
         return False, "dirty"
 
+    comparison_target = frozen_target_sha or f"origin/{target_branch}"
     cherry = subprocess.run(
-        git_cmd + ["cherry", f"origin/{target_branch}"],
+        git_cmd + ["cherry", comparison_target],
         cwd=cwd, capture_output=True,
         text=True, encoding="utf-8", errors="replace",
     )
@@ -1353,6 +1425,59 @@ def _assess_parked_branch_switch(
         # "branch kept with N unmerged commit(s)" notice.
         return True, f"unmerged:{len(unmerged)}"
     return True, ""
+
+
+def _checkout_target_at_frozen(
+    git_cmd: list[str], cwd: Path, target_branch: str, frozen_target_sha: str
+) -> subprocess.CompletedProcess[str]:
+    """Checkout the target without letting its mutable ref redefine this run.
+
+    An existing target branch is always checked out unchanged so a concurrent
+    ref advance cannot be overwritten after the local-only probe.  A missing
+    branch is created at the already-frozen commit with ``checkout -b``;
+    creation fails closed if another process creates it first.
+    """
+    local_only = subprocess.run(
+        git_cmd
+        + [
+            "rev-list",
+            "--count",
+            f"{frozen_target_sha}..refs/heads/{target_branch}",
+        ],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if local_only.returncode == 0:
+        try:
+            int(local_only.stdout.strip())
+        except ValueError:
+            return subprocess.CompletedProcess(
+                local_only.args, 1, local_only.stdout, "invalid local-only count"
+            )
+        return subprocess.run(
+            git_cmd + ["checkout", target_branch],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    elif (
+        "unknown revision" not in local_only.stderr
+        and "ambiguous argument" not in local_only.stderr
+    ):
+        return local_only
+    return subprocess.run(
+        git_cmd + ["checkout", "-b", target_branch, frozen_target_sha],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 def _print_parked_branch_skip_warning(
@@ -2364,15 +2489,9 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     from datetime import datetime, timezone
 
     stash_name = datetime.now(timezone.utc).strftime(
-        "hermes-update-autostash-%Y%m%d-%H%M%S"
-    )
+        "hermes-update-autostash-%Y%m%d-%H%M%S-"
+    ) + os.urandom(16).hex()
     print("→ Local changes detected — stashing before update...")
-    prev_stash = subprocess.run(
-        git_cmd + ["rev-parse", "--verify", "refs/stash"],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    ).stdout.strip()
     push = subprocess.run(
         git_cmd + ["stash", "push", "--include-untracked", "-m", stash_name],
         cwd=cwd,
@@ -2382,15 +2501,24 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     if push.stdout.strip():
         print(push.stdout.strip())
     stash_probe = subprocess.run(
-        git_cmd + ["rev-parse", "--verify", "refs/stash"],
+        git_cmd + ["stash", "list", "--format=%H%x00%gs"],
         cwd=cwd,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
     )
-    stash_ref = stash_probe.stdout.strip()
-    stash_created = (
-        stash_probe.returncode == 0 and bool(stash_ref) and stash_ref != prev_stash
-    )
+    stash_ref = None
+    if stash_probe.returncode == 0:
+        for line in stash_probe.stdout.splitlines():
+            commit, separator, subject = line.partition("\0")
+            if (
+                separator
+                and len(commit) == 40
+                and all(character in "0123456789abcdef" for character in commit)
+                and (subject == stash_name or subject.endswith(f": {stash_name}"))
+            ):
+                stash_ref = commit
+                break
+    stash_created = stash_ref is not None
 
     if push.returncode != 0:
         if stash_created:
@@ -2433,6 +2561,14 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
                 push.returncode, push.args, output=push.stdout, stderr=push.stderr
             )
 
+    if not stash_created:
+        raise subprocess.CalledProcessError(
+            1,
+            push.args,
+            output=push.stdout,
+            stderr="autostash ownership could not be verified",
+        )
+
     return stash_ref
 
 def _resolve_stash_selector(
@@ -2451,19 +2587,59 @@ def _resolve_stash_selector(
             return selector.strip()
     return None
 
-def _print_stash_cleanup_guidance(
-    stash_ref: str, stash_selector: Optional[str] = None
-) -> None:
+
+def _drop_owned_stash(git_cmd: list[str], cwd: Path, stash_ref: str) -> bool:
+    """Atomically remove our sole top-level stash, or preserve it fail-closed.
+
+    ``git stash drop stash@{N}`` resolves a mutable reflog selector before it
+    mutates the ref. A concurrent stash push can therefore redirect the same
+    selector at another user's entry. We only auto-remove when our immutable
+    OID is the sole entry, using ``update-ref``'s old-OID compare-and-swap.
+    Existing or concurrently-created entries are preserved for manual cleanup.
+    """
+    stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
+    if stash_selector != "stash@{0}":
+        return False
+    ownership = subprocess.run(
+        git_cmd + ["rev-parse", stash_selector],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if ownership.returncode != 0 or ownership.stdout.strip() != stash_ref:
+        return False
+    stash_list = subprocess.run(
+        git_cmd + ["stash", "list", "--format=%H"],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    entries = [line.strip() for line in stash_list.stdout.splitlines() if line.strip()]
+    if stash_list.returncode != 0 or entries != [stash_ref]:
+        return False
+    drop = subprocess.run(
+        git_cmd + ["update-ref", "-d", "refs/stash", stash_ref],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if drop.returncode != 0:
+        return False
+    gone = subprocess.run(
+        git_cmd + ["show-ref", "--verify", "--quiet", "refs/stash"],
+        cwd=cwd,
+        capture_output=True,
+    )
+    return gone.returncode == 1
+
+
+def _print_stash_cleanup_guidance(stash_ref: str) -> None:
     print(
         "  Check `git status` first so you don't accidentally reapply the same change twice."
     )
     print("  Find the saved entry with: git stash list --format='%gd %H %s'")
-    if stash_selector:
-        print(f"  Remove it with: git stash drop {stash_selector}")
-    else:
-        print(
-            f"  Look for commit {stash_ref}, then drop its selector with: git stash drop stash@{{N}}"
-        )
+    print(f"  Your saved entry has immutable commit ID: {stash_ref}")
+    print("  Hermes did not print a drop command because stash selectors can change concurrently.")
 
 def _stash_apply_failed_only_on_existing_untracked(stderr: str) -> bool:
     """True when a ``git stash apply`` failure is ONLY about untracked files
@@ -2612,24 +2788,14 @@ def _restore_stashed_changes(
         )
         _print_stash_cleanup_guidance(stash_ref)
     else:
-        drop = subprocess.run(
-            git_cmd + ["stash", "drop", stash_selector],
-            cwd=cwd,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if drop.returncode != 0:
+        if not _drop_owned_stash(git_cmd, cwd, stash_ref):
             print(
                 "⚠ Local changes were restored, but Hermes couldn't drop the saved stash entry."
             )
-            if drop.stdout.strip():
-                print(drop.stdout.strip())
-            if drop.stderr.strip():
-                print(drop.stderr.strip())
             print(
                 "  The stash was left in place. You can remove it manually after checking the result."
             )
-            _print_stash_cleanup_guidance(stash_ref, stash_selector)
+            _print_stash_cleanup_guidance(stash_ref)
 
     print("⚠ Local changes were restored on top of the updated codebase.")
     print("  Review `git diff` / `git status` if Hermes behaves unexpectedly.")
@@ -2663,20 +2829,12 @@ def _discard_stashed_changes(
         _print_stash_cleanup_guidance(stash_ref)
         return False
 
-    drop = subprocess.run(
-        git_cmd + ["stash", "drop", stash_selector],
-        cwd=cwd,
-        capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
-    if drop.returncode != 0:
+    if not _drop_owned_stash(git_cmd, cwd, stash_ref):
         print(
             "⚠ Configured to discard local changes, but Hermes couldn't drop "
             "the saved stash entry."
         )
-        if drop.stderr.strip():
-            print(f"  {drop.stderr.strip().splitlines()[0]}")
-        _print_stash_cleanup_guidance(stash_ref, stash_selector)
+        _print_stash_cleanup_guidance(stash_ref)
         return False
 
     print("→ Discarded local source changes (updates.non_interactive_local_changes=discard).")
@@ -6605,6 +6763,55 @@ def _verified_graceful_restart_current_launchd_gateway():
     return _verified_graceful_restart_launchd_target(target)
 
 
+def _schedule_deferred_launchd_restart(label: str, probe) -> None:
+    """Best-effort durable handoff for a verified active launchd Gateway."""
+    from hermes_cli.deferred_gateway_restart import (
+        deferred_restart_receipt_path,
+        schedule_deferred_restart,
+    )
+    from hermes_cli.update_receipt import record_deferred_gateway_restart
+
+    identity = getattr(probe, "identity", None)
+    target = _resolve_launchd_gateway_contract_target(label)
+    expected_sha = _current_checkout_sha()
+    if target is None or identity is None or not expected_sha:
+        record_deferred_gateway_restart(
+            profile=label,
+            scheduled=False,
+            reason="deferred-target-unavailable",
+        )
+        return
+    result = schedule_deferred_restart(
+        home=target.home,
+        port=target.port,
+        expected_sha=expected_sha,
+        old_identity=identity,
+        reason=probe.reason,
+    )
+    record_deferred_gateway_restart(
+        profile=label,
+        scheduled=result.scheduled,
+        reason=result.reason,
+        intent_path=result.path,
+        receipt_path=(
+            deferred_restart_receipt_path(target.home) if result.scheduled else None
+        ),
+    )
+    if result.scheduled:
+        print(
+            "    Durable idle retry scheduled; receipt will be written to "
+            f"{deferred_restart_receipt_path(target.home)}"
+        )
+
+
+def _try_schedule_deferred_launchd_restart(label: str, probe) -> None:
+    """Keep optional durable handoff failures from masking restart authority."""
+    try:
+        _schedule_deferred_launchd_restart(label, probe)
+    except Exception as exc:
+        logger.debug("Could not schedule deferred Gateway restart for %s: %s", label, exc)
+
+
 def _restart_launchd_gateway_after_update(
     *, supervision_verify: bool = True
 ) -> tuple[list, list]:
@@ -6649,6 +6856,12 @@ def _restart_launchd_gateway_after_update(
         return [], [current_label]
 
     if not probe.ready:
+        from hermes_cli.deferred_gateway_restart import (
+            is_schedulable_active_work_reason,
+        )
+
+        if is_schedulable_active_work_reason(probe.reason):
+            _try_schedule_deferred_launchd_restart(current_label, probe)
         print(
             f"  ⚠ Gateway restart deferred: {probe.reason}.\n"
             "    No force fallback was attempted. Retry after the gateway is idle."
@@ -6744,6 +6957,12 @@ def _restart_macos_launchd_gateways(
                 target, timeout=drain_budget
             )
             if not probe.ready:
+                from hermes_cli.deferred_gateway_restart import (
+                    is_schedulable_active_work_reason,
+                )
+
+                if is_schedulable_active_work_reason(probe.reason):
+                    _try_schedule_deferred_launchd_restart(label, probe)
                 failed_or_stale_units.append(label)
                 print(
                     f"  ⚠ {label}: restart deferred: {probe.reason}.\n"
@@ -7994,15 +8213,60 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _print_fetch_failure(fetch_result.stderr)
             sys.exit(1)
 
-        # Get current branch (returns literal "HEAD" when detached)
+        # Resolve the checkout before freezing.  Fork synchronization may
+        # advance HEAD and origin/main, so it must either finish now or wait
+        # for a later run; it is never allowed to mutate this run's target
+        # after the immutable SHA has been captured.
         result = subprocess.run(
             git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
         )
         current_branch = result.stdout.strip()
+        upstream_checked = not is_fork
+        fork_sync_advanced = False
+        auto_stash_ref = None
+        if is_fork and branch == "main" and current_branch == branch:
+            auto_stash_ref = _m()._stash_local_changes_if_needed(
+                git_cmd, _m().PROJECT_ROOT
+            )
+            pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+            upstream_checked = _m()._sync_with_upstream_if_needed(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                assume_yes=assume_yes,
+                input_fn=gw_input_fn,
+            )
+            post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+            fork_sync_advanced = bool(
+                pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha
+            )
+            refresh_result = subprocess.run(
+                git_cmd + ["fetch", "origin", branch],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if refresh_result.returncode != 0:
+                _print_fetch_failure(refresh_result.stderr)
+                sys.exit(1)
+
+        frozen_remote_ref = f"origin/{branch}"
+        frozen_target_sha = _capture_fetched_target_sha(
+            git_cmd, _m().PROJECT_ROOT, frozen_remote_ref
+        )
+        if frozen_target_sha is None:
+            print(
+                f"✗ Could not freeze fetched target {frozen_remote_ref} to an immutable SHA."
+            )
+            print("  Refusing to apply a moving or malformed update target.")
+            sys.exit(1)
 
         # Parked-branch guard (2026-08-17 live incident): the checkout can be
         # left parked on a stale feature branch by earlier tooling. Blindly
@@ -8035,7 +8299,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         in_place_update = False
         if current_branch != branch and current_branch != "HEAD":
             switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
-                git_cmd, _m().PROJECT_ROOT, current_branch, branch
+                git_cmd,
+                _m().PROJECT_ROOT,
+                current_branch,
+                branch,
+                frozen_target_sha=frozen_target_sha,
             )
             if not switch_safe:
                 _m()._print_parked_branch_skip_warning(
@@ -8074,7 +8342,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # previously surfaced through the checkout failing, which
                     # does not run on this path.
                     verify_ref = subprocess.run(
-                        git_cmd + ["rev-parse", "--verify", "--quiet", f"origin/{branch}"],
+                        git_cmd + ["rev-parse", "--verify", "--quiet", frozen_target_sha],
                         cwd=_m().PROJECT_ROOT,
                         capture_output=True,
                         text=True, encoding="utf-8", errors="replace",
@@ -8101,6 +8369,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     f"(fully merged) — switching back to {branch}..."
                 )
 
+        target_checkout_advanced = False
         if not in_place_update and current_branch != branch:
             if current_branch == "HEAD":
                 print(
@@ -8109,39 +8378,39 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
             # Stash before checkout so uncommitted work isn't lost
             auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
-            checkout_result = subprocess.run(
-                git_cmd + ["checkout", branch],
+            target_tip_before = subprocess.run(
+                git_cmd + ["rev-parse", "--verify", f"refs/heads/{branch}"],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            ).stdout.strip()
+            checkout_result = _checkout_target_at_frozen(
+                git_cmd, _m().PROJECT_ROOT, branch, frozen_target_sha
+            )
+            target_checkout_advanced = bool(
+                checkout_result.returncode == 0
+                and target_tip_before != frozen_target_sha
+                and _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+                == frozen_target_sha
             )
             if checkout_result.returncode != 0:
-                # Local checkout doesn't have this branch yet. Try to set
-                # it up as a tracking branch of origin/<branch>. This is
-                # the common case when the requested branch exists upstream
-                # but was never checked out locally.
-                track_result = subprocess.run(
-                    git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
-                    cwd=_m().PROJECT_ROOT,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                )
-                if track_result.returncode != 0:
-                    # Restore the user's prior stash before bailing
-                    # so we don't leave them stranded in a weird state.
-                    if auto_stash_ref is not None:
-                        _m()._restore_stashed_changes(
-                            git_cmd,
-                            _m().PROJECT_ROOT,
-                            auto_stash_ref,
-                            prompt_user=False,
-                            input_fn=gw_input_fn,
-                        )
-                    print(f"✗ Branch '{branch}' does not exist locally or on origin.")
-                    if track_result.stderr.strip():
-                        print(f"  {track_result.stderr.strip().splitlines()[0]}")
-                    sys.exit(1)
-        else:
+                # Restore the user's prior stash before bailing so a failed
+                # or raced branch creation cannot strand the checkout.
+                if auto_stash_ref is not None:
+                    _m()._restore_stashed_changes(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=False,
+                        input_fn=gw_input_fn,
+                    )
+                print(f"✗ Branch '{branch}' does not exist locally or on origin.")
+                if checkout_result.stderr.strip():
+                    print(f"  {checkout_result.stderr.strip().splitlines()[0]}")
+                sys.exit(1)
+        elif auto_stash_ref is None:
             auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
 
         prompt_for_restore = (
@@ -8157,13 +8426,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # 0), so keep it, but treat the shallow NUMBER as unknown and recover
         # the real one via the GitHub compare API when possible.
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{frozen_target_sha}", "--count"],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             check=True,
         )
         commit_count = int(result.stdout.strip())
+        if target_checkout_advanced and commit_count == 0:
+            commit_count = 1
+        if fork_sync_advanced and commit_count == 0:
+            commit_count = max(
+                1,
+                _count_commits_between(
+                    git_cmd, _m().PROJECT_ROOT, pre_sync_sha, post_sync_sha
+                ),
+            )
 
         apply_is_shallow = (
             subprocess.run(
@@ -8182,11 +8460,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 cwd=_m().PROJECT_ROOT, capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
             ).stdout.strip()
-            target_sha = subprocess.run(
-                git_cmd + ["rev-parse", f"origin/{branch}"],
-                cwd=_m().PROJECT_ROOT, capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            ).stdout.strip()
+            target_sha = frozen_target_sha
             counted = _github_compare_behind(head_sha, target_sha)
             # counted == 0 means local-ahead (remote tip reachable from HEAD):
             # not behind, fall through to the up-to-date path.
@@ -8202,27 +8476,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # date!" and verified nothing).
         # Non-fork checkouts have no upstream question: origin IS the official
         # repo, so "Already up to date!" is fully verified there.
-        upstream_checked = True
-        if commit_count == 0 and is_fork and branch == "main":
-            pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-            upstream_checked = _m()._sync_with_upstream_if_needed(
-                git_cmd,
-                _m().PROJECT_ROOT,
-                assume_yes=assume_yes,
-                input_fn=gw_input_fn,
-            )
-            post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-            if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
-                synced_count = _count_commits_between(
-                    git_cmd,
-                    _m().PROJECT_ROOT,
-                    pre_sync_sha,
-                    post_sync_sha,
-                )
-                # HEAD moving is itself proof of an update. Keep the update
-                # path active even if the informational count cannot be read.
-                commit_count = max(1, synced_count)
-
         if commit_count == 0:
             _invalidate_update_cache()
 
@@ -8416,7 +8669,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # `pull --ff-only origin <branch>` given the fresh tracking ref;
             # the divergence fallback below is unchanged.
             pull_result = subprocess.run(
-                git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+                git_cmd + ["merge", "--ff-only", frozen_target_sha],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -8437,7 +8690,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     ).stdout
                     or ""
                 ).strip()
-                _remote_ref = f"origin/{branch}"
+                _remote_ref = frozen_target_sha
                 _same_branch_local_commits: Optional[bool] = False
                 if not _cur_branch or _cur_branch == branch:
                     _same_branch_local_commits = _same_branch_has_local_only_commits(
@@ -8523,11 +8776,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(
                         "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                     )
-                    reset_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", _remote_ref],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
+                    reset_result = _reset_hard_if_head_matches(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        _remote_ref,
+                        expected_head=pre_pull_sha or "",
                     )
                     if reset_result.returncode != 0:
                         print(f"✗ Failed to reset to {_remote_ref}.")
@@ -8544,6 +8797,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # ruff check), this catches it on the user side and rolls back
             # so the CLI stays bootable. The user can then retry ``hermes
             # update`` later once a fix lands upstream.
+            applied_head_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
                 _m().PROJECT_ROOT
             )
@@ -8559,11 +8813,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 if pre_pull_sha:
                     print()
                     print(f"→ Rolling back to {pre_pull_sha[:10]}...")
-                    rollback_result = subprocess.run(
-                        git_cmd + ["reset", "--hard", pre_pull_sha],
-                        cwd=_m().PROJECT_ROOT,
-                        capture_output=True,
-                        text=True, encoding="utf-8", errors="replace",
+                    rollback_result = _reset_hard_if_head_matches(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        pre_pull_sha,
+                        expected_head=applied_head_sha or "",
                     )
                     if rollback_result.returncode == 0:
                         print("  ✓ Rollback complete — your install is unchanged.")
@@ -8625,7 +8879,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # and post-pull HEAD; if they match, surface the no-op instead of
         # claiming success.
         post_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        if pre_pull_sha and post_pull_sha == pre_pull_sha:
+        if (
+            pre_pull_sha
+            and post_pull_sha == pre_pull_sha
+            and not target_checkout_advanced
+            and not fork_sync_advanced
+        ):
             print()
             print("✗ Code did not move — update was a no-op.")
             print(
@@ -8690,13 +8949,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _m()._record_bytecode_fingerprint()
         _m()._refresh_bootstrap_cache_scripts(branch)
 
-        # Fork upstream sync logic (only for main branch on forks)
+        # A second fork/upstream fetch here would advance beyond the immutable
+        # target reviewed and applied above. Defer upstream sync to the next
+        # update run; its existing no-origin-update path performs that sync
+        # before deciding whether the checkout is current.
         if is_fork and branch == "main":
-            _m()._sync_with_upstream_if_needed(
-                git_cmd,
-                _m().PROJECT_ROOT,
-                assume_yes=assume_yes,
-                input_fn=gw_input_fn,
+            print(
+                "  ℹ Fork upstream sync deferred to the next update run so this "
+                "run remains pinned to its fetched SHA."
             )
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra

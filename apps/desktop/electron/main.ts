@@ -372,7 +372,13 @@ import {
   shouldCountCommits
 } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
-import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
+import {
+  claimUpdateMarker,
+  handoffUpdateMarker,
+  readLiveUpdateMarker,
+  releaseUpdateMarker,
+  updateHandoffConflict
+} from './update-marker'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import {
   collectRelaunchArgs,
@@ -2124,8 +2130,7 @@ function directoryExists(filePath) {
 // staleness self-heal live in update-marker.ts (unit-tested).
 
 // How long we'll park the launch waiting for a live update to finish before
-// giving up and starting the backend anyway (belt-and-suspenders alongside the
-// marker's own age ceiling; covers a stuck-but-alive updater).
+// reporting a timeout. A live marker remains authoritative regardless of age.
 const UPDATE_WAIT_TIMEOUT_MS = 20 * 60 * 1000
 const UPDATE_WAIT_POLL_MS = 1000
 // How long the desktop lingers on the "updating, don't reopen" overlay after
@@ -2151,13 +2156,23 @@ function updateGateDeps() {
   }
 }
 
+async function waitForSafeUpdateClearance(options) {
+  let outcome
+
+  do {
+    outcome = await waitForUpdateClearance(updateGateDeps(), options)
+  } while (outcome === 'timeout' && readLiveUpdateMarker(HERMES_HOME))
+
+  return outcome
+}
+
 // Block until no live update is in progress (or we hit the wait timeout).
 // Emits a boot-progress phase so the renderer shows "Update in progress…"
 // rather than a frozen splash. Returns true if it parked at all.
 async function waitForUpdateToFinish() {
   let announced = false
 
-  const outcome = await waitForUpdateClearance(updateGateDeps(), {
+  const outcome = await waitForSafeUpdateClearance({
     onWaitTick: async reason => {
       if (!announced) {
         announced = true
@@ -2212,7 +2227,7 @@ async function waitForUpdateToFinish() {
   }
 
   if (outcome === 'timeout') {
-    rememberLog('[updates] update still in progress after wait timeout; starting backend anyway')
+    rememberLog('[updates] in-process update wait timed out with no live marker; starting backend')
   } else {
     rememberLog('[updates] update finished; proceeding with backend start')
   }
@@ -3638,6 +3653,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
   }
 
   updateInFlight = true
+  let desktopClaimForCleanup: { token: string } | null = null
 
   try {
     const updater = resolveUpdaterBinary()
@@ -3699,18 +3715,21 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       rememberLog('[updates] no staged updater; using repo hand-off script for CLI install')
     }
 
-    const handoffConflict = updateHandoffConflict(HERMES_HOME)
+    const desktopClaim = claimUpdateMarker(HERMES_HOME, process.pid)
 
-    if (handoffConflict) {
+    if (!desktopClaim) {
+      const handoffConflict = updateHandoffConflict(HERMES_HOME)
       // A different updater already owns the marker — most often a previous
       // "Update" click whose updater is still alive and parked mid-run.
       // Spawning another here would overwrite its claim and let two updaters
       // mutate the checkout at once (#75778); refuse instead.
-      rememberLog(`[updates] refusing hand-off: ${handoffConflict.message}`)
-      emitUpdateProgress({ stage: 'error', message: handoffConflict.message, percent: null })
+      const message = handoffConflict?.message || 'The update lock could not be claimed safely. Try again.'
+      rememberLog(`[updates] refusing hand-off: ${message}`)
+      emitUpdateProgress({ stage: 'error', message, percent: null })
 
-      return { ok: false, error: 'update-already-running', message: handoffConflict.message }
+      return { ok: false, error: 'update-already-running', message }
     }
+    desktopClaimForCleanup = desktopClaim
 
     emitUpdateProgress({
       stage: 'restart',
@@ -3861,6 +3880,8 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
           ...process.env,
           HERMES_HOME,
           HERMES_UPDATE_STARTED_AT: String(updateStartedAt),
+          HERMES_UPDATE_CLAIM_TOKEN: desktopClaim.token,
+          HERMES_UPDATE_HANDOFF_PID: String(process.pid),
           PATH: pathWithHermesManagedNode(venvBin)
         },
         detached: true,
@@ -3874,10 +3895,6 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       // dead pid makes the marker read as stale and self-delete (no wedge).
       // The `hermes update` child adopts the SCRIPT's claim via
       // update_lock.py's process-ancestry rule; no mtime heuristics needed.
-      if (Number.isInteger(child.pid)) {
-        writeUpdateMarker(HERMES_HOME, child.pid, { startedAt: updateStartedAt })
-      }
-
       rememberLog(
         `[updates] launched repo hand-off script: ${scriptHandoff.scriptPath} (branch ${branch}); exiting desktop to release venv shim`
       )
@@ -3887,6 +3904,8 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
         env: {
           ...process.env,
           HERMES_HOME,
+          HERMES_UPDATE_CLAIM_TOKEN: desktopClaim.token,
+          HERMES_UPDATE_HANDOFF_PID: String(process.pid),
           PATH: pathWithHermesManagedNode(venvBin)
         },
         detached: true,
@@ -3909,7 +3928,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
       // strictly better than never updating again, and the updater still writes
       // its own marker moments later.
       if (Number.isInteger(child.pid) && stagedUpdaterSupportsPrewrittenMarker(updater)) {
-        writeUpdateMarker(HERMES_HOME, child.pid)
+        handoffUpdateMarker(HERMES_HOME, process.pid, desktopClaim.token, child.pid)
       } else if (Number.isInteger(child.pid)) {
         rememberLog(
           `[updates] skipping marker pre-write: staged updater predates self-adopt (${updater}); it would refuse its own claim`
@@ -3947,6 +3966,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     }
 
     isQuittingForHandoff = true
+    desktopClaimForCleanup = null
     setTimeout(
       () => {
         app.quit()
@@ -3956,6 +3976,9 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
 
     return { ok: true, handedOff: true, updater }
   } finally {
+    if (desktopClaimForCleanup) {
+      releaseUpdateMarker(HERMES_HOME, process.pid, desktopClaimForCleanup.token)
+    }
     updateInFlight = false
   }
 }
@@ -3971,16 +3994,17 @@ async function handOffWindowsBootstrapRecovery(reason) {
     return false
   }
 
-  const handoffConflict = updateHandoffConflict(HERMES_HOME)
+  const desktopClaim = claimUpdateMarker(HERMES_HOME, process.pid)
 
-  if (handoffConflict) {
+  if (!desktopClaim) {
+    const handoffConflict = updateHandoffConflict(HERMES_HOME)
     // Same hazard as applyUpdates (#75778): a live foreign updater already
     // owns the marker. Spawning another here would overwrite its claim and
     // race a second updater over the same install tree. The live updater
     // is already working on this exact install and will restart us when
     // it finishes, so treat this the same as a successful hand-off instead
     // of clobbering it with our own.
-    rememberLog(`[bootstrap] refusing recovery hand-off: ${handoffConflict.message}`)
+    rememberLog(`[bootstrap] refusing recovery hand-off: ${handoffConflict?.message || 'update lock unavailable'}`)
     isQuittingForHandoff = true
     setTimeout(() => {
       app.quit()
@@ -3989,6 +4013,25 @@ async function handOffWindowsBootstrapRecovery(reason) {
     return true
   }
 
+  let recoveryClaimOwner = process.pid
+  let preserveRecoveryClaim = false
+
+  try {
+    const handedOff = await handOffWindowsBootstrapRecoveryClaimed(reason, updater, desktopClaim, owner => {
+      recoveryClaimOwner = owner
+    })
+
+    preserveRecoveryClaim = handedOff
+
+    return handedOff
+  } finally {
+    if (!preserveRecoveryClaim) {
+      releaseUpdateMarker(HERMES_HOME, recoveryClaimOwner, desktopClaim.token)
+    }
+  }
+}
+
+async function handOffWindowsBootstrapRecoveryClaimed(reason, updater, desktopClaim, setClaimOwner) {
   const updateRoot = resolveUpdateRoot()
   const { branch: configuredBranch } = readDesktopUpdateConfig()
 
@@ -4022,19 +4065,21 @@ async function handOffWindowsBootstrapRecovery(reason) {
     env: {
       ...process.env,
       HERMES_HOME,
+      HERMES_UPDATE_CLAIM_TOKEN: desktopClaim.token,
+      HERMES_UPDATE_HANDOFF_PID: String(process.pid),
       PATH: pathWithHermesManagedNode(venvBin)
     },
     detached: true,
     stdio: 'ignore'
   })
 
-  // Same marker pre-write as applyUpdates — see comment there. The recovery
-  // hand-off has the same window where the renderer can respawn a backend
-  // before the updater writes its own marker, and the same stale-updater
-  // exclusion: a pre-#74782 binary would refuse its own pre-written claim and
-  // strand the very recovery meant to heal the install.
+  // Same marker CAS as applyUpdates — see comment there. The recovery
+  // hand-off keeps one canonical claim while ownership transfers to the
+  // staged updater.
   if (Number.isInteger(child.pid) && stagedUpdaterSupportsPrewrittenMarker(updater)) {
-    writeUpdateMarker(HERMES_HOME, child.pid)
+    if (handoffUpdateMarker(HERMES_HOME, process.pid, desktopClaim.token, child.pid)) {
+      setClaimOwner(child.pid)
+    }
   } else if (Number.isInteger(child.pid)) {
     rememberLog(
       `[bootstrap] skipping marker pre-write: staged updater predates self-adopt (${updater}); it would refuse its own claim`
@@ -4188,17 +4233,35 @@ async function applyUpdatesPosixHandoff(opts: any) {
     return { ok: true, manual: true, command: 'hermes update', hermesRoot: updateRoot }
   }
 
-  const handoffConflict = updateHandoffConflict(HERMES_HOME)
+  const desktopClaim = claimUpdateMarker(HERMES_HOME, process.pid)
 
-  if (handoffConflict) {
+  if (!desktopClaim) {
+    const handoffConflict = updateHandoffConflict(HERMES_HOME)
     // Same hazard as the Windows path (#75778): a live foreign updater
     // already owns the marker — refuse rather than double-mutate the tree.
-    rememberLog(`[updates] refusing posix hand-off: ${handoffConflict.message}`)
-    emitUpdateProgress({ stage: 'error', message: handoffConflict.message, percent: null })
+    const message = handoffConflict?.message || 'The update lock could not be claimed safely. Try again.'
+    rememberLog(`[updates] refusing posix hand-off: ${message}`)
+    emitUpdateProgress({ stage: 'error', message, percent: null })
 
-    return { ok: false, error: 'update-already-running', message: handoffConflict.message }
+    return { ok: false, error: 'update-already-running', message }
   }
 
+  let preserveDesktopClaim = false
+
+  try {
+    const result = await applyUpdatesPosixHandoffClaimed(updateRoot, handoff, desktopClaim)
+
+    preserveDesktopClaim = result.handedOff === true
+
+    return result
+  } finally {
+    if (!preserveDesktopClaim) {
+      releaseUpdateMarker(HERMES_HOME, process.pid, desktopClaim.token)
+    }
+  }
+}
+
+async function applyUpdatesPosixHandoffClaimed(updateRoot, handoff, desktopClaim) {
   // ── Pre-flight state.db integrity guard (#68474) ──
   preflightStateDb(HERMES_HOME, rememberLog)
 
@@ -4252,19 +4315,16 @@ async function applyUpdatesPosixHandoff(opts: any) {
       ...process.env,
       HERMES_HOME,
       HERMES_UPDATE_STARTED_AT: String(updateStartedAt),
+      HERMES_UPDATE_CLAIM_TOKEN: desktopClaim.token,
+      HERMES_UPDATE_HANDOFF_PID: String(process.pid),
       PATH: pathWithHermesManagedNode(path.join(updateRoot, 'venv', 'bin'))
     },
     detached: true,
     stdio: 'ignore'
   })
 
-  // Bridge marker (same contract as the Windows hand-off): cover the gap
-  // until the script claims the marker with its own pid as step 0. If the
-  // script never starts, the dead pid reads as stale and self-deletes.
-  if (Number.isInteger(child.pid)) {
-    writeUpdateMarker(HERMES_HOME, child.pid, { startedAt: updateStartedAt })
-  }
-
+  // The Desktop claim remains canonical until the script atomically compares
+  // expected pid + token and transfers it to its own pid as step zero.
   rememberLog(`[updates] launched posix hand-off: ${handoff.scriptPath} (branch ${branch}); quitting to hand off`)
   emitUpdateProgress({
     stage: 'restart',
@@ -11997,7 +12057,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   {
     let poolAnnounced = false
 
-    await waitForUpdateClearance(updateGateDeps(), {
+    await waitForSafeUpdateClearance({
       onWaitTick: reason => {
         if (!poolAnnounced) {
           poolAnnounced = true

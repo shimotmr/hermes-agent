@@ -24,6 +24,7 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,9 +104,9 @@ pub async fn start_update(app: AppHandle) -> Result<(), String> {
 /// its `Drop` removes the marker on EVERY exit path — success, early
 /// `return Err`, or a panic that unwinds through `run_update` — so a crashed
 /// or aborted updater can never permanently strand the marker and block
-/// future desktop launches. The marker payload is `{pid}\n{started_at_unix}`
-/// so the desktop's launch gate can detect a stale marker (dead PID / past a
-/// hard ceiling) and self-heal rather than wait forever.
+/// future desktop launches. The marker payload is
+/// `{pid}\n{started_at_unix}\n{claim_token}` so release and handoff authority
+/// can be compared without trusting pid alone.
 ///
 /// The marker is also the cross-process update lock: `hermes update` claims
 /// the same file (see `hermes_cli/update_lock.py`) so a dashboard-spawned
@@ -118,14 +119,8 @@ struct UpdateMarkerGuard {
     /// False when a live foreign updater already owns the marker: we hold no
     /// claim, so `Drop` must not delete their marker.
     owned: bool,
+    token: String,
 }
-
-/// Never treat a marker older than this as a live update. Mirrors
-/// UPDATE_MARKER_MAX_AGE_MS in apps/desktop/electron/update-marker.ts and
-/// UPDATE_MARKER_MAX_AGE_SECONDS in hermes_cli/update_lock.py — all three read
-/// this one file, so a shorter ceiling in any of them would steal a lock the
-/// others still consider live.
-const UPDATE_MARKER_MAX_AGE_SECS: u64 = 20 * 60;
 
 /// The pid + age of a confirmed-live update holding the marker.
 struct MarkerOwner {
@@ -134,8 +129,8 @@ struct MarkerOwner {
 }
 
 /// Read the marker and report a live owner, if any. `None` for every "no live
-/// update" case — absent, unreadable, malformed, dead pid, or past the ceiling
-/// — matching `readLiveUpdateMarker` in the Electron gate. Never panics.
+/// update" case. Callers separately reject an existing malformed or unknown
+/// marker, matching the fail-closed Electron gate. Never panics.
 ///
 /// Self-PID is returned so `acquire` can adopt the desktop's pre-written claim
 /// without refreshing its acquisition time (#74761). A foreign live pid (e.g.
@@ -150,48 +145,286 @@ fn live_marker_owner(path: &Path) -> Option<MarkerOwner> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let age_secs = now.saturating_sub(started_at);
-    if age_secs > UPDATE_MARKER_MAX_AGE_SECS || !pid_is_alive(pid) {
+    if !pid_is_alive(pid) {
         return None;
     }
     Some(MarkerOwner { pid, age_secs })
 }
 
-/// True when the on-disk marker names THIS process as its owner.
-///
-/// A raw read is used instead of `live_marker_owner` on purpose: that
-/// helper folds in age and liveness policy (and, since the #74761
-/// adoption work, self-ownership handling has changed shape more than
-/// once). The exit-2 self-heal below needs exactly one raw fact — does
-/// the marker name our PID — because a `hermes update` child that
-/// refuses over OUR marker is a handoff-recognition failure in a stale
-/// checkout, not a real concurrent update.
-fn marker_owned_by_self(path: &Path) -> bool {
+fn marker_token(path: &Path) -> Option<String> {
     std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| {
-            raw.lines()
-                .next()
-                .and_then(|line| line.trim().parse::<u32>().ok())
-        })
-        == Some(std::process::id())
+        .ok()?
+        .lines()
+        .nth(2)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
-/// The exit-2 heal decision (#75788), extracted so the contract is testable.
-///
-/// True only when BOTH hold: the child exited with the concurrent-update
-/// refusal code, AND the on-disk marker names THIS process. That combination
-/// means the child refused over its own parent's claim — a stale checkout
-/// without handoff recognition — so dropping the claim and retrying once is
-/// safe. Any other owner (live foreign updater, garbage, missing marker) or
-/// any other exit code must leave the refusal untouched.
-fn should_heal_self_marker_refusal(exit_code: Option<i32>, marker_path: &Path) -> bool {
-    exit_code == Some(UPDATE_EXIT_CONCURRENT) && marker_owned_by_self(marker_path)
+fn self_marker_adoptable(
+    marker_pid: u32,
+    current_pid: u32,
+    marker_token: Option<&str>,
+    expected_token: Option<&str>,
+) -> bool {
+    marker_pid == current_pid
+        && marker_token.is_some_and(|token| !token.is_empty())
+        && marker_token == expected_token.filter(|token| !token.is_empty())
+}
+
+struct MarkerOperationGuard {
+    path: PathBuf,
+    retained: bool,
+}
+
+fn remove_guard_quarantine(path: &Path) {
+    if path.is_dir() {
+        let _ = std::fs::remove_file(path.join("owner"));
+        let _ = std::fs::remove_dir(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn operation_guard_quarantine_exists(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return true;
+    };
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("update-marker.lock");
+    let prefixes = [format!(".{name}.stale-"), format!("{name}.stale-")];
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return true;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|entry_name| prefixes.iter().any(|prefix| entry_name.starts_with(prefix)))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn reclaim_operation_guard<F>(path: &Path, after_detach: F) -> std::io::Result<bool>
+where
+    F: FnOnce(),
+{
+    let quarantine = marker_quarantine(path, "stale");
+    std::fs::rename(path, &quarantine)?;
+    after_detach();
+    let owner_path = if quarantine.is_dir() {
+        quarantine.join("owner")
+    } else {
+        quarantine.clone()
+    };
+    let owner = std::fs::read_to_string(&owner_path)
+        .ok()
+        .and_then(|raw| raw.lines().next()?.trim().parse::<u32>().ok());
+    if owner.is_none() || pid_liveness(owner.unwrap()) != ProcessLiveness::Dead {
+        match std::fs::hard_link(&owner_path, path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+        remove_guard_quarantine(&quarantine);
+        return Ok(false);
+    }
+    remove_guard_quarantine(&quarantine);
+    Ok(!quarantine.exists() && !path.exists())
+}
+
+impl MarkerOperationGuard {
+    fn acquire(marker: &Path) -> std::io::Result<Self> {
+        let name = marker
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("update-marker");
+        let path = marker.with_file_name(format!("{name}.lock"));
+        if operation_guard_quarantine_exists(&path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "marker guard quarantine retained",
+            ));
+        }
+        for _ in 0..3 {
+            let private = marker_quarantine(&path, "guard");
+            match (|| {
+                std::fs::create_dir(&private)?;
+                let mut owner = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(private.join("owner"))?;
+                owner.write_all(format!("{}\n", std::process::id()).as_bytes())?;
+                owner.sync_all()?;
+                if let Ok(directory) = std::fs::File::open(&private) {
+                    let _ = directory.sync_all();
+                }
+                std::fs::hard_link(private.join("owner"), &path)
+            })() {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(private.join("owner"));
+                    let _ = std::fs::remove_dir(&private);
+                    return Ok(Self {
+                        path,
+                        retained: false,
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = std::fs::remove_file(private.join("owner"));
+                    let _ = std::fs::remove_dir(&private);
+                    // Detach and validate one guard identity. Never unlink the
+                    // canonical pathname based on a prior read (ABA).
+                    match reclaim_operation_guard(&path, || {}) {
+                        Ok(true) => continue,
+                        Ok(false) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::WouldBlock,
+                                "marker guard held",
+                            ));
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(err) => {
+                    let _ = std::fs::remove_file(private.join("owner"));
+                    let _ = std::fs::remove_dir(&private);
+                    return Err(err);
+                }
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "marker guard unavailable",
+        ))
+    }
+}
+
+impl Drop for MarkerOperationGuard {
+    fn drop(&mut self) {
+        if self.retained {
+            return;
+        }
+        if self.path.is_dir() {
+            let _ = std::fs::remove_file(self.path.join("owner"));
+            let _ = std::fs::remove_dir(&self.path);
+        } else {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn marker_quarantine(path: &Path, action: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("update-marker");
+    path.with_file_name(format!(
+        ".{name}.{action}-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+}
+
+fn restore_quarantined_marker(path: &Path, quarantine: &Path) -> bool {
+    match std::fs::hard_link(quarantine, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(quarantine);
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(quarantine);
+            true
+        }
+        Err(_) => {
+            // Fail closed: retain the detached claim for diagnosis rather than
+            // deleting an inode whose ownership could not be restored safely.
+            false
+        }
+    }
+}
+
+fn remove_marker_if_owned_token(path: &Path, owner_pid: u32, owner_token: &str) {
+    let Ok(mut operation) = MarkerOperationGuard::acquire(path) else {
+        return;
+    };
+    let quarantine = marker_quarantine(path, "remove");
+    if std::fs::rename(path, &quarantine).is_err() {
+        return;
+    }
+    let owned = std::fs::read_to_string(&quarantine)
+        .ok()
+        .is_some_and(|raw| {
+            let mut lines = raw.lines();
+            let pid = lines
+                .next()
+                .and_then(|line| line.trim().parse::<u32>().ok());
+            let token = lines.nth(1).unwrap_or("").trim();
+            pid == Some(owner_pid) && (owner_token.is_empty() || token == owner_token)
+        });
+    if owned {
+        if std::fs::remove_file(&quarantine).is_err() {
+            if !restore_quarantined_marker(path, &quarantine) {
+                operation.retained = true;
+            }
+        }
+    } else {
+        if !restore_quarantined_marker(path, &quarantine) {
+            operation.retained = true;
+        }
+    }
+}
+
+fn atomic_replace_marker(path: &Path, body: &str) -> std::io::Result<()> {
+    let temporary = marker_quarantine(path, "handoff");
+    let result = (|| {
+        let mut handle = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        handle.write_all(body.as_bytes())?;
+        handle.sync_all()?;
+        std::fs::rename(&temporary, path)
+    })();
+    let _ = std::fs::remove_file(temporary);
+    result
+}
+
+fn publish_new_marker(path: &Path, body: &str) -> std::io::Result<()> {
+    let temporary = marker_quarantine(path, "write");
+    let result = (|| {
+        let mut handle = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        handle.write_all(body.as_bytes())?;
+        handle.sync_all()?;
+        std::fs::hard_link(&temporary, path)
+    })();
+    let _ = std::fs::remove_file(temporary);
+    result
 }
 
 /// True when a process with `pid` currently exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessLiveness {
+    Alive,
+    Dead,
+    Unknown,
+}
+
 #[cfg(windows)]
-fn pid_is_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+fn pid_liveness(pid: u32) -> ProcessLiveness {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
+    };
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
@@ -199,48 +432,137 @@ fn pid_is_alive(pid: u32) -> bool {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
-            // Either the pid is gone or we lack rights to open it. A pid we
-            // can't inspect is treated as dead so an unopenable straggler
-            // can't wedge every future update.
-            return false;
+            // ERROR_INVALID_PARAMETER is the documented no-such-process case.
+            // Access denied or any unknown probe result fails closed as alive.
+            return if GetLastError() == ERROR_INVALID_PARAMETER {
+                ProcessLiveness::Dead
+            } else {
+                ProcessLiveness::Unknown
+            };
         }
         let mut code: u32 = 0;
         let ok = GetExitCodeProcess(handle, &mut code);
         CloseHandle(handle);
-        ok != 0 && code == STILL_ACTIVE as u32
+        if ok == 0 {
+            ProcessLiveness::Unknown
+        } else if code == STILL_ACTIVE as u32 {
+            ProcessLiveness::Alive
+        } else {
+            ProcessLiveness::Dead
+        }
     }
 }
 
 #[cfg(not(windows))]
-fn pid_is_alive(pid: u32) -> bool {
+fn pid_liveness(pid: u32) -> ProcessLiveness {
     // signal 0 delivers nothing; it only probes existence/permission.
     // ESRCH => dead. EPERM => alive but owned by another user.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if rc == 0 {
-        return true;
+        return ProcessLiveness::Alive;
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => ProcessLiveness::Dead,
+        Some(libc::EPERM) => ProcessLiveness::Alive,
+        _ => ProcessLiveness::Unknown,
+    }
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    pid_liveness(pid) != ProcessLiveness::Dead
 }
 
 impl UpdateMarkerGuard {
     /// Claim the marker, or report the live updater that already owns it.
     ///
-    /// Writing is best-effort: a write failure must NOT abort the update (the
-    /// gate degrades to "no marker => proceed", i.e. exactly the pre-marker
-    /// behavior), so we log and carry on with a guard that still attempts
-    /// cleanup of whatever may exist at the path.
+    /// Claim publication is fail-closed. Proceeding without a durable marker
+    /// would make ownership unknowable and permit a second updater to mutate
+    /// the same checkout.
     fn acquire(path: PathBuf) -> Result<Self, MarkerOwner> {
         let pid = std::process::id();
+        let mut operation = MarkerOperationGuard::acquire(&path).map_err(|_| MarkerOwner {
+            pid: 0,
+            age_secs: 0,
+        })?;
         if let Some(owner) = live_marker_owner(&path) {
-            if owner.pid == pid {
+            let token = marker_token(&path).unwrap_or_default();
+            let expected_token = std::env::var("HERMES_UPDATE_CLAIM_TOKEN").ok();
+            if self_marker_adoptable(
+                owner.pid,
+                pid,
+                Some(token.as_str()),
+                expected_token.as_deref(),
+            ) {
                 // Repeated acquisition in this process is intentionally
-                // re-entrant because the desktop may have pre-written our pid.
-                // The desktop races ahead and pre-writes our pid. Adopt that
-                // claim verbatim: rewriting started_at here lets retries reset
-                // a wedged updater's age before the stale ceiling can clear it.
-                return Ok(Self { path, owned: true });
+                // re-entrant only when the inherited opaque token proves this
+                // is the desktop's transferred claim rather than PID reuse.
+                return Ok(Self {
+                    path,
+                    owned: true,
+                    token,
+                });
+            }
+            let expected_pid = std::env::var("HERMES_UPDATE_HANDOFF_PID")
+                .ok()
+                .and_then(|raw| raw.parse::<u32>().ok());
+            let expected_token = std::env::var("HERMES_UPDATE_CLAIM_TOKEN").ok();
+            if expected_pid == Some(owner.pid)
+                && expected_token.as_deref() == Some(token.as_str())
+                && !token.is_empty()
+            {
+                let raw = std::fs::read_to_string(&path).unwrap_or_default();
+                let started_at = raw.lines().nth(1).unwrap_or("0");
+                if atomic_replace_marker(&path, &format!("{pid}\n{started_at}\n{token}\n")).is_ok()
+                {
+                    return Ok(Self {
+                        path,
+                        owned: true,
+                        token,
+                    });
+                }
             }
             return Err(owner);
+        }
+        if path.exists() {
+            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            let candidate_pid = raw
+                .lines()
+                .next()
+                .and_then(|line| line.trim().parse::<u32>().ok());
+            if candidate_pid.is_none()
+                || pid_liveness(candidate_pid.unwrap()) != ProcessLiveness::Dead
+            {
+                return Err(MarkerOwner {
+                    pid: candidate_pid.unwrap_or(0),
+                    age_secs: 0,
+                });
+            }
+            let quarantine = marker_quarantine(&path, "stale");
+            if std::fs::rename(&path, &quarantine).is_err() {
+                return Err(MarkerOwner {
+                    pid: 0,
+                    age_secs: 0,
+                });
+            }
+            if let Some(owner) = live_marker_owner(&quarantine) {
+                if !restore_quarantined_marker(&path, &quarantine) {
+                    operation.retained = true;
+                }
+                let restored = live_marker_owner(&path).unwrap_or(MarkerOwner {
+                    pid: 0,
+                    age_secs: 0,
+                });
+                if restored.pid == pid {
+                    let token = marker_token(&path).unwrap_or_default();
+                    return Ok(Self {
+                        path,
+                        owned: true,
+                        token,
+                    });
+                }
+                return Err(if restored.pid == 0 { owner } else { restored });
+            }
+            let _ = std::fs::remove_file(quarantine);
         }
         let started_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -249,10 +571,23 @@ impl UpdateMarkerGuard {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(err) = std::fs::write(&path, format!("{pid}\n{started_at}")) {
+        let token = std::env::var("HERMES_UPDATE_CLAIM_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        if let Err(err) = publish_new_marker(&path, &format!("{pid}\n{started_at}\n{token}\n")) {
             tracing::warn!(?path, %err, "could not write update-in-progress marker");
+            let owner = live_marker_owner(&path).unwrap_or(MarkerOwner {
+                pid: 0,
+                age_secs: 0,
+            });
+            return Err(owner);
         }
-        Ok(Self { path, owned: true })
+        Ok(Self {
+            path,
+            owned: true,
+            token,
+        })
     }
 
     /// Release the marker as soon as every mutating stage has completed.
@@ -260,18 +595,14 @@ impl UpdateMarkerGuard {
     /// The updater still owns a Tauri/Cocoa event loop while it relaunches the
     /// desktop, and that loop can outlive `app.exit(0)`. Relying on `Drop`
     /// alone therefore leaves a *successful* update looking active — a live
-    /// pid holding a fresh marker — which blocks desktop startup and every
-    /// other updater for the full age ceiling. Idempotent: `Drop` still runs
-    /// and tolerates an already-removed marker.
+    /// pid holding the marker — which correctly blocks desktop startup and
+    /// every other updater. Idempotent: `Drop` still runs and tolerates an
+    /// already-removed marker.
     fn complete(&self) {
         if !self.owned {
             return;
         }
-        if let Err(err) = std::fs::remove_file(&self.path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = ?self.path, %err, "could not remove completed update marker");
-            }
-        }
+        remove_marker_if_owned_token(&self.path, std::process::id(), &self.token);
     }
 }
 
@@ -296,9 +627,8 @@ async fn run_update(app: AppHandle) -> Result<()> {
     // update_lock.py claims it too), so a live foreign owner means another
     // updater — most often a dashboard-spawned `hermes update` — is already
     // mutating this checkout. Refuse instead of running a second one over it.
-    let _update_marker = match UpdateMarkerGuard::acquire(
-        crate::paths::update_in_progress_marker(),
-    ) {
+    let _update_marker = match UpdateMarkerGuard::acquire(crate::paths::update_in_progress_marker())
+    {
         Ok(guard) => guard,
         Err(owner) => {
             let mins = owner.age_secs / 60;
@@ -393,9 +723,8 @@ async fn run_update(app: AppHandle) -> Result<()> {
         LogStream::Stdout,
         &format!("[update] updating against branch {update_branch}"),
     );
-    let child_env = update_child_env(&install_root);
-    let mut update_args: Vec<String> =
-        vec!["update".into(), "--yes".into(), "--gateway".into()];
+    let child_env = update_child_env(&install_root, &_update_marker.token);
+    let mut update_args: Vec<String> = vec!["update".into(), "--yes".into(), "--gateway".into()];
     // --force skips `hermes update`'s Windows running-exe guard (which would
     // `sys.exit(2)` and dead-end the handoff). By contract the desktop has
     // already exited and waited for the install locks to clear before launching
@@ -439,7 +768,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
     // stare at a scary crash first), retry once automatically. Skip the retry
     // for the concurrent-instance guard (exit 2) — that's a "close Hermes" state
     // a retry can't fix.
-    if !matches!(update.exit_code, Some(0) | Some(UPDATE_EXIT_CONCURRENT)) {
+    if update_needs_retry(update.exit_code) {
         emit_log(
             &app,
             Some("update"),
@@ -458,40 +787,6 @@ async fn run_update(app: AppHandle) -> Result<()> {
         .await?;
     }
 
-    // Self-owned-marker heal (#75788). Exit 2 means the child refused over a
-    // live update marker with a foreign owner. When that "foreign" owner is
-    // THIS process, the child simply failed to recognize the handoff — a
-    // checkout predating the HERMES_UPDATE_HANDOFF_PID env fix (8c76fe19f)
-    // and the ancestor-pid fallback runs its pre-pull update_lock.py, reads
-    // our marker, and exits 2 every time. The refusal loop is unbreakable
-    // from the user's side because the update being refused is the one that
-    // ships the fix. The marker exists to serialize updates and this process
-    // IS the update: drop our claim and retry once with the marker absent.
-    // The guard re-removes on Drop (idempotent), and the desktop is already
-    // gone at this point, so nothing races the brief marker-free window.
-    if should_heal_self_marker_refusal(
-        update.exit_code,
-        &crate::paths::update_in_progress_marker(),
-    ) {
-        emit_log(
-            &app,
-            Some("update"),
-            LogStream::Stdout,
-            "[update] child refused over this updater's own marker (stale \
-             checkout without handoff recognition); clearing the claim and \
-             retrying once…",
-        );
-        _update_marker.complete();
-        update = run_streamed(
-            &app,
-            &hermes,
-            &update_args,
-            &install_root,
-            &child_env,
-            Some("update"),
-        )
-        .await?;
-    }
     let update_ms = started.elapsed().as_millis() as u64;
 
     match update.exit_code {
@@ -612,7 +907,13 @@ async fn run_update(app: AppHandle) -> Result<()> {
         );
         return Err(anyhow!(msg));
     }
-    emit_stage(&app, "rebuild", StageState::Succeeded, Some(rebuild_ms), None);
+    emit_stage(
+        &app,
+        "rebuild",
+        StageState::Succeeded,
+        Some(rebuild_ms),
+        None,
+    );
 
     let launch_target = if let Some(target_app) = target_app {
         let started = Instant::now();
@@ -662,8 +963,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
     // Every install-tree mutation is finished. Release the lock BEFORE the
     // relaunch: this process can stay wedged in its native event loop even
     // after a successful app.exit(), and a live pid on a fresh marker would
-    // make a completed update look active — blocking desktop startup and
-    // every other updater until the age ceiling expires.
+    // make a completed update look active and correctly block every consumer.
     _update_marker.complete();
 
     if let Some(target_app) = launch_target {
@@ -675,8 +975,11 @@ async fn run_update(app: AppHandle) -> Result<()> {
                 &format!("[update] could not auto-launch desktop: {err}. Launch Hermes manually."),
             );
         }
-    } else if let Err(err) =
-        crate::bootstrap::launch_hermes_desktop(app.clone(), install_root.to_string_lossy().into_owned()).await
+    } else if let Err(err) = crate::bootstrap::launch_hermes_desktop(
+        app.clone(),
+        install_root.to_string_lossy().into_owned(),
+    )
+    .await
     {
         // Launch failed: don't hard-fail the update (it succeeded); surface a
         // log line so the success screen can still tell the user to launch
@@ -716,7 +1019,12 @@ pub(crate) async fn wait_for_install_locks_free(install_root: &Path, app: &AppHa
     let lock_targets = install_lock_probe_paths(install_root);
     let deadline = Instant::now() + DESKTOP_EXIT_WAIT;
 
-    emit_log(app, Some(stage), LogStream::Stdout, "[handoff] waiting for Hermes to exit…");
+    emit_log(
+        app,
+        Some(stage),
+        LogStream::Stdout,
+        "[handoff] waiting for Hermes to exit…",
+    );
 
     loop {
         let locked = locked_paths(&lock_targets);
@@ -796,16 +1104,35 @@ fn desktop_app_payload_paths(install_root: &Path) -> Vec<PathBuf> {
     let release = install_root.join("apps").join("desktop").join("release");
     if cfg!(target_os = "windows") {
         vec![
-            release.join("win-unpacked").join("resources").join("app.asar"),
-            release.join("win-arm64-unpacked").join("resources").join("app.asar"),
+            release
+                .join("win-unpacked")
+                .join("resources")
+                .join("app.asar"),
+            release
+                .join("win-arm64-unpacked")
+                .join("resources")
+                .join("app.asar"),
         ]
     } else if cfg!(target_os = "macos") {
         vec![
-            release.join("mac").join("Hermes.app").join("Contents").join("Resources").join("app.asar"),
-            release.join("mac-arm64").join("Hermes.app").join("Contents").join("Resources").join("app.asar"),
+            release
+                .join("mac")
+                .join("Hermes.app")
+                .join("Contents")
+                .join("Resources")
+                .join("app.asar"),
+            release
+                .join("mac-arm64")
+                .join("Hermes.app")
+                .join("Contents")
+                .join("Resources")
+                .join("app.asar"),
         ]
     } else {
-        vec![release.join("linux-unpacked").join("resources").join("app.asar")]
+        vec![release
+            .join("linux-unpacked")
+            .join("resources")
+            .join("app.asar")]
     }
 }
 
@@ -814,7 +1141,11 @@ fn locked_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 fn format_locked_paths(paths: &[PathBuf]) -> String {
-    paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Find processes running the exact `venv\Scripts\hermes.exe` shim for this
@@ -917,7 +1248,11 @@ fn is_locked(path: &Path) -> bool {
     if !path.exists() {
         return false;
     }
-    match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
         Ok(_) => false,
         Err(_) => true,
     }
@@ -929,6 +1264,10 @@ fn is_locked(path: &Path) -> bool {
 /// second run resolves.
 fn rebuild_needs_retry(exit_code: Option<i32>) -> bool {
     exit_code != Some(0)
+}
+
+fn update_needs_retry(exit_code: Option<i32>) -> bool {
+    !matches!(exit_code, Some(0) | Some(UPDATE_EXIT_CONCURRENT))
 }
 
 /// Spawn `hermes <args>` from `cwd`, stream stdout/stderr as Log events on the
@@ -1015,9 +1354,17 @@ fn resolve_hermes(install_root: &Path) -> Option<PathBuf> {
         return Some(shim);
     }
     // PATH fallback. which-style probe via env, kept dependency-free.
-    let exe = if cfg!(target_os = "windows") { "hermes.exe" } else { "hermes" };
+    let exe = if cfg!(target_os = "windows") {
+        "hermes.exe"
+    } else {
+        "hermes"
+    };
     if let Ok(path) = std::env::var("PATH") {
-        let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
+        let sep = if cfg!(target_os = "windows") {
+            ';'
+        } else {
+            ':'
+        };
         for dir in path.split(sep) {
             let cand = Path::new(dir).join(exe);
             if cand.exists() {
@@ -1028,7 +1375,7 @@ fn resolve_hermes(install_root: &Path) -> Option<PathBuf> {
     None
 }
 
-fn update_child_env(install_root: &Path) -> Vec<(String, OsString)> {
+fn update_child_env(install_root: &Path, claim_token: &str) -> Vec<(String, OsString)> {
     let hermes_home = crate::paths::hermes_home();
     let mut envs = vec![(
         "HERMES_HOME".to_string(),
@@ -1051,6 +1398,10 @@ fn update_child_env(install_root: &Path) -> Vec<(String, OsString)> {
     envs.push((
         "HERMES_UPDATE_HANDOFF_PID".to_string(),
         OsString::from(std::process::id().to_string()),
+    ));
+    envs.push((
+        "HERMES_UPDATE_CLAIM_TOKEN".to_string(),
+        OsString::from(claim_token),
     ));
     if let Some(path) = path_with_prepended_entries(&[
         hermes_home.join("node").join("bin"),
@@ -1127,12 +1478,17 @@ async fn install_macos_app_update(
         ));
     }
 
-    let rebuilt_app = crate::bootstrap::resolve_hermes_desktop_app(install_root).ok_or_else(|| {
-        anyhow!(
-            "desktop rebuild succeeded but no Hermes.app was found under {}",
-            install_root.join("apps").join("desktop").join("release").display()
-        )
-    })?;
+    let rebuilt_app =
+        crate::bootstrap::resolve_hermes_desktop_app(install_root).ok_or_else(|| {
+            anyhow!(
+                "desktop rebuild succeeded but no Hermes.app was found under {}",
+                install_root
+                    .join("apps")
+                    .join("desktop")
+                    .join("release")
+                    .display()
+            )
+        })?;
 
     let same = match (rebuilt_app.canonicalize(), target_app.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
@@ -1230,7 +1586,10 @@ async fn swap_in_new_bundle(tmp: &Path, target: &Path, old: &Path) -> Result<()>
             let _ = tokio::fs::rename(old, target).await;
         }
         remove_dir_if_exists(tmp).await;
-        return Err(anyhow!("installing updated app at {}: {err}", target.display()));
+        return Err(anyhow!(
+            "installing updated app at {}: {err}",
+            target.display()
+        ));
     }
     remove_dir_if_exists(old).await;
     Ok(())
@@ -1367,7 +1726,7 @@ mod tests {
 
     #[test]
     fn update_child_env_forces_unbuffered_python() {
-        let envs = update_child_env(Path::new("/x/hermes-agent"));
+        let envs = update_child_env(Path::new("/x/hermes-agent"), "test-token");
         assert!(
             envs.iter()
                 .any(|(k, v)| k == "PYTHONUNBUFFERED" && v.to_str() == Some("1")),
@@ -1377,12 +1736,17 @@ mod tests {
 
     #[test]
     fn update_child_env_names_our_pid_for_the_lock_handoff() {
-        let envs = update_child_env(Path::new("/x/hermes-agent"));
+        let envs = update_child_env(Path::new("/x/hermes-agent"), "test-token");
         assert!(
             envs.iter().any(|(k, v)| k == "HERMES_UPDATE_HANDOFF_PID"
                 && v.to_str() == Some(std::process::id().to_string().as_str())),
             "the hermes update child claims the same marker we hold; without our pid \
              it refuses its own parent's lock and every GUI update dead-ends on exit 2"
+        );
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "HERMES_UPDATE_CLAIM_TOKEN" && v.to_str() == Some("test-token")),
+            "handoff must bind both expected owner pid and opaque claim token"
         );
     }
 
@@ -1447,12 +1811,92 @@ mod tests {
                 std::process::id(),
                 "marker records our pid so the desktop can probe liveness"
             );
-            assert_eq!(body.lines().count(), 2, "marker is pid + started_at lines");
+            assert_eq!(
+                body.lines().count(),
+                3,
+                "marker is pid + started_at + token lines"
+            );
         }
 
         assert!(
             !marker.exists(),
             "Drop must remove the marker on every exit path (incl. early return / panic unwind)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn operation_guard_publishes_complete_identity_as_one_inode() {
+        let dir = unique_tmp_dir("operation-guard-identity");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(".hermes-update-in-progress");
+        let canonical = dir.join(".hermes-update-in-progress.lock");
+
+        let guard = MarkerOperationGuard::acquire(&marker).unwrap();
+        assert!(canonical.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&canonical).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        drop(guard);
+        assert!(!canonical.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn operation_guard_reclaim_preserves_aba_replacement() {
+        let dir = unique_tmp_dir("operation-guard-aba");
+        std::fs::create_dir_all(&dir).unwrap();
+        let canonical = dir.join(".hermes-update-in-progress.lock");
+        std::fs::write(&canonical, "4294967294\n").unwrap();
+        let replacement = format!("{}\n", std::process::id());
+
+        assert!(
+            !reclaim_operation_guard(&canonical, || {
+                std::fs::write(&canonical, &replacement).unwrap();
+            })
+            .unwrap(),
+            "the replacement is live, so reclaim must fail closed"
+        );
+        assert_eq!(std::fs::read_to_string(&canonical).unwrap(), replacement);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn operation_guard_orphan_quarantine_blocks_reacquire() {
+        let dir = unique_tmp_dir("operation-guard-orphan-quarantine");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(".hermes-update-in-progress");
+        let canonical = dir.join(".hermes-update-in-progress.lock");
+        let quarantine = marker_quarantine(&canonical, "stale");
+        std::fs::write(&quarantine, "malformed\n").unwrap();
+
+        let error = match MarkerOperationGuard::acquire(&marker) {
+            Ok(_) => panic!("orphan quarantine must block reacquire"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(quarantine.exists());
+        assert!(!canonical.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_guard_and_marker_both_fail_closed() {
+        let dir = unique_tmp_dir("corrupt-authority");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(".hermes-update-in-progress");
+        let canonical = dir.join(".hermes-update-in-progress.lock");
+        std::fs::write(&canonical, "unknown\n").unwrap();
+        assert!(UpdateMarkerGuard::acquire(marker.clone()).is_err());
+        assert!(canonical.exists());
+
+        std::fs::remove_file(&canonical).unwrap();
+        std::fs::write(&marker, "not-a-pid\n123\n").unwrap();
+        assert!(UpdateMarkerGuard::acquire(marker.clone()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "not-a-pid\n123\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1524,7 +1968,10 @@ mod tests {
         assert_eq!(owner.pid, foreign_pid);
 
         // The refused guard must not delete the live owner's marker.
-        assert!(marker.exists(), "refused acquire must leave the marker intact");
+        assert!(
+            marker.exists(),
+            "refused acquire must leave the marker intact"
+        );
         let _ = foreign.kill();
         let _ = foreign.wait();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1532,10 +1979,8 @@ mod tests {
 
     #[test]
     fn acquire_adopts_a_marker_prewritten_with_our_own_pid() {
-        // #74761: desktop writeUpdateMarker(hermesHome, child.pid) races ahead
-        // of UpdateMarkerGuard::acquire. The marker names US; refusing it made
-        // every in-app desktop update loop forever. Adopt it without resetting
-        // the holder age, so a wedged updater still reaches the stale ceiling.
+        // #74761: a compatible desktop may already have transferred the marker
+        // to our pid. Adopt it without resetting its original acquisition time.
         let dir = unique_tmp_dir("marker-own-pid");
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join(".hermes-update-in-progress");
@@ -1547,137 +1992,28 @@ mod tests {
             .saturating_sub(2);
         std::fs::write(&marker, format!("{}\n{started_at}", std::process::id())).unwrap();
 
-        let guard = UpdateMarkerGuard::acquire(marker.clone()).unwrap_or_else(|owner| {
-            panic!(
-                "own-pid pre-write must be adoptable, got foreign owner pid={}",
-                owner.pid
-            )
-        });
-        assert!(marker.exists(), "adopted guard must own the marker");
-        let body = std::fs::read_to_string(&marker).unwrap();
-        assert_eq!(
-            body.lines().next().unwrap().trim().parse::<u32>().unwrap(),
+        assert!(
+            !self_marker_adoptable(std::process::id(), std::process::id(), None, None,),
+            "PID equality without a nonempty token must not adopt a reused PID's marker"
+        );
+
+        assert!(
+            UpdateMarkerGuard::acquire(marker.clone()).is_err(),
+            "tokenless own-pid marker must fail closed instead of trusting PID reuse"
+        );
+        assert!(marker.exists(), "refusal must preserve the unproven marker");
+        assert!(self_marker_adoptable(
             std::process::id(),
-            "acquire keeps the adopted marker owner"
-        );
-        assert_eq!(
-            body.lines().nth(1).unwrap().trim().parse::<u64>().unwrap(),
-            started_at,
-            "adopting an own-pid marker must preserve its original holder age"
-        );
-        drop(guard);
-        assert!(
-            !marker.exists(),
-            "Drop must still clear the marker we adopted"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // ---- exit-2 self-marker heal (#75788) --------------------------------
-    // The deadlock: the updater holds the marker with its own PID; a stale
-    // checkout's `hermes update` reads it as a live foreign update and exits
-    // 2; the generic retry deliberately skips exit 2 — so the refusal loops
-    // forever. These tests pin the heal decision's full contract. On
-    // merge-base product code (no heal) the decision function does not exist
-    // and the refusal is terminal — the A/B run proves that.
-
-    #[test]
-    fn self_owned_marker_plus_exit_2_heals() {
-        let dir = unique_tmp_dir("heal-self-owned");
-        let marker = dir.join(".hermes-update-in-progress");
-        std::fs::write(&marker, format!("{}\n123\n", std::process::id())).unwrap();
-
-        assert!(
-            should_heal_self_marker_refusal(Some(UPDATE_EXIT_CONCURRENT), &marker),
-            "a child refusing over OUR marker is the #75788 deadlock — must heal"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn foreign_owned_marker_never_heals() {
-        let dir = unique_tmp_dir("heal-foreign");
-        let marker = dir.join(".hermes-update-in-progress");
-        // A live sibling process stands in for a genuinely concurrent updater.
-        let mut foreign = spawn_foreign_holder();
-        std::fs::write(&marker, format!("{}\n123\n", foreign.id())).unwrap();
-
-        assert!(
-            !should_heal_self_marker_refusal(Some(UPDATE_EXIT_CONCURRENT), &marker),
-            "a foreign owner is a REAL concurrent update — the refusal must stand"
-        );
-        let _ = foreign.kill();
-        let _ = foreign.wait();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn missing_or_garbage_marker_never_heals() {
-        let dir = unique_tmp_dir("heal-garbage");
-        let missing = dir.join("never-written");
-        assert!(
-            !should_heal_self_marker_refusal(Some(UPDATE_EXIT_CONCURRENT), &missing),
-            "no marker on disk = the child refused over something else entirely"
-        );
-
-        let garbage = dir.join(".hermes-update-in-progress");
-        std::fs::write(&garbage, "not-a-pid\n123\n").unwrap();
-        assert!(
-            !should_heal_self_marker_refusal(Some(UPDATE_EXIT_CONCURRENT), &garbage),
-            "an unparseable marker must not be treated as ours"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn non_exit_2_outcomes_never_heal() {
-        let dir = unique_tmp_dir("heal-wrong-exit");
-        let marker = dir.join(".hermes-update-in-progress");
-        std::fs::write(&marker, format!("{}\n123\n", std::process::id())).unwrap();
-
-        for code in [Some(0), Some(1), Some(3), None] {
-            assert!(
-                !should_heal_self_marker_refusal(code, &marker),
-                "heal is exit-2-only; exit {code:?} must keep its normal path"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn heal_end_to_end_marker_lifecycle() {
-        // The full deadlock-and-heal sequence with a REAL marker guard, as
-        // run_update executes it: acquire (marker written with our pid) →
-        // child exits 2 refusing our own claim → heal decision fires →
-        // complete() drops the claim → the retry's precondition (no marker,
-        // or a marker the child can now claim) holds.
-        let dir = unique_tmp_dir("heal-e2e");
-        let marker = dir.join(".hermes-update-in-progress");
-
-        let guard = UpdateMarkerGuard::acquire(marker.clone())
-            .unwrap_or_else(|_| panic!("no live owner => acquire must succeed"));
-        assert!(marker.exists(), "updater holds the marker during the child run");
-
-        // Stale child refused over our claim:
-        assert!(should_heal_self_marker_refusal(
-            Some(UPDATE_EXIT_CONCURRENT),
-            &marker
-        ));
-
-        // The heal drops the claim exactly as run_update does:
-        guard.complete();
-        assert!(
-            !marker.exists(),
-            "claim dropped — the one retry now runs with the marker absent"
-        );
-
-        // And with the marker gone the heal can never fire twice (the retry's
-        // own exit 2, e.g. a genuinely still-running Hermes, stays terminal).
-        assert!(!should_heal_self_marker_refusal(
-            Some(UPDATE_EXIT_CONCURRENT),
-            &marker
+            std::process::id(),
+            Some("expected-token"),
+            Some("expected-token"),
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_exit_2_is_terminal_without_a_marker_free_retry() {
+        assert!(!update_needs_retry(Some(UPDATE_EXIT_CONCURRENT)));
     }
 
     #[test]
@@ -1708,23 +2044,28 @@ mod tests {
     }
 
     #[test]
-    fn acquire_reclaims_a_marker_past_the_age_ceiling() {
+    fn acquire_never_reclaims_a_live_marker_past_the_age_ceiling() {
         let dir = unique_tmp_dir("marker-stale-age");
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join(".hermes-update-in-progress");
 
-        // Our own (live) pid, but started well past the ceiling: a wedged
-        // updater must not hold the lock forever.
+        // A foreign pid is live but older than the former ceiling. Windows
+        // updates may legitimately remain quiet for 40+ minutes.
         let long_ago = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
-            .saturating_sub(UPDATE_MARKER_MAX_AGE_SECS + 60);
-        std::fs::write(&marker, format!("{}\n{long_ago}", std::process::id())).unwrap();
+            .saturating_sub(20 * 60 + 60);
+        let mut foreign = spawn_foreign_holder();
+        std::fs::write(&marker, format!("{}\n{long_ago}", foreign.id())).unwrap();
 
-        let guard = UpdateMarkerGuard::acquire(marker.clone())
-            .unwrap_or_else(|_| panic!("a marker past the ceiling must be reclaimable"));
-        drop(guard);
+        let owner = UpdateMarkerGuard::acquire(marker.clone())
+            .err()
+            .expect("age alone must never evict a live updater");
+        assert_eq!(owner.pid, foreign.id());
+        assert!(marker.exists());
+        let _ = foreign.kill();
+        let _ = foreign.wait();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1792,8 +2133,14 @@ mod tests {
 
     #[test]
     fn rebuild_retries_only_on_failure() {
-        assert!(!rebuild_needs_retry(Some(0)), "a clean rebuild must not retry");
-        assert!(rebuild_needs_retry(Some(1)), "a failed rebuild retries once");
+        assert!(
+            !rebuild_needs_retry(Some(0)),
+            "a clean rebuild must not retry"
+        );
+        assert!(
+            rebuild_needs_retry(Some(1)),
+            "a failed rebuild retries once"
+        );
         assert!(
             rebuild_needs_retry(None),
             "a killed/signalled rebuild (no exit code) retries once"
@@ -1806,7 +2153,10 @@ mod tests {
             target_app_from_args(["--update", "--target-app", "/Applications/Hermes.app"]),
             Some(PathBuf::from("/Applications/Hermes.app"))
         );
-        assert_eq!(target_app_from_args(["--target-app", "/tmp/not-an-app"]), None);
+        assert_eq!(
+            target_app_from_args(["--target-app", "/tmp/not-an-app"]),
+            None
+        );
     }
 
     // Helpers for the swap tests: make a throwaway dir tree we can rename.
@@ -1869,8 +2219,14 @@ mod tests {
 
         let result = swap_in_new_bundle(&tmp, &target, &old).await;
 
-        assert!(result.is_err(), "swap should fail when neither move can complete");
-        assert!(target.exists(), "original app must NOT be deleted on failure");
+        assert!(
+            result.is_err(),
+            "swap should fail when neither move can complete"
+        );
+        assert!(
+            target.exists(),
+            "original app must NOT be deleted on failure"
+        );
         assert_eq!(
             std::fs::read_to_string(target.join("marker.txt")).unwrap(),
             "OLD",
@@ -1892,12 +2248,18 @@ mod tests {
         let result = swap_in_new_bundle(&tmp, &target, &old).await;
 
         assert!(result.is_err());
-        assert!(target.exists(), "original must be restored after failed install");
+        assert!(
+            target.exists(),
+            "original must be restored after failed install"
+        );
         assert_eq!(
             std::fs::read_to_string(target.join("marker.txt")).unwrap(),
             "OLD"
         );
-        assert!(!old.exists(), "backup should be rolled back, not left behind");
+        assert!(
+            !old.exists(),
+            "backup should be rolled back, not left behind"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

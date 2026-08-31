@@ -20,7 +20,7 @@ import subprocess
 import pytest
 
 from hermes_cli import update_cmd
-from hermes_cli.gateway_restart_contract import RestartProbe
+from hermes_cli.gateway_restart_contract import RestartProbe, ServingIdentity
 
 
 class _FakePlist:
@@ -107,6 +107,74 @@ class TestLaunchdRestartAfterUpdate:
         assert calls == ["contract"]
         assert "control-identity-missing" in out
         assert "No force fallback" in out
+
+    def test_active_work_schedules_durable_retry_without_changing_failure_result(
+        self, launchd, monkeypatch, tmp_path
+    ):
+        calls, state, _ = launchd
+        state["probe"] = RestartProbe(
+            False,
+            "active-work:2",
+            ServingIdentity(4321, 5678, tmp_path, "b" * 40),
+        )
+        scheduled = []
+        monkeypatch.setattr(
+            update_cmd,
+            "_schedule_deferred_launchd_restart",
+            lambda label, probe: scheduled.append((label, probe.reason)),
+            raising=False,
+        )
+
+        result = update_cmd._restart_launchd_gateway_after_update(
+            supervision_verify=False
+        )
+
+        assert result == ([], ["ai.hermes.gateway"])
+        assert calls == ["contract"]
+        assert scheduled == [("ai.hermes.gateway", "active-work:2")]
+
+    def test_scheduler_failure_cannot_mask_original_deferred_result(
+        self, launchd, monkeypatch, tmp_path
+    ):
+        calls, state, _ = launchd
+        state["probe"] = RestartProbe(
+            False,
+            "active-work:1",
+            ServingIdentity(4321, 5678, tmp_path, "b" * 40),
+        )
+        monkeypatch.setattr(
+            update_cmd,
+            "_schedule_deferred_launchd_restart",
+            lambda *_args: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+        result = update_cmd._restart_launchd_gateway_after_update(
+            supervision_verify=False
+        )
+
+        assert result == ([], ["ai.hermes.gateway"])
+        assert calls == ["contract"]
+
+    def test_unknown_authority_does_not_schedule_durable_retry(
+        self, launchd, monkeypatch
+    ):
+        calls, state, _ = launchd
+        state["probe"] = RestartProbe(False, "active-work-unknown", None)
+        scheduled = []
+        monkeypatch.setattr(
+            update_cmd,
+            "_schedule_deferred_launchd_restart",
+            lambda label, probe: scheduled.append((label, probe.reason)),
+            raising=False,
+        )
+
+        result = update_cmd._restart_launchd_gateway_after_update(
+            supervision_verify=False
+        )
+
+        assert result == ([], ["ai.hermes.gateway"])
+        assert calls == ["contract"]
+        assert scheduled == []
 
     @pytest.mark.parametrize(
         "exc",

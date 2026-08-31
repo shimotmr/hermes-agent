@@ -351,12 +351,19 @@ class TestSiblingVerifiedRestartContract:
         )
         restarted: list[str] = []
         failed: list[str] = []
+        scheduled = []
+        monkeypatch.setattr(
+            update_cmd,
+            "_schedule_deferred_launchd_restart",
+            lambda label, probe: scheduled.append((label, probe.reason)),
+        )
 
         _restart_macos_launchd_gateways(restarted, failed, 5.0)
 
         assert restarted == [current]
         assert failed == [sibling]
         assert waits == []
+        assert scheduled == [(sibling, "active-work:1")]
 
     def test_idle_sibling_requires_verified_replacement_and_supervision(
         self, monkeypatch, tmp_path

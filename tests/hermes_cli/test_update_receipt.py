@@ -119,6 +119,45 @@ class TestReceiptLifecycle:
         assert gr["incomplete"] is True
         assert "boom" in gr["phase_error"]
 
+    def test_deferred_restart_summary_is_appended_and_persisted(self, receipt_home):
+        ur.begin_update_receipt()
+        ur.record_deferred_gateway_restart(
+            profile="default",
+            scheduled=True,
+            reason="scheduled",
+            intent_path=receipt_home / "logs" / "update_receipts" / "deferred.json",
+            receipt_path=receipt_home / "logs" / "update_receipts" / "receipt.json",
+        )
+        ur.record_deferred_gateway_restart(
+            profile="ops",
+            scheduled=False,
+            reason="active-work-unknown",
+        )
+
+        path = _finalize("partial")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+
+        assert payload["deferred_restarts"] == [
+            {
+                "profile": "default",
+                "scheduled": True,
+                "reason": "scheduled",
+                "intent_path": str(
+                    receipt_home / "logs" / "update_receipts" / "deferred.json"
+                ),
+                "receipt_path": str(
+                    receipt_home / "logs" / "update_receipts" / "receipt.json"
+                ),
+            },
+            {
+                "profile": "ops",
+                "scheduled": False,
+                "reason": "active-work-unknown",
+                "intent_path": None,
+                "receipt_path": None,
+            },
+        ]
+
     def test_record_without_begin_is_noop(self, receipt_home):
         # No begin — nothing should raise, nothing should be written.
         ur.record_step("orphan", True)

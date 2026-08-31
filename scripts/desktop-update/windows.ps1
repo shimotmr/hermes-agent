@@ -82,6 +82,8 @@ try {
 $TempDir = if ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
 $HermesHome = if ($InstallRoot) { Split-Path -Parent $InstallRoot } else { $TempDir }
 $MarkerPath = Join-Path $HermesHome ".hermes-update-in-progress"
+$MarkerGuardPath = "$MarkerPath.lock"
+$script:ClaimToken = "$env:HERMES_UPDATE_CLAIM_TOKEN".Trim()
 $LogDir = Join-Path $HermesHome "logs"
 $LogPath = Join-Path $LogDir "desktop-update-handoff.log"
 $ResultPath = Join-Path $HermesHome ".hermes-update-result.json"
@@ -522,19 +524,141 @@ function Write-Result([bool]$Ok, [int]$Code, [string]$Message, [bool]$ManualActi
     } catch {}
 }
 
+function Get-MarkerPidLiveness([string]$OwnerPid) {
+    $parsed = 0
+    if (-not [int]::TryParse($OwnerPid, [ref]$parsed) -or $parsed -le 0) { return "Unknown" }
+    try {
+        $null = Get-Process -Id $parsed -ErrorAction Stop
+        return "Alive"
+    } catch {
+        if ($_.FullyQualifiedErrorId -like "NoProcessFoundForGivenId*") { return "Dead" }
+        return "Unknown"
+    }
+}
+
+function Test-MarkerPidAlive([string]$OwnerPid) {
+    return (Get-MarkerPidLiveness $OwnerPid) -ne "Dead"
+}
+
+function Remove-MarkerGuardQuarantine([string]$Quarantine) {
+    try {
+        if ([System.IO.Directory]::Exists($Quarantine)) {
+            [System.IO.File]::Delete((Join-Path $Quarantine "owner"))
+            [System.IO.Directory]::Delete($Quarantine)
+        } else {
+            [System.IO.File]::Delete($Quarantine)
+        }
+    } catch {}
+}
+
+function Test-MarkerGuardQuarantinePresent {
+    $parent = [System.IO.Path]::GetDirectoryName($MarkerGuardPath)
+    $name = [System.IO.Path]::GetFileName($MarkerGuardPath)
+    try {
+        return @([System.IO.Directory]::EnumerateFileSystemEntries($parent, ".$name.stale-*")).Count -gt 0 -or
+            @([System.IO.Directory]::EnumerateFileSystemEntries($parent, "$name.stale-*")).Count -gt 0
+    } catch {
+        return $true
+    }
+}
+
+function Restore-MarkerGuardQuarantine([string]$Quarantine, [string]$OwnerPath) {
+    $null = & cmd.exe /d /c mklink /H "`"$MarkerGuardPath`"" "`"$OwnerPath`"" 2>$null
+    if ($LASTEXITCODE -ne 0 -and -not [System.IO.File]::Exists($MarkerGuardPath)) {
+        return $false
+    }
+    Remove-MarkerGuardQuarantine $Quarantine
+    return $true
+}
+
+function Reclaim-DeadMarkerGuard {
+    $quarantine = "$MarkerGuardPath.stale-$PID-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        if ([System.IO.Directory]::Exists($MarkerGuardPath)) {
+            [System.IO.Directory]::Move($MarkerGuardPath, $quarantine)
+        } else {
+            [System.IO.File]::Move($MarkerGuardPath, $quarantine)
+        }
+    } catch { return $false }
+
+    $ownerPath = if ([System.IO.Directory]::Exists($quarantine)) { Join-Path $quarantine "owner" } else { $quarantine }
+    $owner = ""
+    try { $owner = ([System.IO.File]::ReadAllText($ownerPath)).Trim() } catch {}
+    if ((Get-MarkerPidLiveness $owner) -ne "Dead") {
+        $null = Restore-MarkerGuardQuarantine $quarantine $ownerPath
+        return $false
+    }
+
+    Remove-MarkerGuardQuarantine $quarantine
+    # A replacement published after our detach remains canonical and wins.
+    return (-not [System.IO.File]::Exists($MarkerGuardPath) -and -not [System.IO.Directory]::Exists($MarkerGuardPath))
+}
+
+function Enter-MarkerGuard {
+    if (Test-MarkerGuardQuarantinePresent) { return $false }
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        $privateGuard = "$MarkerGuardPath.$PID-$([Guid]::NewGuid().ToString('N'))"
+        try {
+            [System.IO.Directory]::CreateDirectory($privateGuard) | Out-Null
+            $ownerPath = Join-Path $privateGuard "owner"
+            $bytes = [System.Text.Encoding]::ASCII.GetBytes("$PID`n")
+            $stream = [System.IO.File]::Open($ownerPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            try {
+                $stream.Write($bytes, 0, $bytes.Length)
+                $stream.Flush($true)
+            } finally { $stream.Dispose() }
+            $null = & cmd.exe /d /c mklink /H "`"$MarkerGuardPath`"" "`"$ownerPath`"" 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not [System.IO.File]::Exists($MarkerGuardPath)) {
+                throw "could not atomically publish marker guard"
+            }
+            [System.IO.Directory]::Delete($privateGuard, $true)
+            return $true
+        } catch {
+            try { [System.IO.Directory]::Delete($privateGuard, $true) } catch {}
+            if (-not (Reclaim-DeadMarkerGuard)) { return $false }
+        }
+    }
+    return $false
+}
+
+function Exit-MarkerGuard {
+    if ([System.IO.Directory]::Exists($MarkerGuardPath)) {
+        try { [System.IO.File]::Delete((Join-Path $MarkerGuardPath "owner")) } catch {}
+        try { [System.IO.Directory]::Delete($MarkerGuardPath) } catch {}
+    } else {
+        try { [System.IO.File]::Delete($MarkerGuardPath) } catch {}
+    }
+}
+
 function Remove-MarkerIfOwned {
     if ($NoMarkerCleanup) { return }
+    if (-not (Enter-MarkerGuard)) { return }
+    $preserveGuard = $false
+    $quarantine = "$MarkerPath.remove-$PID-$([Guid]::NewGuid().ToString('N'))"
     try {
-        if (Test-Path -LiteralPath $MarkerPath) {
-            $firstLine = (Get-Content -LiteralPath $MarkerPath -TotalCount 1 -ErrorAction SilentlyContinue)
-            if ("$firstLine".Trim() -eq "$PID") {
-                Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
+        if ([System.IO.File]::Exists($MarkerPath)) {
+            [System.IO.File]::Move($MarkerPath, $quarantine)
+            $firstLine = (Get-Content -LiteralPath $quarantine -TotalCount 1 -ErrorAction SilentlyContinue)
+            $lines = [System.IO.File]::ReadAllLines($quarantine)
+            $markerToken = if ($lines.Length -ge 3) { $lines[2].Trim() } else { "" }
+            if ("$firstLine".Trim() -eq "$PID" -and (-not $script:ClaimToken -or $markerToken -eq $script:ClaimToken)) {
+                Remove-Item -LiteralPath $quarantine -Force -ErrorAction SilentlyContinue
+                if ([System.IO.File]::Exists($quarantine)) {
+                    try { [System.IO.File]::Move($quarantine, $MarkerPath) } catch { $preserveGuard = $true }
+                }
                 Write-HandoffLog "removed update marker (owned)"
             } else {
                 Write-HandoffLog "leaving update marker: owned by pid '$firstLine', not us ($PID)"
+                try { [System.IO.File]::Move($quarantine, $MarkerPath) } catch {
+                    if ([System.IO.File]::Exists($MarkerPath)) {
+                        Remove-Item -LiteralPath $quarantine -Force -ErrorAction SilentlyContinue
+                    } else {
+                        $preserveGuard = $true
+                    }
+                }
             }
         }
-    } catch {}
+    } catch { $preserveGuard = $true } finally { if (-not $preserveGuard) { Exit-MarkerGuard } }
 }
 
 function Start-DesktopRelaunch {
@@ -1371,12 +1495,51 @@ try {
         if (-not $hasStartedAt -or $startedAt -gt $epoch -or ($epoch - $startedAt) -gt 1200) {
             $startedAt = $epoch
         }
-        # WriteAllText for byte-exact LF framing: Set-Content emits CRLF and
-        # the marker contract (Rust/TS/Python readers) is "<pid>\n<ts>\n".
-        [System.IO.File]::WriteAllText($MarkerPath, "$PID`n$startedAt`n")
+        if (-not $script:ClaimToken) { $script:ClaimToken = [Guid]::NewGuid().ToString('N') }
+        $markerTemp = "$MarkerPath.write-$PID-$([Guid]::NewGuid().ToString('N'))"
+        $claimed = $false
+        $preserveClaimGuard = $false
+        if (-not (Enter-MarkerGuard)) { throw "marker operation guard is held or unverifiable" }
+        try {
+            if ([System.IO.File]::Exists($MarkerPath)) {
+                $lines = [System.IO.File]::ReadAllLines($MarkerPath)
+                $currentPid = if ($lines.Length -ge 1) { $lines[0].Trim() } else { "" }
+                $currentStarted = if ($lines.Length -ge 2) { $lines[1].Trim() } else { "$startedAt" }
+                $currentToken = if ($lines.Length -ge 3) { $lines[2].Trim() } else { "" }
+                $expectedPid = "$env:HERMES_UPDATE_HANDOFF_PID".Trim()
+                if ($expectedPid -and $currentPid -eq $expectedPid -and $currentToken -eq $script:ClaimToken) {
+                    [System.IO.File]::WriteAllText($markerTemp, "$PID`n$currentStarted`n$($script:ClaimToken)`n")
+                    [System.IO.File]::Replace($markerTemp, $MarkerPath, $null)
+                    $claimed = $true
+                } elseif ($currentPid -eq "$PID" -and (-not $currentToken -or $currentToken -eq $script:ClaimToken)) {
+                    $claimed = $true
+                } elseif ((Get-MarkerPidLiveness $currentPid) -eq "Dead") {
+                    $stale = "$MarkerPath.stale-$PID-$([Guid]::NewGuid().ToString('N'))"
+                    [System.IO.File]::Move($MarkerPath, $stale)
+                    $detachedPid = ([System.IO.File]::ReadAllLines($stale)[0]).Trim()
+                    if ((Get-MarkerPidLiveness $detachedPid) -ne "Dead") {
+                        try { [System.IO.File]::Move($stale, $MarkerPath) } catch { $preserveClaimGuard = $true }
+                    } else {
+                        try { [System.IO.File]::Delete($stale) } catch {
+                            try { [System.IO.File]::Move($stale, $MarkerPath) } catch { $preserveClaimGuard = $true }
+                        }
+                    }
+                }
+            }
+            if (-not $claimed -and -not [System.IO.File]::Exists($MarkerPath)) {
+                [System.IO.File]::WriteAllText($markerTemp, "$PID`n$startedAt`n$($script:ClaimToken)`n")
+                [System.IO.File]::Move($markerTemp, $MarkerPath)
+                $claimed = $true
+            }
+        } finally { if (-not $preserveClaimGuard) { Exit-MarkerGuard } }
+        if (-not $claimed) {
+            throw "marker is owned by another live or unverifiable updater"
+        }
         Write-HandoffLog "claimed update marker (pid $PID)"
     } catch {
-        Write-HandoffLog "WARNING: could not write update marker: $($_.Exception.Message)"
+        if ($markerTemp) { Remove-Item -LiteralPath $markerTemp -Force -ErrorAction SilentlyContinue }
+        Write-HandoffLog "ERROR: could not atomically claim update marker: $($_.Exception.Message)"
+        throw
     }
 
     if ($SelfTestMarker) {
@@ -1437,8 +1600,8 @@ try {
     # -- 3. Run the update from the CURRENT checkout ------------------------
     # --force skips only the hermes.exe shim guard, which step 2 just PROVED
     # is unlocked; the venv-python holder guard (orphan reap included) stays
-    # active. Our marker claim is adopted by the child via update_lock.py's
-    # process-ancestry rule.
+    # active. Our marker claim is adopted by the child through the exact
+    # pid+token handoff contract (with one narrow direct-parent legacy rollout).
     #
     # DRIVE THE UPDATE THROUGH venv\Scripts\python.exe, NOT venv\Scripts\hermes.exe.
     # `uv pip install -e .` has to replace the console-script shims, so

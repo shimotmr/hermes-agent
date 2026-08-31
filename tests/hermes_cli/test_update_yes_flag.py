@@ -12,8 +12,16 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from hermes_cli import main as hermes_main
+from hermes_cli import update_cmd
 from hermes_cli.main import cmd_update
 
+pytestmark = [
+    pytest.mark.update_orchestration,
+    pytest.mark.usefixtures("isolated_update_orchestrator"),
+]
 
 def _make_run_side_effect(
     branch="main", verify_ok=True, commit_count="1", dirty=False
@@ -23,6 +31,10 @@ def _make_run_side_effect(
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
 
+        if "rev-parse" in joined and "^{commit}" in joined:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{'f' * 40}\n", stderr=""
+            )
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
         if "rev-parse" in joined and "--verify" in joined:

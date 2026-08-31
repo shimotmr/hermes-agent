@@ -861,7 +861,10 @@ def _pid_exists(pid: int) -> bool:
             return False
         except Exception:
             pass
-        return bool(psutil.pid_exists(int(pid)))
+        try:
+            return bool(psutil.pid_exists(int(pid)))
+        except Exception:
+            return True
 
     except ImportError:
         pass  # Fall through to stdlib fallback.
@@ -877,6 +880,7 @@ def _pid_exists(pid: int) -> bool:
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
             SYNCHRONIZE = 0x100000  # required for WaitForSingleObject
             WAIT_TIMEOUT = 0x00000102
+            WAIT_OBJECT_0 = 0x00000000
             ERROR_INVALID_PARAMETER = 87
             ERROR_ACCESS_DENIED = 5
             handle = kernel32.OpenProcess(
@@ -888,16 +892,16 @@ def _pid_exists(pid: int) -> bool:
                     return False  # PID definitely gone
                 if err == ERROR_ACCESS_DENIED:
                     return True   # Exists but owned by another user/session
-                return False      # Conservative default for unknown errors
+                return True       # Unknown authority fails closed
             try:
                 wait_result = kernel32.WaitForSingleObject(handle, 0)
-                # WAIT_TIMEOUT = still running; anything else (WAIT_OBJECT_0
-                # via exit, WAIT_FAILED via handle issue) = treat as gone.
-                return wait_result == WAIT_TIMEOUT
+                if wait_result == WAIT_OBJECT_0:
+                    return False
+                return True  # WAIT_TIMEOUT is alive; failures are unknown/blocking
             finally:
                 kernel32.CloseHandle(handle)
         except (OSError, AttributeError):
-            return False
+            return True
     else:
         # psutil missing (stripped install / scaffold phase). Catch the same
         # zombie case as the psutil path above (issue #42126): a zombie
@@ -933,7 +937,7 @@ def _pid_exists(pid: int) -> bool:
             # Process exists but we can't signal it — still alive.
             return True
         except OSError:
-            return False
+            return True
 
 
 

@@ -62,6 +62,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from gateway.platform_status import project_live_platforms
+
 logger = logging.getLogger(__name__)
 
 CONTROL_PROTOCOL_VERSION = 1
@@ -242,17 +244,11 @@ def build_status_payload() -> dict[str, Any]:
         # restart inventory when both writer-identity fields unambiguously
         # belong to a prior process.  Partial/malformed mismatches stay visible
         # so the restart validator continues to fail closed on corrupt state.
-        payload["platforms"] = {
-            name: record
-            for name, record in platforms.items()
-            if not (
-                isinstance(record, dict)
-                and type(record.get("writer_pid")) is int
-                and record.get("writer_pid") != answering_pid
-                and type(record.get("writer_start_time")) is int
-                and record.get("writer_start_time") != current_start_time
-            )
-        }
+        payload["platforms"] = project_live_platforms(
+            platforms,
+            current_pid=answering_pid,
+            current_start_time=current_start_time,
+        )
     payload["protocol"] = CONTROL_PROTOCOL_VERSION
     payload["answered_at"] = time.time()
     payload["answering_pid"] = answering_pid

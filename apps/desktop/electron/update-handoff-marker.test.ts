@@ -98,10 +98,32 @@ function assertScriptHandoff(run: (installRoot: string, startedAt?: string) => R
   )
 }
 
+function assertScriptRefusesForeignClaim(
+  run: (installRoot: string, startedAt?: string) => ReturnType<typeof spawnSync>
+) {
+  const foreign = sandbox('foreign')
+  const marker = path.join(foreign.home, '.hermes-update-in-progress')
+  const original = `${process.pid}\n${Math.floor(Date.now() / 1000) - 3}\nforeign-token\n`
+  fs.writeFileSync(marker, original)
+
+  const result = run(foreign.installRoot)
+
+  assert.notEqual(result.status, 0, 'a foreign live claim must refuse the hand-off')
+  assert.equal(fs.readFileSync(marker, 'utf8'), original)
+}
+
 test.skipIf(process.platform === 'win32')('POSIX hand-off preserves the Desktop marker acquisition time', () => {
   assertScriptHandoff(runPosix)
 })
 
+test.skipIf(process.platform === 'win32')('POSIX hand-off never replaces a foreign live claim', () => {
+  assertScriptRefusesForeignClaim(runPosix)
+})
+
 test.skipIf(process.platform !== 'win32')('PowerShell hand-off preserves the Desktop marker acquisition time', () => {
   assertScriptHandoff(runWindows)
+})
+
+test.skipIf(process.platform !== 'win32')('PowerShell hand-off never replaces a foreign live claim', () => {
+  assertScriptRefusesForeignClaim(runWindows)
 })

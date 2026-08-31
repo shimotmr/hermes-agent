@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 from subprocess import CalledProcessError
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,6 +9,11 @@ import pytest
 from hermes_cli import config as hermes_config
 from hermes_cli import main as hermes_main
 from hermes_cli import update_cmd
+
+pytestmark = [
+    pytest.mark.update_orchestration,
+    pytest.mark.usefixtures("isolated_update_orchestrator"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +58,8 @@ def _patch_managed_uv(request):
 
 
 
+
+
 # ---------------------------------------------------------------------------
 # Update uses .[all] with fallback to .
 # ---------------------------------------------------------------------------
@@ -68,6 +76,105 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
     monkeypatch.setattr(hermes_main, "_upgrade_pip_before_lazy_refresh", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda *a, **kw: True)
+
+
+def test_drop_owned_stash_revalidates_selector_before_mutation(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[-3:] == ["stash", "list", "--format=%gd %H"]:
+            return subprocess.CompletedProcess(command, 0, "stash@{0} owned\n", "")
+        if command[-2:] == ["rev-parse", "stash@{0}"]:
+            return subprocess.CompletedProcess(command, 0, "replacement\n", "")
+        raise AssertionError(f"unsafe mutation attempted: {command}")
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+
+    assert update_cmd._drop_owned_stash(["git"], tmp_path, "owned") is False
+    assert not any(command[-2:] == ["drop", "stash@{0}"] for command in calls)
+
+
+def test_drop_owned_stash_fails_closed_when_refs_stash_changes_before_mutation(
+    monkeypatch, tmp_path
+):
+    """A concurrent stash must never be deleted through selector drift."""
+    real_run = subprocess.run
+
+    def git(*args):
+        return real_run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "Release Gate Test")
+    git("config", "user.email", "release-gate@example.invalid")
+    (tmp_path / "tracked.txt").write_text("base\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "base")
+    (tmp_path / "tracked.txt").write_text("owned\n", encoding="utf-8")
+    git("stash", "push", "-qm", "owned")
+    owned = git("rev-parse", "refs/stash")
+    injected = False
+
+    def race_before_mutation(command, **kwargs):
+        nonlocal injected
+        is_drop = command[-2:-1] == ["drop"]
+        is_ref_delete = command[-4:-3] == ["update-ref"] and "-d" in command
+        if not injected and (is_drop or is_ref_delete):
+            injected = True
+            (tmp_path / "tracked.txt").write_text("foreign\n", encoding="utf-8")
+            git("stash", "push", "-qm", "foreign")
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", race_before_mutation)
+
+    assert update_cmd._drop_owned_stash(["git"], tmp_path, owned) is False
+    remaining = git("stash", "list", "--format=%H")
+    assert owned in remaining
+    assert len(remaining.splitlines()) == 2
+
+
+def test_restore_guidance_never_emits_mutable_selector_after_concurrent_push(
+    monkeypatch, tmp_path, capsys
+):
+    """CAS failure guidance must identify our stash only by immutable OID."""
+    real_run = subprocess.run
+
+    def git(*args):
+        return real_run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "Updater Test")
+    git("config", "user.email", "updater@example.invalid")
+    (tmp_path / "tracked.txt").write_text("base\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "base")
+    (tmp_path / "tracked.txt").write_text("owned\n", encoding="utf-8")
+    git("stash", "push", "-qm", "owned")
+    owned = git("rev-parse", "refs/stash")
+    injected = False
+
+    def push_before_cas(command, **kwargs):
+        nonlocal injected
+        if not injected and command[-4:-3] == ["update-ref"] and "-d" in command:
+            injected = True
+            (tmp_path / "foreign.txt").write_text("foreign\n", encoding="utf-8")
+            git("stash", "push", "-uqm", "foreign")
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", push_before_cas)
+
+    assert update_cmd._restore_stashed_changes(["git"], tmp_path, owned) is True
+
+    output = capsys.readouterr().out
+    assert owned in output
+    assert "stash@{" not in output
+    assert "git stash drop" not in output
+    assert git("rev-parse", "refs/stash") != owned
+    assert owned in git("stash", "list", "--format=%H").splitlines()
 
 
 
@@ -131,6 +238,8 @@ def _make_update_side_effect(
             if fetch_fails:
                 return SimpleNamespace(stdout="", stderr=fetch_stderr, returncode=128)
             return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if "rev-parse" in joined and "^{commit}" in joined:
+            return SimpleNamespace(stdout=f"{'f' * 40}\n", stderr="", returncode=0)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
         if "checkout" in joined and "main" in joined:
@@ -745,3 +854,41 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
         assert (pkg / "hermes-agent.rb").read_text() == "formula\n"
     finally:
         os.chmod(pkg, 0o755)
+
+
+def test_partial_stash_failure_does_not_reset_for_concurrent_foreign_stash(
+    monkeypatch, tmp_path
+):
+    """A raced refs/stash update is not proof that this invocation saved edits."""
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        joined = " ".join(command)
+        if "status --porcelain" in joined:
+            return SimpleNamespace(returncode=0, stdout=" M tracked.txt\n", stderr="")
+        if "ls-files --unmerged" in joined:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "stash push" in joined:
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="warning: failed to remove foreign-owned file",
+                args=command,
+            )
+        if "stash list" in joined:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{'b' * 40}\x00On main: somebody-elses-stash\n",
+                stderr="",
+            )
+        if "reset --hard" in joined:
+            pytest.fail("foreign stash must never authorize destructive reset")
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", run)
+
+    with pytest.raises(CalledProcessError):
+        update_cmd._stash_local_changes_if_needed(["git"], tmp_path)
+
+    assert not any("reset --hard" in " ".join(command) for command in commands)
