@@ -343,6 +343,33 @@ def _strip_persistence_markers(messages: List[Dict[str, Any]]) -> None:
             msg.pop(_DB_PERSISTED_MARKER, None)
 
 
+def stamp_db_persisted_markers(messages: List[Dict[str, Any]]) -> None:
+    """Fulfil the post-commit contract of ``SessionDB.archive_and_compact()``.
+
+    ``archive_and_compact()`` atomically soft-archives the previous active
+    rows and inserts *messages* as the new active set — after it returns,
+    every dict in *messages* IS durably stored. Stamp ``_DB_PERSISTED_MARKER``
+    on those exact dict instances so the append-only flush
+    (``_persist_session`` → ``_flush_messages_to_session_db_unlocked``)
+    skips them instead of re-INSERTing the whole compacted transcript.
+
+    This is the single stamp site for ALL ``archive_and_compact`` callers
+    (in-place batch commit, micro-compaction sync, proactive prune). The
+    marker must land on the dicts the caller actually keeps as the live
+    message list: ``compress()`` output is marker-swept by design
+    (``_strip_persistence_markers``, #57491 — the sweep protects the
+    ROTATION flush to a child session), so a committed in-place set that
+    is returned to the caller unstamped is re-written as "new" by the next
+    persist walk and the live transcript doubles on every compaction
+    (#98450: ~58K → ~512K tokens). Call this ONLY after the commit
+    succeeded — an unstamped dict after a failed commit is correct
+    (the flush then durably writes it).
+    """
+    for msg in messages:
+        if isinstance(msg, dict):
+            msg[_DB_PERSISTED_MARKER] = True
+
+
 def _prune_stale_reasoning_replay(messages: List[Dict[str, Any]]) -> int:
     """Strip stale per-turn replay items (``codex_reasoning_items``) from
     assistant messages that belong to turns older than the active one.
@@ -2920,9 +2947,16 @@ class ContextCompressor(ContextEngine):
         cooldown_seconds: float,
         error: Optional[str],
     ) -> None:
-        cooldown_until = time.time() + cooldown_seconds
-        self._summary_failure_cooldown_until = time.monotonic() + cooldown_seconds
+        now_mono = time.monotonic()
+        new_mono = now_mono + float(cooldown_seconds)
+        # Never shorten a longer live deadline (#96775). A later stall or
+        # timeout records the latest error text but keeps the later of the
+        # two clocks.
+        if new_mono > self._summary_failure_cooldown_until:
+            self._summary_failure_cooldown_until = new_mono
         self._last_summary_error = error
+        remaining = max(0.0, self._summary_failure_cooldown_until - time.monotonic())
+        cooldown_until = time.time() + remaining
 
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
@@ -2943,14 +2977,23 @@ class ContextCompressor(ContextEngine):
             self._cooldown_persist_failed = True
             logger.debug("compression failure cooldown persist failed (non-sqlite): %s", exc)
 
-    def record_timeout_failure(self, error: str) -> None:
-        """Record a consecutive timeout failure using the shared cooldown ladder.
+    def record_timeout_failure(self, error: str, failure_kind: str = "timeout") -> None:
+        """Record a consecutive timeout/stall failure using the shared ladder.
 
-        Used by both the summary-LLM exception handler (inline at line ~3714)
-        and the host-level ``compress_context`` timeout wrapper in
-        ``run_compress_context_with_progress_timeout``. Avoids re-implementing
-        the ladder at each call site (#62452).
+        Used by the summary-LLM exception handler, the host-level
+        ``compress_context`` timeout wrapper, and stall-interrupted
+        pre-commit cancellation (#62452, #96775).
+
+        The persisted error is prefixed with the attempt identity —
+        ``backoff:<failure_kind>:strategy=<tail_mode>`` — so the durable row
+        (``sessions.compression_failure_cooldown_until`` +
+        ``compression_failure_error`` in state.db) records WHICH strategy
+        failed and WHY, and a gateway restart rebuilds the same backoff
+        decision from ``bind_session_state()`` (#96775/#97488).
         """
+        strategy = getattr(self, "tail_mode", None) or "unknown"
+        kind = failure_kind or "timeout"
+        stamped = f"backoff:{kind}:strategy={strategy}: {error}"
         _TIMEOUT_COOLDOWN_LADDER = (60, 300, 900)
         self._consecutive_timeout_failures = (
             getattr(self, "_consecutive_timeout_failures", 0) + 1
@@ -2959,7 +3002,7 @@ class ContextCompressor(ContextEngine):
             min(self._consecutive_timeout_failures,
                 len(_TIMEOUT_COOLDOWN_LADDER)) - 1
         ]
-        self._record_compression_failure_cooldown(float(cooldown), error)
+        self._record_compression_failure_cooldown(float(cooldown), stamped)
 
     def _clear_compression_failure_cooldown(self) -> None:
         # #76354 review F4: fence check BEFORE cooldown-clear. A late worker
@@ -2999,6 +3042,17 @@ class ContextCompressor(ContextEngine):
             logger.debug("compression failure cooldown clear failed: %s", exc)
         except Exception as exc:
             logger.debug("compression failure cooldown clear failed (non-sqlite): %s", exc)
+
+    def _compression_cancelled(self) -> bool:
+        """Read the host-owned cooperative cancellation signal, if installed."""
+        cancelled_check = getattr(self, "_compression_cancelled_check", None)
+        if not callable(cancelled_check):
+            return False
+        try:
+            return bool(cancelled_check())
+        except Exception:
+            logger.debug("compression cancellation check failed", exc_info=True)
+            return False
 
     def update_model(
         self,
@@ -4269,9 +4323,9 @@ class ContextCompressor(ContextEngine):
                     exc,
                 )
                 return messages, 0
-            for msg in pruned_msgs:
-                if isinstance(msg, dict):
-                    msg[_DB_PERSISTED_MARKER] = True
+            # Shared post-commit contract with the in-place batch commit and
+            # the micro-compaction sync (#98450) — one stamp site for the class.
+            stamp_db_persisted_markers(pruned_msgs)
         self._proactive_prune_rearm_tokens = next_rearm_tokens
         return pruned_msgs, pruned_count
 
@@ -4805,6 +4859,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         placeholder.
         """
         prompt_started_at = time.monotonic()
+        if self._compression_cancelled():
+            raise AuxiliaryExplicitCancellation()
         now = prompt_started_at
         if now < self._summary_failure_cooldown_until:
             logger.debug(
@@ -5183,6 +5239,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                     effective_aux_context=_aux_context,
                     phase_timings=_latency_info,
                 )
+            if self._compression_cancelled():
+                raise AuxiliaryExplicitCancellation()
             # ``_validate_llm_response`` only guarantees ``choices[0].message``
             # exists, not that it's an object with ``.content``. Some
             # OpenAI-compatible proxies / local backends return a dict- or
@@ -7260,9 +7318,9 @@ This compaction should PRIORITISE preserving all information related to the focu
             return
         try:
             session_db.archive_and_compact(session_id, compacted_messages)
-            for msg in compacted_messages:
-                if isinstance(msg, dict):
-                    msg[_DB_PERSISTED_MARKER] = True
+            # Shared post-commit contract with the in-place batch commit and
+            # the proactive prune (#98450) — one stamp site for the class.
+            stamp_db_persisted_markers(compacted_messages)
         except Exception:
             logger.info(
                 "Micro-compaction DB sync failed — resume will double-load "
