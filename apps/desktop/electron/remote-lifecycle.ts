@@ -921,7 +921,11 @@ finally:
 sys.exit(result.returncode if result is not None else 1)
 `.trim()
 
-  return `python3 -c ${shq(script)} ${shq(mutexPath)} ${shq(command)}`
+  // mutexPath is an expandRemotePath() shell fragment (for example
+  // "$HOME"'/.hermes/...'). Embed it once so the shell expands the path into
+  // one argv value. shq() here would preserve the quote characters literally
+  // and create a repo-local directory named `'` when tests run from a checkout.
+  return `python3 -c ${shq(script)} ${mutexPath} ${shq(command)}`
 }
 
 /**

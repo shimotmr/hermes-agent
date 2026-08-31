@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback, spawn } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -855,12 +855,17 @@ done
       logPath
     })
 
-    await exec(command, { shell: '/bin/bash' })
+    await exec(command, { cwd: directory, shell: '/bin/bash' })
 
     for (let attempt = 0; attempt < 40; attempt += 1) {
       try {
         const report = await readFile(reportPath, 'utf8')
         assert.equal(report, '', 'the backend process must not retain the update mutex descriptor')
+        await assert.rejects(
+          stat(path.join(directory, "'")),
+          (error: any) => error?.code === 'ENOENT',
+          'the already shell-quoted mutex path must not create a literal quote directory'
+        )
 
         return
       } catch (error: any) {
