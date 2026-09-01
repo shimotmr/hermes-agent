@@ -95,11 +95,37 @@ def _preflight_request_tokens(
             "using generic transcript estimate",
             exc_info=True,
         )
+    if _agent_stale_thinking_on_wire(agent):
+        return estimate_request_tokens_rough(
+            messages,
+            system_prompt=system_prompt or "",
+            tools=tools,
+        )
     return estimate_request_tokens_rough(
         messages,
         system_prompt=system_prompt or "",
         tools=tools,
+        charge_stale_thinking=False,
     )
+
+
+def _agent_stale_thinking_on_wire(agent: Any) -> bool:
+    """Whether the agent's active route replays stale thinking text (#84371).
+
+    Route facts unavailable (test doubles, partially-built agents) default to
+    ``True`` — the conservative full charge.
+    """
+    try:
+        from agent.message_sanitization import stale_thinking_reaches_wire
+
+        return stale_thinking_reaches_wire(
+            getattr(agent, "api_mode", "") or "",
+            getattr(agent, "provider", "") or "",
+            getattr(agent, "model", "") or "",
+            getattr(agent, "base_url", "") or "",
+        )
+    except Exception:
+        return True
 
 
 def compose_user_api_content(
@@ -379,6 +405,23 @@ def compression_made_progress(
 _compression_made_progress = compression_made_progress
 
 
+class PreflightCompressionTimedOut(RuntimeError):
+    """Raised when an oversized turn cannot safely finish preflight."""
+
+
+def _fail_closed_after_preflight_timeout(agent, request_tokens: int) -> None:
+    """Stop an oversized turn instead of sending its unchanged provider payload."""
+    from agent.conversation_compression import context_compression_timed_out
+
+    if not context_compression_timed_out(agent):
+        return
+    raise PreflightCompressionTimedOut(
+        "Context compression timed out before it could commit while the request "
+        f"was still approximately {request_tokens:,} tokens. The provider call "
+        "was not sent. Run /compress and wait for it to finish, then retry."
+    )
+
+
 def _review_fork_first_request_pending(agent: Any) -> bool:
     """Whether a detached review fork has yet to send its first provider request.
 
@@ -514,6 +557,7 @@ def build_turn_context(
     stream_callback,
     persist_user_message: Optional[Any],
     persist_user_timestamp: Optional[float] = None,
+    persist_user_platform_id: Optional[str] = None,
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
@@ -627,6 +671,7 @@ def build_turn_context(
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
+    agent._persist_user_message_platform_id = persist_user_platform_id
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
@@ -764,6 +809,13 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
+    # Stamp the platform-side message id (e.g. the Discord/Telegram message id)
+    # as metadata on the user turn so it survives the early crash-resilience
+    # persist below (the turn-start flush).  Load-bearing for restart
+    # drain-window recovery: a recovery pass dedups via
+    # ``has_platform_message_id`` against this row.
+    if persist_user_platform_id is not None:
+        user_msg["platform_message_id"] = persist_user_platform_id
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
@@ -1143,6 +1195,7 @@ def build_turn_context(
                 if not _compression_made_progress(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens
                 ):
+                    _fail_closed_after_preflight_timeout(agent, _preflight_tokens)
                     _preflight_compression_blocked = True
                     break  # Cannot compress further: neither rows nor tokens moved
                 conversation_history = conversation_history_after_compression(

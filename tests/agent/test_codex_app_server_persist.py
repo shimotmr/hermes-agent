@@ -126,6 +126,7 @@ def test_codex_turn_persists_each_message_exactly_once():
     real AIAgent._flush_messages_to_session_db to prove no #860/#42039
     duplicate-write regression on the codex path."""
     tmp = tempfile.mkdtemp(prefix="codex_persist_")
+    db = None
     try:
         db = SessionDB(Path(tmp) / "state.db")
         sid = "sess-codex-once"
@@ -178,7 +179,9 @@ def test_codex_turn_persists_each_message_exactly_once():
     finally:
         import shutil
 
-        shutil.rmtree(tmp)
+        if db is not None:
+            db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestGatewayPersistedResolution:
