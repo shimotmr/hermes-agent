@@ -20,8 +20,8 @@
  * log sinks are.
  */
 
-import crypto from 'node:crypto'
 import fs from 'fs'
+import crypto from 'node:crypto'
 import path from 'path'
 
 // Retained for API compatibility and elapsed-time diagnostics. A live pid is
@@ -36,6 +36,7 @@ export function markerPath(hermesHome) {
 function authorityPathPresentOrUnknown(file: string) {
   try {
     fs.lstatSync(file)
+
     return true
   } catch (err) {
     return !err || (err as NodeJS.ErrnoException).code !== 'ENOENT'
@@ -70,6 +71,7 @@ function removeGuardQuarantine(quarantine: string) {
 function guardQuarantinePresent(guard: string) {
   const basename = path.basename(guard)
   const prefixes = [`.${basename}.stale-`, `${basename}.stale-`]
+
   try {
     return fs.readdirSync(path.dirname(guard)).some(entry => prefixes.some(prefix => entry.startsWith(prefix)))
   } catch {
@@ -79,19 +81,24 @@ function guardQuarantinePresent(guard: string) {
 
 function reclaimDeadOperationGuard(guard: string) {
   const quarantine = `${guard}.stale-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+
   try {
     fs.renameSync(guard, quarantine)
   } catch {
     return false
   }
+
   const owner =
     fs.existsSync(quarantine) && fs.statSync(quarantine).isDirectory() ? path.join(quarantine, 'owner') : quarantine
+
   let guardPid = 0
+
   try {
     guardPid = Number.parseInt(fs.readFileSync(owner, 'ascii').split(/\r?\n/, 1)[0].trim(), 10)
   } catch {
     guardPid = 0
   }
+
   if (!Number.isInteger(guardPid) || isPidAlive(guardPid)) {
     try {
       fs.linkSync(owner, guard)
@@ -103,21 +110,30 @@ function reclaimDeadOperationGuard(guard: string) {
         try {
           fs.mkdirSync(guard)
         } catch (mkdirErr) {
-          if (!mkdirErr || (mkdirErr as NodeJS.ErrnoException).code !== 'EEXIST') return false
+          if (!mkdirErr || (mkdirErr as NodeJS.ErrnoException).code !== 'EEXIST') {
+            return false
+          }
+
           return false
         }
+
         try {
           fs.linkSync(owner, path.join(guard, 'owner'))
         } catch {
           void 0
         }
+
         return false
       }
     }
+
     removeGuardQuarantine(quarantine)
+
     return false
   }
+
   removeGuardQuarantine(quarantine)
+
   // A replacement published after our detach is authoritative. Do not retry
   // by detaching the newer guard.
   return !fs.existsSync(quarantine) && !fs.existsSync(guard)
@@ -126,22 +142,28 @@ function reclaimDeadOperationGuard(guard: string) {
 function markerOperationGuard(file: string, action: () => boolean | typeof PRESERVE_OPERATION_GUARD) {
   const guard = `${file}.lock`
 
-  if (guardQuarantinePresent(guard)) return false
+  if (guardQuarantinePresent(guard)) {
+    return false
+  }
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
     let privateGuard: string | null = null
+
     try {
       privateGuard = fs.mkdtempSync(`${guard}.`)
       const privateOwner = path.join(privateGuard, 'owner')
       const descriptor = fs.openSync(privateOwner, 'wx', 0o600)
+
       try {
         fs.writeSync(descriptor, `${process.pid}\n`, undefined, 'ascii')
         fs.fsyncSync(descriptor)
       } finally {
         fs.closeSync(descriptor)
       }
+
       try {
         const directoryDescriptor = fs.openSync(privateGuard, 'r')
+
         try {
           fs.fsyncSync(directoryDescriptor)
         } finally {
@@ -150,36 +172,53 @@ function markerOperationGuard(file: string, action: () => boolean | typeof PRESE
       } catch {
         // Windows cannot open directories through the regular file API.
       }
+
       fs.linkSync(privateOwner, guard)
       let preserve = false
+
       try {
         const result = action()
         preserve = result === PRESERVE_OPERATION_GUARD
+
         return preserve ? false : result
       } finally {
         if (!preserve) {
           try {
-            if (fs.statSync(guard).isDirectory()) fs.unlinkSync(path.join(guard, 'owner'))
-            else fs.unlinkSync(guard)
+            if (fs.statSync(guard).isDirectory()) {
+              fs.unlinkSync(path.join(guard, 'owner'))
+            } else {
+              fs.unlinkSync(guard)
+            }
           } catch {
             void 0
           }
+
           try {
-            if (fs.existsSync(guard) && fs.statSync(guard).isDirectory()) fs.rmdirSync(guard)
+            if (fs.existsSync(guard) && fs.statSync(guard).isDirectory()) {
+              fs.rmdirSync(guard)
+            }
           } catch {
             void 0
           }
         }
       }
     } catch (err) {
-      if (!err || (err as NodeJS.ErrnoException).code !== 'EEXIST') return false
+      if (!err || (err as NodeJS.ErrnoException).code !== 'EEXIST') {
+        return false
+      }
+
       // Identity-preserving stale reclaim: detach exactly one guard inode,
       // validate it in quarantine, and never replace a newer canonical guard.
-      if (!reclaimDeadOperationGuard(guard)) return false
+      if (!reclaimDeadOperationGuard(guard)) {
+        return false
+      }
     } finally {
-      if (privateGuard) fs.rmSync(privateGuard, { recursive: true, force: true })
+      if (privateGuard) {
+        fs.rmSync(privateGuard, { recursive: true, force: true })
+      }
     }
   }
+
   return false
 }
 
@@ -278,13 +317,17 @@ export function readLiveUpdateMarker(
   } = {}
 ) {
   const file = markerPath(hermesHome)
-  if (authorityPathPresentOrUnknown(`${file}.lock`)) return { pid: 0, ageMs: Infinity }
+
+  if (authorityPathPresentOrUnknown(`${file}.lock`)) {
+    return { pid: 0, ageMs: Infinity }
+  }
   let raw
 
   try {
     raw = fs.readFileSync(file, 'utf8')
   } catch (err) {
     const markerUnknown = !err || (err as NodeJS.ErrnoException).code !== 'ENOENT'
+
     return markerUnknown || authorityPathPresentOrUnknown(`${file}.lock`) ? { pid: 0, ageMs: Infinity } : null
   }
 
@@ -294,10 +337,13 @@ export function readLiveUpdateMarker(
   const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
   const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
 
-  if (!Number.isInteger(pid) || !Number.isInteger(startedAt)) return { pid: 0, ageMs }
+  if (!Number.isInteger(pid) || !Number.isInteger(startedAt)) {
+    return { pid: 0, ageMs }
+  }
 
   if (!alive) {
     const removed = removeMarkerIfUnchanged(file, raw)
+
     if (!removed && (fs.existsSync(file) || authorityPathPresentOrUnknown(`${file}.lock`))) {
       // A cross-runtime handoff/cleanup operation currently owns the guard.
       // Fail closed until its canonical marker transition completes.
@@ -333,27 +379,39 @@ export function claimUpdateMarker(
   const guarded = markerOperationGuard(file, () => {
     if (fs.existsSync(file)) {
       let existingPid = 0
+
       try {
         existingPid = Number.parseInt(fs.readFileSync(file, 'utf8').split('\n')[0].trim(), 10)
       } catch {
         return false
       }
-      if (!Number.isInteger(existingPid) || existingPid <= 0) return false
-      if (isPidAlive(existingPid, kill)) return false
+
+      if (!Number.isInteger(existingPid) || existingPid <= 0) {
+        return false
+      }
+
+      if (isPidAlive(existingPid, kill)) {
+        return false
+      }
       const stale = `${file}.stale-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+
       try {
         fs.renameSync(file, stale)
         const detached = fs.readFileSync(stale, 'utf8')
         const detachedPid = Number.parseInt(detached.split('\n')[0].trim(), 10)
+
         if (isPidAlive(detachedPid, kill)) {
           try {
             fs.linkSync(stale, file)
           } catch {
             return PRESERVE_OPERATION_GUARD
           }
+
           fs.unlinkSync(stale)
+
           return false
         }
+
         try {
           fs.unlinkSync(stale)
         } catch {
@@ -362,15 +420,18 @@ export function claimUpdateMarker(
           } catch {
             return PRESERVE_OPERATION_GUARD
           }
+
           return false
         }
       } catch {
         return false
       }
     }
+
     try {
       fs.writeFileSync(file, body, { encoding: 'utf8', flag: 'wx' })
       claimed = true
+
       return true
     } catch {
       return false
@@ -385,15 +446,22 @@ export function handoffUpdateMarker(hermesHome: string, expectedPid: number, exp
 
   return markerOperationGuard(file, () => {
     let raw = ''
+
     try {
       raw = fs.readFileSync(file, 'utf8')
     } catch {
       return false
     }
+
     const claim = parseClaim(raw)
-    if (!claim || claim.pid !== expectedPid || claim.token !== expectedToken) return false
+
+    if (!claim || claim.pid !== expectedPid || claim.token !== expectedToken) {
+      return false
+    }
+
     try {
       atomicReplaceMarker(file, `${nextPid}\n${claim.startedAt}\n${claim.token}\n`)
+
       return true
     } catch {
       return false
@@ -406,13 +474,19 @@ export function releaseUpdateMarker(hermesHome: string, expectedPid: number, exp
 
   return markerOperationGuard(file, () => {
     let raw = ''
+
     try {
       raw = fs.readFileSync(file, 'utf8')
     } catch {
       return false
     }
+
     const claim = parseClaim(raw)
-    if (!claim || claim.pid !== expectedPid || claim.token !== expectedToken) return false
+
+    if (!claim || claim.pid !== expectedPid || claim.token !== expectedToken) {
+      return false
+    }
+
     return removeMarkerIfUnchangedGuarded(file, raw)
   })
 }
@@ -456,6 +530,7 @@ export function writeUpdateMarker(
   void file
   void kill
   void maxAgeMs
+
   return claimUpdateMarker(hermesHome, pid, { now: () => nowMs, startedAt, kill })
 }
 

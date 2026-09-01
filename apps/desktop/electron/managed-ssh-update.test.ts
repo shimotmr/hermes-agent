@@ -406,6 +406,7 @@ test('POSIX observer reports unavailable while operation guard exists without ma
 
   try {
     await writeFile(path.join(home, '.hermes-update-in-progress.lock'), `${process.pid}\n`)
+
     const command = buildRemoteUpdateObservationCommand(
       {
         ssh: { exec: async () => '' },

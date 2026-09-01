@@ -20,9 +20,9 @@ import path from 'path'
 import { test, vi } from 'vitest'
 
 import {
-  isPidAlive,
   claimUpdateMarker,
   handoffUpdateMarker,
+  isPidAlive,
   markerPath,
   readLiveUpdateMarker,
   UPDATE_MARKER_MAX_AGE_MS,
@@ -70,9 +70,11 @@ test('operation guard appearing during marker read still blocks backend gate', (
   const home = tmpHome('guard-race')
   const file = markerPath(home)
   const guard = `${file}.lock`
+
   const read = vi.spyOn(fs, 'readFileSync').mockImplementation(candidate => {
     assert.equal(candidate, file)
     fs.writeFileSync(guard, `${process.pid}\n`)
+
     const err = new Error('marker temporarily absent')
 
     ;(err as NodeJS.ErrnoException).code = 'ENOENT'
@@ -99,9 +101,13 @@ test('operation guard reclaim preserves an ABA replacement published after detac
   fs.writeFileSync(guard, '999999\n')
   const replacement = `${process.pid}\n`
   const renameSync = fs.renameSync.bind(fs)
+
   const rename = vi.spyOn(fs, 'renameSync').mockImplementation((source, destination) => {
     renameSync(source, destination)
-    if (source === guard) fs.writeFileSync(guard, replacement)
+
+    if (source === guard) {
+      fs.writeFileSync(guard, replacement)
+    }
   })
 
   try {
@@ -123,20 +129,26 @@ test('operation guard restore failure keeps the canonical namespace blocked', ()
   fs.writeFileSync(guard, 'malformed\n')
   const linkSync = fs.linkSync.bind(fs)
   const mkdirSync = fs.mkdirSync.bind(fs)
+
   const link = vi.spyOn(fs, 'linkSync').mockImplementation((source, destination) => {
     if (destination === guard && String(source).includes('.stale-')) {
       const err = new Error('simulated ACL denial')
+
       ;(err as NodeJS.ErrnoException).code = 'EACCES'
       throw err
     }
+
     return linkSync(source, destination)
   })
+
   const mkdir = vi.spyOn(fs, 'mkdirSync').mockImplementation((candidate, options) => {
     if (candidate === guard) {
       const err = new Error('simulated namespace denial')
+
       ;(err as NodeJS.ErrnoException).code = 'EACCES'
       throw err
     }
+
     return mkdirSync(candidate, options as any)
   })
 

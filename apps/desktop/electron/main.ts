@@ -3730,6 +3730,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
 
       return { ok: false, error: 'update-already-running', message }
     }
+
     desktopClaimForCleanup = desktopClaim
 
     emitUpdateProgress({
@@ -3980,6 +3981,7 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     if (desktopClaimForCleanup) {
       releaseUpdateMarker(HERMES_HOME, process.pid, desktopClaimForCleanup.token)
     }
+
     updateInFlight = false
   }
 }
