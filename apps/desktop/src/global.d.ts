@@ -278,7 +278,13 @@ declare global {
       onContextMenuSpellcheck?: (
         callback: (payload: { misspelledWord: string; suggestions: string[] }) => void
       ) => () => void
-      saveImageBuffer: (data: ArrayBuffer | Uint8Array, ext: string) => Promise<string>
+      saveImageBuffer: (data: ArrayBuffer | Uint8Array, ext: string, name?: string) => Promise<string>
+      /** Crop the in-app browser guest. `rect` is CSS pixels in the page viewport. */
+      capturePreview?: (payload: {
+        rect?: { height: number; width: number; x: number; y: number }
+        viewport?: { height: number; width: number }
+        webContentsId: number
+      }) => Promise<string>
       saveClipboardImage: () => Promise<string>
       getPathForFile: (file: File) => string
       normalizePreviewTarget: (target: string, baseDir?: string) => Promise<HermesPreviewTarget | null>
@@ -295,6 +301,9 @@ declare global {
       glassSupported?: boolean
       /** Main-process fact: this OS can do any translucency at all (not Linux). */
       translucencySupported?: boolean
+      /** Launch flag: the app was started with --local, enabling the
+       *  local-models GUI surfaces. Absent/false = every local surface hides. */
+      localModelsEnabled?: boolean
       setTranslucency?: (payload: TranslucencyState) => void
       setKeepAwake?: (on: boolean) => void
       setDisableF12?: (blocked: boolean) => void
