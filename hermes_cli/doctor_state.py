@@ -225,13 +225,24 @@ def _state_db_stats(issues: list, state_db_path: Path) -> None:
                               + (" and run 'hermes sessions optimize-storage' offline (gateway stopped)" if "optimize-storage" in _detail else ""))
 
 
+try:
+    from hermes_state import _WAL_SIZE_LIMIT_BYTES as _EXPECTED_WAL_HIGH_WATER_BYTES
+except ImportError:  # pragma: no cover - defensive for partial installations
+    _EXPECTED_WAL_HIGH_WATER_BYTES = 64 * 1024 * 1024
+
+
+def _wal_size_is_abnormal(size_bytes: int) -> bool:
+    """Return whether the reusable WAL allocation exceeds SessionDB's cap."""
+    return size_bytes > _EXPECTED_WAL_HIGH_WATER_BYTES
+
+
 def _state_db_wal(f: Finding, should_fix: bool, state_db_path: Path) -> None:
     """WAL file size (unbounded growth indicates missed checkpoints)."""
     wal_path = state_db_path.parent / "state.db-wal"
     wal_size = lambda: wal_path.stat().st_size if wal_path.exists() else 0  # noqa: E731
     with warn_on_error(""):
         size = wal_size()
-        if size > 50 * 1024 * 1024:  # 50 MB
+        if _wal_size_is_abnormal(size):
             check_warn(f"WAL file is large ({size // (1024*1024)} MB)", "(may indicate missed checkpoints)")
             if not should_fix:
                 return f.issues.append("Large WAL file — run 'hermes doctor --fix' to checkpoint")
