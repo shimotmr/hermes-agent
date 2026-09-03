@@ -974,6 +974,30 @@ def test_seed_from_singletons_respects_hermes_pkce_suppression(tmp_path, monkeyp
     assert "hermes_pkce" not in active
 
 
+def test_pooled_credential_repr_redacts_secret_material():
+    """Assertion failures and debug logs must not print credential values."""
+    from agent.credential_pool import PooledCredential
+
+    credential = PooledCredential(
+        provider="example",
+        id="cred-1",
+        label="example",
+        auth_type="oauth",
+        priority=0,
+        source="test",
+        access_token="access-secret-value",
+        refresh_token="refresh-secret-value",
+        agent_key="agent-secret-value",
+        extra={"client_secret": "nested-secret-value"},
+    )
+
+    rendered = repr(credential)
+    assert "access-secret-value" not in rendered
+    assert "refresh-secret-value" not in rendered
+    assert "agent-secret-value" not in rendered
+    assert "nested-secret-value" not in rendered
+
+
 
 
 def test_credential_sources_registry_has_expected_steps():

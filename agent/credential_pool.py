@@ -228,6 +228,16 @@ class PooledCredential:
             self.extra = {}
         self.auth_type = _normalize_pool_auth_type(self.provider, self.access_token, self.auth_type)
 
+    def __repr__(self) -> str:
+        """Return diagnostic metadata without exposing credential material."""
+        return (
+            f"{type(self).__name__}(provider={self.provider!r}, id={self.id!r}, "
+            f"label={self.label!r}, auth_type={self.auth_type!r}, "
+            f"priority={self.priority!r}, source={self.source!r}, "
+            f"last_status={self.last_status!r}, expires_at={self.expires_at!r}, "
+            f"expires_at_ms={self.expires_at_ms!r}, request_count={self.request_count!r})"
+        )
+
     def __getattr__(self, name: str):
         if name in _EXTRA_KEYS:
             return self.extra.get(name)
