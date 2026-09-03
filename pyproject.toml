@@ -407,6 +407,12 @@ override-dependencies = [
   # requests with RSA and AES, and that API did not break in 49 or 50.
   # Remove this line when alibabacloud-tea-openapi lifts the cap.
   "cryptography>=50,<51",
+  # tornado is transitive-only; upstream's uv.lock regeneration keeps pinning
+  # 6.5.7 (GHSA-mpf4-983q-p7j4, multipart DoS — fixed in 6.5.8, published
+  # 2026-08-07). A bare lockfile bump gets reverted by the next upstream
+  # merge, so we floor it here to make the fix merge-proof. Remove when
+  # upstream's lock carries >=6.5.8 on its own.
+  "tornado>=6.5.8,<7",
 ]
 exclude-newer = "14 days"
 # h2: temporary exclude-newer exception for the CVE-2026-71554 (GHSA-6hr6-w5qg-qmwg,
