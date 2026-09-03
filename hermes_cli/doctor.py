@@ -27,6 +27,18 @@ PROJECT_ROOT = get_project_root()
 HERMES_HOME = get_hermes_home()
 _DHH = display_hermes_home()  # user-facing display path (e.g. ~/.hermes or ~/.hermes/profiles/coder)
 
+# SessionDB intentionally keeps a reusable WAL high-water allocation. Physical size at that exact cap
+# is not evidence of missed checkpoints; only growth beyond the configured cap
+# is anomalous from a non-mutating doctor probe.
+try:
+    from hermes_state import _WAL_SIZE_LIMIT_BYTES as _EXPECTED_WAL_HIGH_WATER_BYTES
+except ImportError:  # pragma: no cover - defensive for partial installations
+    _EXPECTED_WAL_HIGH_WATER_BYTES = 64 * 1024 * 1024
+
+
+def _wal_size_is_abnormal(size_bytes: int) -> bool:
+    return size_bytes > _EXPECTED_WAL_HIGH_WATER_BYTES
+
 # Load environment variables from ~/.hermes/.env so API key checks work
 _env_path = get_env_path()
 load_hermes_dotenv(hermes_home=_env_path.parent, project_env=PROJECT_ROOT / ".env")
@@ -2214,7 +2226,7 @@ def run_doctor(args):
     if wal_path.exists():
         try:
             wal_size = wal_path.stat().st_size
-            if wal_size > 50 * 1024 * 1024:  # 50 MB
+            if _wal_size_is_abnormal(wal_size):
                 check_warn(
                     f"WAL file is large ({wal_size // (1024*1024)} MB)",
                     "(may indicate missed checkpoints)"

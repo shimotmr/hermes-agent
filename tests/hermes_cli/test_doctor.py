@@ -17,6 +17,16 @@ from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor import _has_provider_env_config
 
 
+class TestWalSizeClassification:
+    def test_configured_64_mib_high_water_is_not_an_issue(self):
+        limit = doctor._EXPECTED_WAL_HIGH_WATER_BYTES
+        assert doctor._wal_size_is_abnormal(limit) is False
+
+    def test_growth_beyond_configured_high_water_is_an_issue(self):
+        limit = doctor._EXPECTED_WAL_HIGH_WATER_BYTES
+        assert doctor._wal_size_is_abnormal(limit + 1) is True
+
+
 class TestDoctorPlatformHints:
     def test_termux_package_hint(self, monkeypatch):
         monkeypatch.setenv("TERMUX_VERSION", "0.118.3")
