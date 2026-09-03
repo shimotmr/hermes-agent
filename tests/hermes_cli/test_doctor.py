@@ -26,6 +26,20 @@ from hermes_cli import doctor_config
 from tools import browser_tool_install as bt_install
 
 
+class TestWalSizeClassification:
+    def test_configured_64_mib_high_water_is_not_an_issue(self):
+        from hermes_cli import doctor_state
+
+        limit = doctor_state._EXPECTED_WAL_HIGH_WATER_BYTES
+        assert doctor_state._wal_size_is_abnormal(limit) is False
+
+    def test_growth_beyond_configured_high_water_is_an_issue(self):
+        from hermes_cli import doctor_state
+
+        limit = doctor_state._EXPECTED_WAL_HIGH_WATER_BYTES
+        assert doctor_state._wal_size_is_abnormal(limit + 1) is True
+
+
 class TestDoctorPlatformHints:
     def test_termux_package_hint(self, monkeypatch):
         monkeypatch.setenv("TERMUX_VERSION", "0.118.3")
