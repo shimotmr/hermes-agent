@@ -281,7 +281,10 @@ def _make_update_side_effect(
     ``_prune_orphan_rescue_refs`` cleanup pass has something to trim.
     """
     recorded = []
-    head_sha_calls = []
+    pre_pull_head = "1111111111111111111111111111111111111beef"
+    post_pull_head = "2222222222222222222222222222222222222cafe"
+    current_head = [pre_pull_head]
+    branch_ref_updated = [False]
 
     def side_effect(cmd, **kwargs):
         recorded.append(cmd)
@@ -296,21 +299,17 @@ def _make_update_side_effect(
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
         if "show-current" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
+        if "symbolic-ref" in joined and "HEAD" in joined:
+            return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
         if "rev-parse" in joined and "HEAD" in joined:
-            # First call = pre-pull HEAD, every later call = post-pull HEAD
-            # (issue #79678's "did HEAD actually move" guard depends on these
-            # differing after a successful reset/merge).
-            head_sha_calls.append(1)
-            if len(head_sha_calls) == 1:
-                if pre_pull_sha_unavailable:
-                    return SimpleNamespace(stdout="", stderr="", returncode=0)
-                return SimpleNamespace(
-                    stdout="1111111111111111111111111111111111111beef\n", stderr="", returncode=0
-                )
+            if pre_pull_sha_unavailable and current_head[0] == pre_pull_head:
+                return SimpleNamespace(stdout="", stderr="", returncode=0)
             return SimpleNamespace(
-                stdout="2222222222222222222222222222222222222cafe\n", stderr="", returncode=0
+                stdout=f"{current_head[0]}\n", stderr="", returncode=0
             )
         if "checkout" in joined and "main" in joined:
+            if branch_ref_updated[0]:
+                current_head[0] = post_pull_head
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined and "..HEAD" in joined:
             return SimpleNamespace(
@@ -330,6 +329,14 @@ def _make_update_side_effect(
         if "update-ref" in joined and "-d" in cmd:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "update-ref" in joined:
+            is_branch_ref = any(str(part).startswith("refs/heads/") for part in cmd)
+            if is_branch_ref:
+                if reset_fails:
+                    return SimpleNamespace(
+                        stdout="", stderr="error: unable to update branch ref\n", returncode=1
+                    )
+                branch_ref_updated[0] = True
+                return SimpleNamespace(stdout="", stderr="", returncode=0)
             if update_ref_fails:
                 return SimpleNamespace(
                     stdout="", stderr="fatal: unable to write ref\n", returncode=128
@@ -342,6 +349,7 @@ def _make_update_side_effect(
                     stderr="fatal: Not possible to fast-forward, aborting.\n",
                     returncode=128,
                 )
+            current_head[0] = post_pull_head
             return SimpleNamespace(stdout="Updating abc..def\n", stderr="", returncode=0)
         if "reset" in joined and "--hard" in joined:
             if reset_fails:
@@ -714,7 +722,12 @@ def test_cmd_update_orphan_history_backs_up_before_reset(monkeypatch, tmp_path, 
 
     hermes_main.cmd_update(SimpleNamespace())
 
-    update_ref_calls = [c for c in recorded if "update-ref" in " ".join(str(x) for x in c)]
+    update_ref_calls = [
+        c
+        for c in recorded
+        if "update-ref" in c
+        and any(str(part).startswith("refs/hermes-update-backups/orphan-") for part in c)
+    ]
     assert len(update_ref_calls) == 1
     ref_name = update_ref_calls[0][update_ref_calls[0].index("update-ref") + 1]
     assert ref_name.startswith("refs/hermes-update-backups/orphan-main-")
@@ -842,7 +855,7 @@ def test_prune_orphan_rescue_refs_leaves_unparseable_names_alone():
 
 def test_cmd_update_ordinary_divergence_skips_rescue_ref(monkeypatch, tmp_path, capsys):
     """Common ancestor still exists (e.g. upstream force-push) → no rescue
-    ref, no orphan messaging, behavior identical to before #87694."""
+    ref and no orphan messaging; the branch CAS update is still expected."""
     _setup_update_mocks(monkeypatch, tmp_path)
 
     side_effect, recorded = _make_update_side_effect(
@@ -852,8 +865,13 @@ def test_cmd_update_ordinary_divergence_skips_rescue_ref(monkeypatch, tmp_path, 
 
     hermes_main.cmd_update(SimpleNamespace())
 
-    update_ref_calls = [c for c in recorded if "update-ref" in " ".join(str(x) for x in c)]
-    assert update_ref_calls == []
+    rescue_ref_calls = [
+        c
+        for c in recorded
+        if "update-ref" in c
+        and any(str(part).startswith("refs/hermes-update-backups/orphan-") for part in c)
+    ]
+    assert rescue_ref_calls == []
 
     out = capsys.readouterr().out
     assert "orphan divergence" not in out
@@ -873,13 +891,20 @@ def test_cmd_update_orphan_rescue_ref_write_failure_is_non_fatal(monkeypatch, tm
 
     hermes_main.cmd_update(SimpleNamespace())
 
-    update_ref_calls = [c for c in recorded if "update-ref" in " ".join(str(x) for x in c)]
-    assert len(update_ref_calls) == 1
-
-    reset_calls = [
-        c for c in recorded if "reset" in " ".join(str(x) for x in c) and "--hard" in c
+    rescue_ref_calls = [
+        c
+        for c in recorded
+        if "update-ref" in c
+        and any(str(part).startswith("refs/hermes-update-backups/orphan-") for part in c)
     ]
-    assert len(reset_calls) == 1
+    assert len(rescue_ref_calls) == 1
+
+    branch_cas_calls = [
+        c
+        for c in recorded
+        if any(str(part).startswith("refs/heads/") for part in c)
+    ]
+    assert len(branch_cas_calls) == 1
 
     out = capsys.readouterr().out
     assert "orphan divergence" in out
@@ -889,9 +914,9 @@ def test_cmd_update_orphan_guard_skips_rescue_ref_when_pre_pull_sha_missing(
     monkeypatch, tmp_path, capsys
 ):
     """#87694 stress test: if capturing the pre-pull HEAD SHA itself fails
-    (empty ``rev-parse HEAD`` output), the rescue-ref guard requires a
-    truthy ``pre_pull_sha`` and must skip the backup rather than writing a
-    ref pointing at nothing — the reset must still proceed without crashing.
+    (empty ``rev-parse HEAD`` output), the rescue-ref guard must skip writing a
+    ref pointing at nothing. The destructive branch move must then fail closed
+    because its compare-and-swap precondition cannot be proven.
     """
     _setup_update_mocks(monkeypatch, tmp_path)
 
@@ -900,9 +925,10 @@ def test_cmd_update_orphan_guard_skips_rescue_ref_when_pre_pull_sha_missing(
     )
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
-    hermes_main.cmd_update(SimpleNamespace())
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
 
-    update_ref_calls = [c for c in recorded if "update-ref" in " ".join(str(x) for x in c)]
+    update_ref_calls = [c for c in recorded if "update-ref" in c]
     assert update_ref_calls == []
 
     out = capsys.readouterr().out
@@ -910,9 +936,8 @@ def test_cmd_update_orphan_guard_skips_rescue_ref_when_pre_pull_sha_missing(
 
 
 def test_cmd_update_orphan_rescue_ref_persists_when_reset_fails(monkeypatch, tmp_path, capsys):
-    """#87694 stress test: even when the subsequent ``reset --hard`` itself
-    fails, the rescue ref must already have been written — the backup is
-    not lost just because the overall update aborts."""
+    """If the subsequent frozen-SHA branch update fails, the rescue ref was
+    already written and remains available even though the update aborts."""
     _setup_update_mocks(monkeypatch, tmp_path)
 
     side_effect, recorded = _make_update_side_effect(
@@ -924,12 +949,17 @@ def test_cmd_update_orphan_rescue_ref_persists_when_reset_fails(monkeypatch, tmp
         hermes_main.cmd_update(SimpleNamespace())
     assert exc_info.value.code == 1
 
-    update_ref_calls = [c for c in recorded if "update-ref" in " ".join(str(x) for x in c)]
-    assert len(update_ref_calls) == 1
+    rescue_ref_calls = [
+        c
+        for c in recorded
+        if "update-ref" in c
+        and any(str(part).startswith("refs/hermes-update-backups/orphan-") for part in c)
+    ]
+    assert len(rescue_ref_calls) == 1
 
     out = capsys.readouterr().out
     assert "orphan divergence" in out
-    assert "Failed to reset to origin/main" in out
+    assert "Failed to reset to ffffffffffffffffffffffffffffffffffffffff" in out
 
 
 # ---------------------------------------------------------------------------
