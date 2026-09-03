@@ -960,7 +960,7 @@ def test_seed_from_singletons_respects_hermes_pkce_suppression(tmp_path, monkeyp
     }))
 
     # Stub the readers so only hermes_pkce is "available"; claude_code returns None
-    import agent.anthropic_adapter as aa
+    import agent.anthropic_credentials as aa
     monkeypatch.setattr(aa, "read_hermes_oauth_credentials", lambda: {
         "accessToken": "tok", "refreshToken": "r", "expiresAt": 9999999999000,
     })
@@ -972,6 +972,30 @@ def test_seed_from_singletons_respects_hermes_pkce_suppression(tmp_path, monkeyp
     # hermes_pkce suppressed, claude_code returns None → nothing should be seeded
     assert entries == []
     assert "hermes_pkce" not in active
+
+
+def test_pooled_credential_repr_redacts_secret_material():
+    """Assertion failures and debug logs must not print credential values."""
+    from agent.credential_pool import PooledCredential
+
+    credential = PooledCredential(
+        provider="example",
+        id="cred-1",
+        label="example",
+        auth_type="oauth",
+        priority=0,
+        source="test",
+        access_token="access-secret-value",
+        refresh_token="refresh-secret-value",
+        agent_key="agent-secret-value",
+        extra={"client_secret": "nested-secret-value"},
+    )
+
+    rendered = repr(credential)
+    assert "access-secret-value" not in rendered
+    assert "refresh-secret-value" not in rendered
+    assert "agent-secret-value" not in rendered
+    assert "nested-secret-value" not in rendered
 
 
 
