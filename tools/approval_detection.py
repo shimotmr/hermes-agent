@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shlex
+import sys
 import tempfile
 import unicodedata
 
@@ -1117,13 +1118,32 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
     if len(argv) != 3 or argv[0] != "rm" or argv[1] != "-f":
         return False
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    declared_temp_dir = os.path.abspath(tempfile.gettempdir())
+    temp_dir = os.path.realpath(declared_temp_dir)
     basename = os.path.basename(operand)
-    return (
-        operand == os.path.join(temp_dir, basename)
-        and os.path.dirname(os.path.realpath(operand)) == temp_dir
-        and re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
-    )
+    # Always permit the canonical temp directory.  Permit the declared spelling
+    # too only for macOS's fixed, root-owned /tmp and /var aliases; arbitrary
+    # symlinked TMPDIR spellings remain rejected.
+    allowed_temp_dirs: set[str] = {temp_dir}
+    if declared_temp_dir != temp_dir and sys.platform == "darwin" and (
+        (declared_temp_dir == "/tmp" and temp_dir == "/private/tmp")
+        or (
+            declared_temp_dir.startswith("/var/")
+            and temp_dir == f"/private{declared_temp_dir}"
+        )
+    ):
+        # macOS exposes fixed root-owned /tmp and /var aliases below /private.
+        # Permit both spellings without trusting arbitrary symlinked TMPDIRs.
+        allowed_temp_dirs.update((declared_temp_dir, temp_dir))
+    if operand not in {
+        os.path.join(directory, basename) for directory in allowed_temp_dirs
+    }:
+        return False
+
+    target = os.path.realpath(operand)
+    if os.path.dirname(target) != temp_dir:
+        return False
+    return re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
 
 
 def _is_shell_token_spliced_gateway_lifecycle(command: str) -> bool:
