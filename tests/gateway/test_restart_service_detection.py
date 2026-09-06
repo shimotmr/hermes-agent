@@ -1,19 +1,4 @@
-"""Tests for /restart service-manager detection (launchd vs interactive).
-
-The /restart handler routes through ``request_restart(via_service=True)``
-when a service manager supervises the gateway, so the process exits with
-the service-restart code and the manager relaunches it.  Under macOS
-launchd the plist uses ``KeepAlive.SuccessfulExit=false`` — a clean exit 0
-is treated as a deliberate stop and the gateway stays dead (#43475) — so
-launchd must be detected here in the handler, not only at the exit-code
-site (which never runs unless ``via_service=True`` is already set).
-
-launchd sets ``XPC_SERVICE_NAME`` to the job label for processes it
-spawns.  Interactive macOS shells inherit ``XPC_SERVICE_NAME=0`` (a
-truthy string), so the probe must treat ``"0"`` as not-under-launchd:
-routing an unsupervised interactive gateway to the service path would
-make it exit non-zero with nothing to revive it.
-"""
+"""/restart 的環境標記不構成 relaunch 授權；缺少 manager 證明保留 detached fallback。"""
 from unittest.mock import MagicMock
 
 import pytest
@@ -40,29 +25,23 @@ def _make_runner_with_mock_restart(tmp_path, monkeypatch):
     monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
     monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
     monkeypatch.delenv(EXTERNAL_GATEWAY_SUPERVISOR_ENV, raising=False)
-    # Hermeticity: neutralize the real container probe — on a containerized
-    # CI runner /.dockerenv exists and would route every case via_service=True
-    # regardless of the env markers under test (the detection under test is
-    # the SUPERVISOR markers, not the runner's own containment).
-    monkeypatch.setattr(
-        "gateway.restart.is_container_restart_context", lambda: False
-    )
+    monkeypatch.setattr("gateway.restart_relaunch.probe_gateway_relaunch", lambda *_: None)
     runner, _adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
     return runner
 
 
 @pytest.mark.asyncio
-async def test_restart_with_external_supervisor_marker_uses_service_path(
+async def test_restart_with_external_supervisor_marker_keeps_detached_path(
     tmp_path, monkeypatch
 ):
-    """Wrapped supervisors can retain restart ownership without native markers."""
+    """自行宣告的 supervisor 標記不能授權退出服務。"""
     runner = _make_runner_with_mock_restart(tmp_path, monkeypatch)
     monkeypatch.setenv(EXTERNAL_GATEWAY_SUPERVISOR_ENV, "1")
 
     await runner._handle_restart_command(_make_restart_event())
 
-    runner.request_restart.assert_called_once_with(detached=False, via_service=True)
+    runner.request_restart.assert_called_once_with(detached=True, via_service=False)
 
 
 @pytest.mark.asyncio

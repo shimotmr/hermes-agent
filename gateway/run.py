@@ -3389,6 +3389,8 @@ class GatewayRunner(
         from gateway.restart_runtime import GatewayAdmissionBarrier
         self._running = self._exit_cleanly = self._exit_with_failure = self._draining = False
         self._restart_admission_barrier = GatewayAdmissionBarrier()
+        from tools import async_delegation
+        async_delegation._restart_admission_barrier = self._restart_admission_barrier
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
         self._exit_reason: Optional[str] = None
@@ -4979,35 +4981,10 @@ async def _start_gateway_start_control_socket(runner):
         # failure only means consumers fall back to the process-scan/state-file layer, exactly as before
         # this feature. See #92091.
         from gateway.control_socket import GatewayControlServer
-        # pause-for-update: the updater asks us to drain + exit (freeing venv handles) vs. a tree-kill
-        # (same path as SIGUSR1). Handler runs on the socket executor thread, so marshal onto the loop.
-        # pause-for-update (#92091 step 2): the updater asks this gateway to drain in-flight turns and exit
-        # cleanly — releasing every venv file handle — instead of being tree-killed mid-turn. Same drain
-        # path as SIGUSR1/service restarts (request_restart(via_service=True)); the updater (or the service
-        # manager) relaunches after the code swap.
-        _main_loop = asyncio.get_running_loop()
-
         def _pause_for_update_handler() -> dict:
-            try:
-                from hermes_cli.gateway import _get_restart_drain_timeout
-                _drain = float(_get_restart_drain_timeout())
-            except Exception:
-                _drain = 30.0
-            accepted_box: list[bool] = []
-            _done = threading.Event()
-
-            def _request() -> None:
-                try:
-                    accepted_box.append(runner.request_restart(detached=False, via_service=True))
-                finally:
-                    _done.set()
-
-            _main_loop.call_soon_threadsafe(_request)
-            _done.wait(timeout=5.0)
-            accepted = bool(accepted_box and accepted_box[0])
-            return {
-                "pausing": accepted, "already_stopping": not accepted,
-                "pid": os.getpid(), "drain_timeout": _drain}
+            # 更新期間的 hold/relaunch 尚無可獨立驗證的契約；保持服務。
+            return {"pausing": False, "already_stopping": False,
+                    "pid": os.getpid(), "reason": "relaunch-contract-unverified"}
 
         _control_server = GatewayControlServer(
             verb_handlers={"pause-for-update": _pause_for_update_handler},

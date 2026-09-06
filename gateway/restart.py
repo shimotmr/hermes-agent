@@ -40,8 +40,6 @@ CRON_DRAIN_CLEANUP_RESERVE_S = 10.0
 SYSTEMD_STOP_HEADROOM_S = 30.0
 SYSTEMD_TIMEOUT_STOP_SEC_FLOOR = 60.0
 
-_TRUTHY = {"1", "true", "yes", "on"}
-
 
 def is_global_startup_conflict(error_code: str | None) -> bool:
     """True when an adapter's fatal error is a single-writer ownership conflict.
@@ -60,11 +58,14 @@ def is_global_startup_conflict(error_code: str | None) -> bool:
 
 
 def is_gateway_supervisor_process(environ: Mapping[str, str] | None = None) -> bool:
-    """Return whether this gateway process is owned by a supervisor."""
-    env = os.environ if environ is None else environ
-    xpc_service = env.get("XPC_SERVICE_NAME", "")
-    return bool(env.get("INVOCATION_ID") or env.get("HERMES_S6_SUPERVISED_CHILD") or (xpc_service and xpc_service != "0")
-                or str(env.get(EXTERNAL_GATEWAY_SUPERVISOR_ENV, "")).strip().lower() in _TRUTHY)
+    """只接受 manager 的即時查核；傳入環境標記不能授權重啟。"""
+    from gateway.restart_relaunch import probe_gateway_relaunch
+    from gateway.status import get_process_start_time
+
+    if environ is not None:
+        return False
+    pid = os.getpid()
+    return probe_gateway_relaunch(pid, get_process_start_time(pid)) is not None
 
 
 def is_container_restart_context() -> bool:

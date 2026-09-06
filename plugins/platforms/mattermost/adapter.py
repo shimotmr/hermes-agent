@@ -227,6 +227,12 @@ class MattermostAdapter(BasePlatformAdapter):
 
     # --- Required overrides ---
 
+    @property
+    def send_path_degraded(self) -> bool:
+        return (self._closing or self._ws is None or self._ws.closed
+                or self._ws_task is None or self._ws_task.done()
+                or not getattr(self, "_ws_authenticated", False))
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Mattermost and start the WebSocket listener."""
         import aiohttp
@@ -249,6 +255,7 @@ class MattermostAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        self._mark_disconnected()
         self._closing = True
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
@@ -435,6 +442,7 @@ class MattermostAdapter(BasePlatformAdapter):
         import random
         delay = _RECONNECT_BASE_DELAY
         while not self._closing:
+            self._ws_authenticated = False
             try:
                 await self._ws_connect_and_listen()
                 delay = _RECONNECT_BASE_DELAY  # clean disconnect — reset backoff
@@ -460,6 +468,8 @@ class MattermostAdapter(BasePlatformAdapter):
                     await self._notify_fatal_error()
                     return
                 logger.warning("Mattermost WS error: %s — reconnecting in %.0fs", exc, delay)
+            self._ws_authenticated = False
+            self._mark_degraded()
             if self._closing:
                 return
             await asyncio.sleep(delay + delay * _RECONNECT_JITTER * random.random())
@@ -482,6 +492,9 @@ class MattermostAdapter(BasePlatformAdapter):
                     event = json.loads(raw_msg.data)
                 except (json.JSONDecodeError, TypeError):
                     continue
+                if event.get("seq_reply") == 1 and event.get("status") == "OK":
+                    self._ws_authenticated = True
+                    self._mark_connected()
                 await self._handle_ws_event(event)
             elif kind in {kind.ERROR, kind.CLOSE, kind.CLOSING, kind.CLOSED}:
                 logger.info("Mattermost: WebSocket closed (%s)", kind)

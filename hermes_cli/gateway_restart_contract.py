@@ -328,26 +328,18 @@ def perform_verified_graceful_restart(
         else:
             from gateway.control_socket import query_gateway_control
 
-            response = query_gateway_control(
-                home,
-                "restart-if-idle",
-                request_fields={
-                    "expected_pid": pre_signal.identity.pid,
-                    "expected_start_time": pre_signal.identity.start_time,
-                },
+            expected = ExpectedGatewayIdentity(
+                protocol=1, kind="hermes-gateway", pid=pre_signal.identity.pid,
+                start_time=pre_signal.identity.start_time, hermes_home=str(home),
+                code_sha=pre_signal.identity.code_sha or "",
+                required_platforms=tuple(effective_platforms or ()),
+            )
+            result = restart_gateway_if_idle(
+                expected,
+                lambda verb, **kwargs: query_gateway_control(home, verb, **kwargs),
                 timeout=max(1.0, min(5.0, timeout)),
             )
-            response_identity = response.get("identity") if isinstance(response, dict) else None
-            if not (
-                isinstance(response, dict)
-                and response.get("accepted") is True
-                and isinstance(response_identity, dict)
-                and type(response_identity.get("pid")) is int
-                and response_identity.get("pid") == pre_signal.identity.pid
-                and type(response_identity.get("start_time")) is int
-                and response_identity.get("start_time") == pre_signal.identity.start_time
-                and response.get("signal") == "SIGUSR1"
-            ):
+            if result.exit_code != EXIT_OK:
                 return RestartProbe(
                     False,
                     "atomic-restart-request-rejected",
@@ -515,10 +507,6 @@ def main(
     )
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 # Atomic restart-if-idle authorization contract.
 EXIT_OK = 0
 EXIT_DENIED = 20
@@ -663,10 +651,16 @@ def restart_gateway_if_idle(
     timeout: float = 2.0,
 ) -> RestartResult:
     """Request one in-process atomic restart; unsupported/timeout/denial never fall back."""
+    from gateway.restart_relaunch import probe_gateway_relaunch
+
+    attestation = probe_gateway_relaunch(expected.pid, expected.start_time)
+    if attestation is None:
+        return RestartResult(EXIT_DENIED, "relaunch-contract-unverified")
     try:
         response = transport(
             "restart-if-idle",
-            request_fields={"expected_identity": expected.to_mapping()},
+            request_fields={"expected_identity": expected.to_mapping(),
+                            "relaunch_attestation": attestation},
             timeout=timeout,
         )
     except TimeoutError:
@@ -677,10 +671,15 @@ def restart_gateway_if_idle(
         return RestartResult(EXIT_DENIED, "control-unavailable")
     raw_reason = response.get("reason")
     reason: str = raw_reason if isinstance(raw_reason, str) else "denied"
-    if response.get("accepted") is True and reason == "accepted":
+    if (response.get("accepted") is True and reason == "accepted"
+            and type(response.get("pid")) is int and response.get("pid") == expected.pid):
         return RestartResult(EXIT_OK, reason)
     if reason == "unsupported":
         return RestartResult(EXIT_UNSUPPORTED, reason)
     if reason == "timeout":
         return RestartResult(EXIT_TIMEOUT, reason)
     return RestartResult(EXIT_DENIED, reason)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

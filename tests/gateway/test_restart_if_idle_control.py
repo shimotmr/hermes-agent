@@ -3,11 +3,23 @@ import json
 import os
 import threading
 import asyncio
+
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from gateway.control_socket import GatewayControlServer
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+
+@pytest.fixture(autouse=True)
+def _isolate_restart_control_from_relaunch_attestation(monkeypatch):
+    """These tests exercise control semantics, not OS manager probing."""
+    import gateway.restart_relaunch as relaunch
+
+    monkeypatch.setattr(relaunch, "verify_relaunch_attestation", lambda *args, **kwargs: True)
 
 
 def test_production_snapshot_keeps_answering_identity_and_complete_live_state(monkeypatch, tmp_path):
@@ -119,10 +131,21 @@ def _zero_obligations():
     }
 
 
+def _attestation(pid, start_time):
+    return {"manager": "launchd", "service": "gui/501/test.gateway", "policy": "keepalive",
+            "pid": pid, "start_time": start_time}
+
+
+@pytest.fixture(autouse=True)
+def manager_contract(monkeypatch):
+    monkeypatch.setattr("gateway.restart_relaunch.probe_gateway_relaunch", _attestation)
+
+
 def _request(server, expected=None):
     request = {"id": 7, "protocol": 1, "verb": "restart-if-idle"}
     if expected is not None:
         request["expected_identity"] = expected
+        request["relaunch_attestation"] = _attestation(expected["pid"], expected["start_time"])
     return json.loads(server.handle_request_line(json.dumps(request).encode()))
 
 
@@ -381,11 +404,12 @@ def test_admission_barrier_closes_snapshot_authorize_signal_toctou(tmp_path):
     with barrier.admission():
         thread = threading.Thread(target=lambda: calls.append(_request(server, _expected(tmp_path))["result"]))
         thread.start()
-        assert snapshot_started.wait(timeout=0.05) is False
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert not snapshot_started.is_set()
         active["value"] = 1
-    thread.join(timeout=2)
 
-    assert calls == [{"accepted": False, "reason": "active-agents"}]
+    assert calls == [{"accepted": False, "reason": "admissions-active"}]
 
 
 async def _true_async():

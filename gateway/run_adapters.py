@@ -1036,6 +1036,7 @@ class GatewayAdapterLifecycleMixin:
     ) -> None:
         """Install the runner callbacks every adapter needs (defaults = primary handlers;
         secondary wiring passes profile-scoped variants). ``set_reaction_handler`` is optional."""
+        adapter._restart_admission_barrier = getattr(self, "_restart_admission_barrier", None)
         adapter.set_message_handler(message_handler or self._primary_message_handler())
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)

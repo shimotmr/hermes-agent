@@ -482,6 +482,14 @@ class WebSocketRelayTransport:
         return self._descriptors_by_platform.get(platform)
 
     @property
+    def is_connected(self) -> bool:
+        return (not self._closing and self._ws is not None
+                and self._reader is not None and not self._reader.done()
+                and self._descriptor_ready is not None and self._descriptor_ready.done()
+                and not self._descriptor_ready.cancelled()
+                and self._descriptor_ready.exception() is None)
+
+    @property
     def auth_revoked(self) -> bool:
         """True once the connector closed 4401 AFTER a successful handshake — the
         per-gateway secret was revoked. Terminal: no reconnect."""

@@ -352,6 +352,18 @@ def _drop_run_transport(self, run_id: str) -> None:
 
 
 async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Response":
+    from contextlib import nullcontext
+    from gateway.restart_runtime import GatewayAdmissionDenied
+
+    barrier = getattr(self, "_restart_admission_barrier", None)
+    try:
+        with barrier.admission() if barrier is not None else nullcontext():
+            return await _handle_runs_admitted(self, request, _api_server=_api_server)
+    except GatewayAdmissionDenied:
+        return _json_error(_api_server._openai_error, "Gateway 正在重啟，請稍後重試", status=503)
+
+
+async def _handle_runs_admitted(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs — start an agent run, return run_id immediately."""
     _openai_error = _api_server._openai_error
     # Long-term memory scope header (see chat_completions for details).

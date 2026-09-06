@@ -491,7 +491,22 @@ def _batch_status(combined: Dict[str, Any]) -> str:
     return "error" if child_results and all(r.get("status") not in ok for r in child_results) else "completed"
 
 
-def _dispatch(
+_restart_admission_barrier = None
+
+
+def _dispatch(**kwargs) -> Dict[str, Any]:
+    from contextlib import nullcontext
+    from gateway.restart_runtime import GatewayAdmissionDenied
+
+    barrier = _restart_admission_barrier
+    try:
+        with barrier.admission() if barrier is not None else nullcontext():
+            return _dispatch_admitted(**kwargs)
+    except GatewayAdmissionDenied:
+        return {"status": "rejected", "error": "Gateway 正在重啟，暫停委派新工作"}
+
+
+def _dispatch_admitted(
     *, delegation_id: str, goal: str, goals: Optional[List[str]], context: Optional[str],
     toolsets: Optional[List[str]], role: str, model: Optional[str], session_key: str,
     parent_session_id: Optional[str], runner: Callable[[], Dict[str, Any]], origin_ui_session_id: str,

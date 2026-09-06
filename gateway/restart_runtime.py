@@ -32,10 +32,11 @@ class GatewayAdmissionBarrier:
             if self._closed_reason is not None:
                 raise GatewayAdmissionDenied(self._closed_reason)
             self._active_admissions += 1
-            try:
-                yield
-            finally:
-                self._active_admissions = max(0, self._active_admissions - 1)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active_admissions -= 1
 
     def active_admissions(self) -> int:
         with self._lock:
@@ -61,11 +62,21 @@ class GatewayAdmissionBarrier:
         with self._lock:
             if already_requested():
                 return False, "restart-already-requested", {}
-            live = snapshot()
-            accepted, reason = authorize(live)
-            if not accepted:
-                return False, reason, live
+            if self._closed_reason is not None:
+                return False, "admission-closed", {}
+            if self._active_admissions:
+                return False, "admissions-active", {}
+            # Close before the final read, including reentrant callbacks on this thread.
             self._closed_reason = "restart"
+            try:
+                live = snapshot()
+                accepted, reason = authorize(live)
+            except BaseException:
+                self._closed_reason = None
+                raise
+            if not accepted:
+                self._closed_reason = None
+                return False, reason, live
             mark_requested()
             signal_restart()
             return True, "accepted", live
@@ -192,8 +203,14 @@ def live_session_store_snapshot(runner: Any) -> dict[str, str]:
 
 def restart_obligations(runner: Any) -> dict[str, int]:
     updater_task = getattr(runner, "_update_notification_task", None)
+    adapters = {id(a): a for a in (getattr(runner, "adapters", {}) or {}).values()}
+    for profile in (getattr(runner, "_profile_adapters", {}) or {}).values():
+        adapters.update({id(a): a for a in profile.values()})
+    platform_work = sum(
+        _count_unfinished_tasks(getattr(a, "_background_tasks", ()))
+        + _count_sized(getattr(a, "_pending_messages", None)) for a in adapters.values())
     obligations = {
-        "delivery_queue": _count_unfinished_tasks(getattr(runner, "_background_tasks", ())),
+        "delivery_queue": platform_work + _count_unfinished_tasks(getattr(runner, "_background_tasks", ())),
         "delivery_ledger": count_owned_delivery_obligations(),
         "pending_final": _count_sized(getattr(runner, "_pending_final_deliveries", None)),
         "drain": int(bool(getattr(runner, "_draining", False) or getattr(runner, "_external_drain_active", False))),

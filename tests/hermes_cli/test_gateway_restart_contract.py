@@ -606,6 +606,9 @@ def test_verified_graceful_restart_signals_serving_pid_and_verifies_new_sha() ->
 def test_default_restart_uses_atomic_control_verb_not_external_kill(
     monkeypatch,
 ) -> None:
+    proof = {"manager": "launchd", "service": "gui/501/test.gateway", "policy": "keepalive",
+             "pid": OLD.pid, "start_time": OLD.start_time}
+    monkeypatch.setattr("gateway.restart_relaunch.probe_gateway_relaunch", lambda *_: proof)
     accepted = False
     requests: list[tuple[Path, str, dict]] = []
 
@@ -615,8 +618,8 @@ def test_default_restart_uses_atomic_control_verb_not_external_kill(
         accepted = True
         return {
             "accepted": True,
-            "identity": {"pid": OLD.pid, "start_time": OLD.start_time},
-            "signal": "SIGUSR1",
+            "pid": OLD.pid,
+            "reason": "accepted",
         }
 
     monkeypatch.setattr("gateway.control_socket.query_gateway_control", query)
@@ -659,7 +662,9 @@ def test_default_restart_uses_atomic_control_verb_not_external_kill(
         (
             HOME,
             "restart-if-idle",
-            {"expected_pid": OLD.pid, "expected_start_time": OLD.start_time},
+            {"expected_identity": {"protocol": 1, "kind": "hermes-gateway", "pid": OLD.pid,
+             "start_time": OLD.start_time, "hermes_home": str(HOME), "code_sha": OLD.code_sha,
+             "required_platforms": ["api_server", "webhook", "telegram"]}, "relaunch_attestation": proof},
         )
     ]
 

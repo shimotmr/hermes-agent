@@ -1232,6 +1232,11 @@ class MatrixAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("Matrix: initial sync error: %s", exc)
 
+    @property
+    def send_path_degraded(self) -> bool:
+        task = self._sync_task
+        return self._closing or task is None or task.done()
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._device_id_unverified = False
         if self._client is not None:
@@ -1280,6 +1285,7 @@ class MatrixAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        self._mark_disconnected()
         self._closing = True
         if self._sync_task and not self._sync_task.done():
             self._sync_task.cancel()
@@ -1746,16 +1752,19 @@ class MatrixAdapter(BasePlatformAdapter):
                 # Auth failures (M_UNKNOWN_TOKEN) arrive as SyncError objects, not exceptions.
                 _sync_msg = getattr(sync_data, "message", None)
                 if isinstance(_sync_msg, str) and "unknown_token" in _sync_msg.lower():
+                    self._mark_degraded()
                     logger.error("Matrix: permanent auth error from sync: %s — stopping", _sync_msg)
                     return
                 if isinstance(sync_data, dict):
                     next_batch = await self._absorb_sync(client, sync_data) or next_batch
+                    self._mark_connected()
                     await asyncio.sleep(0)  # let fresh invite joins start before the next sync
             except asyncio.CancelledError:
                 return
             except Exception as exc:
                 if self._closing:
                     return
+                self._mark_degraded()
                 if any(k in str(exc).lower() for k in ("401", "403", "unauthorized", "forbidden")):
                     logger.error("Matrix: permanent auth error: %s — stopping sync", exc)
                     return

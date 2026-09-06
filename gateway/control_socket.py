@@ -195,7 +195,16 @@ class GatewayControlServer:
             self._restart_requested = True
 
         def _authorize(snapshot: Mapping[str, Any]) -> tuple[bool, str]:
-            return authorize_restart_if_idle(snapshot, expected)
+            accepted, reason = authorize_restart_if_idle(snapshot, expected)
+            if not accepted:
+                return accepted, reason
+            from gateway.restart_relaunch import verify_relaunch_attestation
+            if not verify_relaunch_attestation(
+                request.get("relaunch_attestation"), pid=expected.pid, start_time=expected.start_time,
+                manager=str(snapshot.get("supervisor") or ""),
+            ):
+                return False, "relaunch-contract-unverified"
+            return True, "accepted"
 
         barrier = self._admission_barrier
         if barrier is not None:
@@ -214,7 +223,7 @@ class GatewayControlServer:
             if _already_requested():
                 return {"accepted": False, "reason": "restart-already-requested"}
             snapshot = self._restart_snapshot()
-            accepted, reason = authorize_restart_if_idle(snapshot, expected)
+            accepted, reason = _authorize(snapshot)
             if not accepted:
                 return {"accepted": False, "reason": reason}
             # Latch before signalling: if delivery raises after reaching the

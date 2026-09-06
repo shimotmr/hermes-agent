@@ -14,6 +14,14 @@ from types import SimpleNamespace
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _isolate_restart_coordinator_from_relaunch_attestation(monkeypatch):
+    """These tests exercise coordinator atomicity, not OS manager probing."""
+    import gateway.restart_relaunch as relaunch
+
+    monkeypatch.setattr(relaunch, "verify_relaunch_attestation", lambda *args, **kwargs: True)
+
 from gateway.config import Platform
 from gateway.control_socket import GatewayControlServer, query_gateway_control
 from gateway.restart_runtime import (
@@ -210,10 +218,13 @@ async def test_plugin_cross_thread_injection_holds_admission_until_routed():
 
 
 @pytest.mark.asyncio
-async def test_concurrent_restart_is_exactly_once_over_real_control_transport(tmp_path):
+async def test_concurrent_restart_is_exactly_once_over_real_control_transport(tmp_path, monkeypatch):
     if not hasattr(asyncio, "start_unix_server"):
         pytest.skip("POSIX control transport required")
 
+    proof = {"manager": "launchd", "service": "gui/501/test.gateway", "policy": "keepalive",
+             "pid": os.getpid(), "start_time": 1234}
+    monkeypatch.setattr("gateway.restart_relaunch.probe_gateway_relaunch", lambda *_: proof)
     signals = []
     snapshot = _snapshot(tmp_path)
     server = GatewayControlServer(
@@ -231,7 +242,7 @@ async def test_concurrent_restart_is_exactly_once_over_real_control_transport(tm
         return query_gateway_control(
             tmp_path,
             "restart-if-idle",
-            request_fields={"expected_identity": _identity(tmp_path).to_mapping()},
+            request_fields={"expected_identity": _identity(tmp_path).to_mapping(), "relaunch_attestation": proof},
             timeout=2,
         )
 

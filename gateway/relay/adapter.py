@@ -631,7 +631,12 @@ class RelayAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"abandon seal transport error: {e}")
 
     # ── abstract methods (delegated to the transport) ────────────────────
+    @property
+    def send_path_degraded(self) -> bool:
+        return getattr(self._transport, "is_connected", False) is not True
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._mark_disconnected()
         # ``is_reconnect`` is part of the BasePlatformAdapter.connect contract (the
         # reconnect watcher passes it; refusing the kwarg would break recovery).
         # Relay IGNORES it: messages buffered during a gap live in the CONNECTOR's
@@ -668,6 +673,7 @@ class RelayAdapter(BasePlatformAdapter):
             logger.warning("relay handshake failed: %s", exc)
             return False
         self._apply_descriptor(descriptor)
+        self._mark_connected()
         # Only the production WebSocket transport exposes `auth_revoked`.
         if hasattr(self._transport, "auth_revoked"):
             self._start_revocation_monitor()
@@ -1086,6 +1092,7 @@ class RelayAdapter(BasePlatformAdapter):
         return parts
 
     async def disconnect(self) -> None:
+        self._mark_disconnected()
         # The runner wraps this call in wait_for(adapter disconnect budget). Monitor
         # teardown and go_idle eat into the transport's drain time, so measure from
         # the top and thread the REMAINDER down — otherwise teardown is cancelled

@@ -2090,6 +2090,25 @@ class BasePlatformAdapter(ABC):
         """
         return False
 
+    def restart_writer_health_probe(self) -> dict:
+        """只對已確認可收送的本程序公開 writer 身分。"""
+        from gateway.status import get_process_start_time
+
+        healthy = (self.is_connected and not self.has_fatal_error
+                   and not self.send_path_degraded
+                   and getattr(self, "_writer_path_healthy", False) is True)
+        result = {"state": "retrying" if self.is_connected else "disconnected",
+                  "writer_pid": None, "writer_start_time": None}
+        if healthy:
+            pid = os.getpid()
+            try:
+                started = get_process_start_time(pid)
+            except Exception:
+                started = None
+            if type(started) in (int, float) and started > 0:
+                result.update(state="connected", writer_pid=pid, writer_start_time=started)
+        return result
+
     def _mark_connected(self) -> None:
         self._running = True
         self._fatal_error_code = self._fatal_error_message = None
@@ -2123,6 +2142,7 @@ class BasePlatformAdapter(ABC):
     def _write_runtime_status_safe(self, context: str, **kwargs) -> None:
         """Write runtime status; log first failure per context at warning, rest at debug
         (failures — permissions, ENOSPC — must neither be silent nor spam reconnect loops)."""
+        self._writer_path_healthy = kwargs.get("platform_state") == "connected"
         try:
             from gateway.status import write_runtime_status
             # Multiplexed adapters share the status file; the runner stamps
@@ -3498,6 +3518,26 @@ class BasePlatformAdapter(ABC):
         await self._drain_pending_after_session_command(session_key, command_guard)
 
     async def handle_message(self, event: MessageEvent) -> None:
+        from gateway.restart_runtime import GatewayAdmissionDenied
+        from hermes_cli.commands import should_bypass_active_session
+
+        if event.allow_gateway_control:
+            coerce_plaintext_gateway_command(event)
+        barrier = getattr(self, "_restart_admission_barrier", None)
+        bypass = event.allow_gateway_control and should_bypass_active_session(event.get_command())
+        if barrier is None or bypass:
+            if barrier is not None and barrier.closed_reason() is not None and bypass:
+                if self._message_handler:
+                    await self._dispatch_inline_reply(event)
+                return
+            return await self._handle_message_admitted(event)
+        try:
+            with barrier.admission():
+                await self._handle_message_admitted(event)
+        except GatewayAdmissionDenied:
+            logger.info("[%s] 暫停接收新工作：gateway 正在重啟", self.name)
+
+    async def _handle_message_admitted(self, event: MessageEvent) -> None:
         """Process an incoming message; returns quickly by spawning a background
         task so new messages (and interrupts) can arrive while an agent runs."""
         if not self._message_handler:

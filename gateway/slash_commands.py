@@ -543,11 +543,9 @@ class GatewaySlashCommandsMixin(
         # so a delayed Telegram redelivery is still detectable. Overwritten on every /restart.
         await _write_marker(".restart_last_processed.json", _dedup_payload, "dedup marker")
         active_agents = self._running_agent_count()
-        # Under a service manager (systemd/launchd) or Docker/Podman, exit 75 so the supervisor /
-        # restart policy restarts us — detached setsid+bash fails there (systemd KillMode=mixed kills
-        # the cgroup; tini exits with the gateway). The explicit marker covers ``sudo env -i`` wrappers.
-        from gateway.restart import is_container_restart_context, is_gateway_supervisor_process
-        via_service = is_gateway_supervisor_process() or is_container_restart_context()
+        # 只有 manager 查核可選 service exit；一般 /restart 保留 detached fallback。
+        from gateway.restart import is_gateway_supervisor_process
+        via_service = is_gateway_supervisor_process()
         self.request_restart(detached=not via_service, via_service=via_service)
         # Track sessions that were active at shutdown for stuck-loop detection (#7536). On each restart, the
         # counter increments for sessions that were running. If a session hits the threshold (3 consecutive

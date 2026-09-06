@@ -364,72 +364,81 @@ def delegate_task(
     if normalized_action and normalized_action != "spawn":
         return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
 
-    # Operator kill switch (TUI / delegation.pause RPC): blocks NEW spawns only.
-    if is_spawn_paused():
-        return tool_error(
-            "Delegation spawning is paused. Clear the pause via the TUI "
-            "(`p` in /agents) or the `delegation.pause` RPC before retrying."
-        )
+    from contextlib import nullcontext
+    from gateway.restart_runtime import GatewayAdmissionDenied
+    from tools import async_delegation
 
-    top_role = _normalize_role(role)
-    # background applies to single tasks AND batches: a batch is ONE async unit
-    # that joins on every child and re-enters as a single consolidated message.
-    background = is_truthy_value(background, default=False) if background is not None else False
-
-    depth = getattr(parent_agent, "_delegate_depth", 0)
-    max_spawn = _get_max_spawn_depth()
-    if depth >= max_spawn:
-        return tool_error(
-            f"Delegation depth limit reached (depth={depth}, max_spawn_depth={max_spawn}). Raise "
-            f"delegation.max_spawn_depth in config.yaml if deeper nesting is required (no hard ceiling, but each level "
-            f"multiplies API cost)."
-        )
-
-    cfg = _load_config()
-    default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
-    # Caller-supplied max_iterations is ignored: the config value is authoritative
-    # so budgets stay predictable (kwarg kept for internal callers/tests).
-    if max_iterations is not None and max_iterations != default_max_iter:
-        logger.debug(
-            "delegate_task: ignoring caller-supplied max_iterations=%s; using delegation.max_iterations=%s from config",
-            max_iterations, default_max_iter,
-        )
-    # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
-    # a per-call override shaped like the delegation config section.
+    barrier = async_delegation._restart_admission_barrier
     try:
-        creds = _resolve_delegation_credentials(credentials_cfg if credentials_cfg else cfg, parent_agent)
-    except ValueError as exc:
-        # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
-        # spawn loudly (#80450).
-        return tool_error(str(exc))
-    max_children = _get_max_concurrent_children()
-    task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
-    if not err:
-        task_schemas, err = _coerce_task_schemas(task_list, output_schema)
-    if err:
-        return tool_error(err)
+        with barrier.admission() if barrier is not None else nullcontext():
+            # Operator kill switch (TUI / delegation.pause RPC): blocks NEW spawns only.
+            if is_spawn_paused():
+                return tool_error(
+                    "Delegation spawning is paused. Clear the pause via the TUI "
+                    "(`p` in /agents) or the `delegation.pause` RPC before retrying."
+                )
 
-    overall_start = time.monotonic()
-    # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
-    # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
-    from tools.delegation_live_log import create_live_transcripts
-    live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
-    )
-    _announce_batch(parent_agent, len(task_list), live_deleg_id)
-    origin = _capture_origin()
+            top_role = _normalize_role(role)
+            # background applies to single tasks AND batches: a batch is ONE async unit
+            # that joins on every child and re-enters as a single consolidated message.
+            background = is_truthy_value(background, default=False) if background is not None else False
 
-    children, err = _build_children(
-        task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        live_deleg_id=live_deleg_id, live_writers=live_writers,
-    )
-    if err:
-        return tool_error(err)
-    batch = _Batch(
-        task_list, children, parent_agent, creds, context, top_role, max_children,
-        live_deleg_id, live_writers, live_paths, *origin, overall_start,
-    )
-    return _run_batch(batch, background)
+            depth = getattr(parent_agent, "_delegate_depth", 0)
+            max_spawn = _get_max_spawn_depth()
+            if depth >= max_spawn:
+                return tool_error(
+                    f"Delegation depth limit reached (depth={depth}, max_spawn_depth={max_spawn}). Raise "
+                    f"delegation.max_spawn_depth in config.yaml if deeper nesting is required (no hard ceiling, but each level "
+                    f"multiplies API cost)."
+                )
+
+            cfg = _load_config()
+            default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+            # Caller-supplied max_iterations is ignored: the config value is authoritative
+            # so budgets stay predictable (kwarg kept for internal callers/tests).
+            if max_iterations is not None and max_iterations != default_max_iter:
+                logger.debug(
+                    "delegate_task: ignoring caller-supplied max_iterations=%s; using delegation.max_iterations=%s from config",
+                    max_iterations, default_max_iter,
+                )
+            # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
+            # a per-call override shaped like the delegation config section.
+            try:
+                creds = _resolve_delegation_credentials(credentials_cfg if credentials_cfg else cfg, parent_agent)
+            except ValueError as exc:
+                # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
+                # spawn loudly (#80450).
+                return tool_error(str(exc))
+            max_children = _get_max_concurrent_children()
+            task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
+            if not err:
+                task_schemas, err = _coerce_task_schemas(task_list, output_schema)
+            if err:
+                return tool_error(err)
+
+            overall_start = time.monotonic()
+            # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
+            # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
+            from tools.delegation_live_log import create_live_transcripts
+            live_deleg_id, live_writers, live_paths = create_live_transcripts(
+                task_list, context, model=creds.get("model"), provider=creds.get("provider")
+            )
+            _announce_batch(parent_agent, len(task_list), live_deleg_id)
+            origin = _capture_origin()
+
+            children, err = _build_children(
+                task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
+                live_deleg_id=live_deleg_id, live_writers=live_writers,
+            )
+            if err:
+                return tool_error(err)
+            batch = _Batch(
+                task_list, children, parent_agent, creds, context, top_role, max_children,
+                live_deleg_id, live_writers, live_paths, *origin, overall_start,
+            )
+            return _run_batch(batch, background)
+    except GatewayAdmissionDenied:
+        return tool_error("Gateway 正在重啟，暫停委派新工作")
 
 
 # ── OpenAI function-calling schema ──────────────────────────────────────────
