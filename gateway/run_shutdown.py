@@ -138,6 +138,44 @@ class GatewayShutdownMixin:
             + self._active_deferred_agent_worker_count()
         )
 
+    def _restart_active_work_count(self) -> int:
+        """Count active work plus restart admission claims not yet running."""
+        barrier = getattr(self, "_restart_admission_barrier", None)
+        admissions = barrier.active_admissions() if barrier is not None else 0
+        return self._active_work_count() + admissions
+
+    def _build_restart_control_snapshot(self) -> dict[str, Any]:
+        """Build authoritative live restart state for the control socket."""
+        from gateway.control_socket import build_identify_payload
+        from gateway.restart_runtime import (
+            build_gateway_restart_topology, configured_platform_names,
+            live_platform_writer_snapshot, live_session_store_snapshot,
+            restart_obligations,
+        )
+
+        identity = dict(build_identify_payload())
+        topology = build_gateway_restart_topology(str(identity.get("supervisor") or "manual"))
+        identity.update(answering_pid=topology.gateway_pid,
+                        signal_target_pid=topology.gateway_pid,
+                        supervisor_pid=topology.supervisor_pid,
+                        supervisor=topology.supervisor)
+        gateway_state = (
+            "draining"
+            if getattr(self, "_draining", False) or getattr(self, "_external_drain_active", False)
+            else "running" if getattr(self, "_running", False) else "stopped"
+        )
+        return {
+            **identity,
+            "gateway_state": gateway_state,
+            "session_store": live_session_store_snapshot(self),
+            "active_agents": max(0, int(self._restart_active_work_count())),
+            "configured_platforms": configured_platform_names(getattr(self, "config", None)),
+            "platforms": live_platform_writer_snapshot(
+                self, expected_pid=topology.gateway_pid,
+                expected_start_time=identity.get("start_time")),
+            "obligations": restart_obligations(self),
+        }
+
     @staticmethod
     def _running_cron_job_count() -> int:
         # The FULL work aggregate, not _running_agent_count(): cron jobs run on the scheduler's own thread

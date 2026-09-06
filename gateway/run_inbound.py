@@ -1712,6 +1712,9 @@ class GatewayInboundMixin:
         loop = getattr(self, "_gateway_loop", None)
         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
             return False
+        barrier = getattr(self, "_restart_admission_barrier", None)
+        if barrier is not None and barrier.closed_reason() is not None:
+            return False
 
         coro = self._dispatch_plugin_message_injection(
             session_key=session_key, content=content, plugin_id=plugin_id,
@@ -1757,9 +1760,31 @@ class GatewayInboundMixin:
     async def _dispatch_plugin_message_injection(
         self, *, session_key: str, content: str, plugin_id: str
     ) -> bool:
+        """Route a plugin turn while holding the restart admission lease."""
+        from gateway.restart_runtime import GatewayAdmissionDenied
+
+        barrier = getattr(self, "_restart_admission_barrier", None)
+        if barrier is None:
+            return await GatewayInboundMixin._dispatch_plugin_message_injection_admitted(
+                self, session_key=session_key, content=content, plugin_id=plugin_id)
+        try:
+            with barrier.admission():
+                return await GatewayInboundMixin._dispatch_plugin_message_injection_admitted(
+                    self, session_key=session_key, content=content, plugin_id=plugin_id)
+        except GatewayAdmissionDenied:
+            return False
+
+    async def _dispatch_plugin_message_injection_admitted(
+        self, *, session_key: str, content: str, plugin_id: str
+    ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         def _accepting() -> bool:
-            return getattr(self, "_running", False) and not getattr(self, "_draining", False)
+            barrier = getattr(self, "_restart_admission_barrier", None)
+            return (
+                getattr(self, "_running", False)
+                and not getattr(self, "_draining", False)
+                and not (barrier is not None and barrier.closed_reason() is not None)
+            )
 
         if not _accepting():
             return False

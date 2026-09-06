@@ -8,6 +8,7 @@ cross-checks; no single signal is sufficient to declare a replacement healthy.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import math
 import os
@@ -16,7 +17,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Sequence, cast
+from typing import Any, Callable, Mapping, NamedTuple, Optional, Sequence, cast
 
 
 _MAX_STATUS_ANSWER_AGE_SECONDS = 10.0
@@ -516,3 +517,170 @@ def main(
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# Atomic restart-if-idle authorization contract.
+EXIT_OK = 0
+EXIT_DENIED = 20
+EXIT_TIMEOUT = 21
+EXIT_UNSUPPORTED = 22
+
+_REQUIRED_OBLIGATIONS = (
+    "delivery_queue",
+    "delivery_ledger",
+    "pending_final",
+    "drain",
+    "delegation_workers",
+    "updater",
+    "update_lock",
+    "oauth_refresh",
+    "oauth_token_lock",
+)
+
+_SUPPORTED_RESTART_SUPERVISORS = frozenset({"launchd", "systemd", "desktop"})
+
+
+@dataclass(frozen=True)
+class ExpectedGatewayIdentity:
+    protocol: int
+    kind: str
+    pid: int
+    start_time: int | float | str
+    hermes_home: str
+    code_sha: str
+    required_platforms: tuple[str, ...] = ()
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ExpectedGatewayIdentity":
+        if not isinstance(value, Mapping):
+            raise ValueError("expected identity must be an object")
+        required = ("protocol", "kind", "pid", "start_time", "hermes_home", "code_sha")
+        if any(key not in value for key in required):
+            raise ValueError("expected identity is missing required fields")
+        if type(value["protocol"]) is not int or type(value["pid"]) is not int:
+            raise ValueError("protocol and pid must be integers")
+        if not isinstance(value["kind"], str) or not isinstance(value["code_sha"], str):
+            raise ValueError("kind and code_sha must be strings")
+        if not isinstance(value["hermes_home"], str) or not value["hermes_home"]:
+            raise ValueError("hermes_home must be a non-empty string")
+        if not isinstance(value["start_time"], (int, float, str)) or isinstance(value["start_time"], bool):
+            raise ValueError("start_time has invalid type")
+        platforms = value.get("required_platforms", ())
+        if not isinstance(platforms, (list, tuple)) or any(not isinstance(p, str) or not p for p in platforms):
+            raise ValueError("required_platforms must be a list of names")
+        return cls(
+            protocol=value["protocol"], kind=value["kind"], pid=value["pid"],
+            start_time=value["start_time"], hermes_home=str(Path(value["hermes_home"]).expanduser().resolve(strict=False)),
+            code_sha=value["code_sha"], required_platforms=tuple(platforms),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "protocol": self.protocol,
+            "kind": self.kind,
+            "pid": self.pid,
+            "start_time": self.start_time,
+            "hermes_home": self.hermes_home,
+            "code_sha": self.code_sha,
+            "required_platforms": list(self.required_platforms),
+        }
+
+
+@dataclass(frozen=True)
+class RestartResult:
+    exit_code: int
+    reason: str
+
+
+def _canonical_home(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value:
+        return None
+    return str(Path(value).expanduser().resolve(strict=False))
+
+
+def authorize_restart_if_idle(snapshot: Mapping[str, Any], expected: ExpectedGatewayIdentity) -> tuple[bool, str]:
+    """Authorize only an exact serving identity with a strictly idle snapshot."""
+    if not isinstance(snapshot, Mapping):
+        return False, "invalid-serving-snapshot"
+    checks = (
+        (type(snapshot.get("protocol")) is int and snapshot.get("protocol") == expected.protocol,
+         "identity-protocol-mismatch"),
+        (snapshot.get("kind") == expected.kind == "hermes-gateway", "identity-kind-mismatch"),
+        (type(snapshot.get("pid")) is int and snapshot.get("pid") == expected.pid,
+         "identity-pid-mismatch"),
+        (isinstance(snapshot.get("start_time"), (int, float))
+         and not isinstance(snapshot.get("start_time"), bool)
+         and math.isfinite(float(snapshot["start_time"]))
+         and snapshot.get("start_time") == expected.start_time, "identity-start-time-mismatch"),
+        (_canonical_home(snapshot.get("hermes_home")) == _canonical_home(expected.hermes_home), "identity-home-mismatch"),
+        (snapshot.get("code_sha") == expected.code_sha, "identity-sha-mismatch"),
+        (snapshot.get("answering_pid") == expected.pid, "identity-answering-pid-mismatch"),
+        (snapshot.get("signal_target_pid") == expected.pid, "identity-signal-target-pid-mismatch"),
+        (type(snapshot.get("supervisor_pid")) is int and snapshot.get("supervisor_pid") != expected.pid,
+         "identity-supervisor-pid-mismatch"),
+        (snapshot.get("supervisor") in _SUPPORTED_RESTART_SUPERVISORS, "unsupported-supervisor"),
+        (snapshot.get("gateway_state") == "running", "gateway-not-running"),
+        (isinstance(snapshot.get("session_store"), Mapping) and snapshot["session_store"].get("status") == "ok", "session-store-unhealthy"),
+        (type(snapshot.get("active_agents")) is int and snapshot.get("active_agents") == 0, "active-agents"),
+    )
+    for passed, reason in checks:
+        if not passed:
+            return False, reason
+    obligations = snapshot.get("obligations")
+    if not isinstance(obligations, Mapping):
+        return False, "obligations-missing"
+    for name in _REQUIRED_OBLIGATIONS:
+        if type(obligations.get(name)) is not int or obligations.get(name) != 0:
+            return False, f"obligation-{name}"
+    for name, value in obligations.items():
+        if name not in _REQUIRED_OBLIGATIONS and (type(value) is not int or value != 0):
+            return False, f"obligation-{name}"
+    platforms = snapshot.get("platforms")
+    if not isinstance(platforms, Mapping):
+        return False, "platforms-missing"
+    configured_raw = snapshot.get("configured_platforms", ())
+    if not isinstance(configured_raw, (list, tuple)):
+        return False, "configured-platforms-missing"
+    configured = tuple(str(name) for name in configured_raw if isinstance(name, str) and name)
+    if "__configured_platforms_unavailable__" in configured:
+        return False, "configured-platforms-unavailable"
+    required_platforms = tuple(dict.fromkeys((*configured, *expected.required_platforms)))
+    for name in required_platforms:
+        platform = platforms.get(name)
+        if not isinstance(platform, Mapping):
+            return False, f"platform-{name}-missing"
+        if platform.get("state") not in {"connected", "running", "ok"}:
+            return False, f"platform-{name}-unhealthy"
+        if platform.get("writer_pid") != expected.pid or platform.get("writer_start_time") != expected.start_time:
+            return False, f"platform-{name}-stale-writer"
+    return True, "accepted"
+
+
+def restart_gateway_if_idle(
+    expected: ExpectedGatewayIdentity,
+    transport: Callable[..., Optional[dict[str, Any]]],
+    *,
+    timeout: float = 2.0,
+) -> RestartResult:
+    """Request one in-process atomic restart; unsupported/timeout/denial never fall back."""
+    try:
+        response = transport(
+            "restart-if-idle",
+            request_fields={"expected_identity": expected.to_mapping()},
+            timeout=timeout,
+        )
+    except TimeoutError:
+        return RestartResult(EXIT_TIMEOUT, "timeout")
+    except Exception:
+        return RestartResult(EXIT_DENIED, "transport-error")
+    if not isinstance(response, Mapping):
+        return RestartResult(EXIT_DENIED, "control-unavailable")
+    raw_reason = response.get("reason")
+    reason: str = raw_reason if isinstance(raw_reason, str) else "denied"
+    if response.get("accepted") is True and reason == "accepted":
+        return RestartResult(EXIT_OK, reason)
+    if reason == "unsupported":
+        return RestartResult(EXIT_UNSUPPORTED, reason)
+    if reason == "timeout":
+        return RestartResult(EXIT_TIMEOUT, reason)
+    return RestartResult(EXIT_DENIED, reason)

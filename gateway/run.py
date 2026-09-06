@@ -3386,7 +3386,9 @@ class GatewayRunner(
 
     def _init_lifecycle_state(self) -> None:
         """Initialise run/exit/restart flags, per-session state, and completion-delivery bookkeeping."""
+        from gateway.restart_runtime import GatewayAdmissionBarrier
         self._running = self._exit_cleanly = self._exit_with_failure = self._draining = False
+        self._restart_admission_barrier = GatewayAdmissionBarrier()
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
         self._exit_reason: Optional[str] = None
@@ -5008,7 +5010,9 @@ async def _start_gateway_start_control_socket(runner):
                 "pid": os.getpid(), "drain_timeout": _drain}
 
         _control_server = GatewayControlServer(
-            verb_handlers={"pause-for-update": _pause_for_update_handler})
+            verb_handlers={"pause-for-update": _pause_for_update_handler},
+            restart_snapshot=runner._build_restart_control_snapshot,
+            admission_barrier=runner._restart_admission_barrier)
         if not await _control_server.start():
             _control_server = None
         else:
@@ -5051,7 +5055,13 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     # Only the in-process ticker polls local due jobs, so only it gets the external-drain dispatch gate.
     if isinstance(cron_provider, InProcessCronScheduler):
         cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active)
+            runner._draining
+            or runner._external_drain_active
+            or (
+                getattr(runner, "_restart_admission_barrier", None) is not None
+                and runner._restart_admission_barrier.closed_reason() is not None
+            )
+        )
     cron_thread = threading.Thread(
         target=cron_provider.start, args=(cron_stop,), kwargs=cron_start_kwargs, daemon=True,
         name="cron-scheduler")

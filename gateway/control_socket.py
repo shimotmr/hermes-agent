@@ -15,12 +15,14 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import socket
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +126,13 @@ class GatewayControlServer:
     because its control socket couldn't bind; consumers fall back to the scan layer."""
 
     def __init__(self, home: Optional[Path] = None, *,
-                 verb_handlers: Optional[dict[str, Callable[[], dict[str, Any]]]] = None) -> None:
+                 verb_handlers: Optional[dict[str, Callable[[], dict[str, Any]]]] = None,
+                 restart_snapshot: Optional[Callable[[], dict[str, Any]]] = None,
+                 active_agents: Optional[Callable[[], int]] = None,
+                 obligations: Optional[Callable[[], Mapping[str, int]]] = None,
+                 admission_barrier: Any = None,
+                 graceful_signal: Optional[Callable[[], None]] = None,
+                 sigusr1_supported: Optional[bool] = None) -> None:
         if home is None:
             from gateway.status import _get_process_hermes_home
             home = _get_process_hermes_home()
@@ -135,6 +143,85 @@ class GatewayControlServer:
         self._pointer_file: Optional[Path] = None
         self._handlers: dict[str, Callable[[], dict[str, Any]]] = {
             "identify": build_identify_payload, "status": build_status_payload, **(verb_handlers or {})}
+        self._active_agents = active_agents
+        self._obligations = obligations
+        self._admission_barrier = admission_barrier
+        self._restart_snapshot = restart_snapshot or self._build_restart_snapshot
+        self._graceful_signal = graceful_signal or self._send_sigusr1_to_self
+        self._sigusr1_supported = hasattr(signal, "SIGUSR1") if sigusr1_supported is None else sigusr1_supported
+        self._restart_lock = threading.Lock()
+        self._restart_requested = False
+
+    def _build_restart_snapshot(self) -> dict[str, Any]:
+        """Read the serving identity and runtime state immediately before authorization."""
+        payload = dict(build_status_payload())
+        payload.update(build_identify_payload())
+        answering_pid = os.getpid()
+        payload.update(answering_pid=answering_pid, signal_target_pid=answering_pid,
+                       supervisor_pid=os.getppid())
+        if self._active_agents is not None:
+            payload["active_agents"] = max(0, int(self._active_agents()))
+        payload.setdefault("active_agents", 0)
+        if self._obligations is not None:
+            payload["obligations"] = {
+                str(name): max(0, int(count)) for name, count in self._obligations().items()}
+        payload.setdefault("obligations", {})
+        return payload
+
+    @staticmethod
+    def _send_sigusr1_to_self() -> None:
+        """Enter the existing graceful restart path; never substitute another signal."""
+        os.kill(os.getpid(), getattr(signal, "SIGUSR1"))
+
+    def _restart_if_idle(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Atomically recheck this serving process and initiate graceful restart once."""
+        if type(request.get("protocol")) is not int or request.get("protocol") != CONTROL_PROTOCOL_VERSION:
+            return {"accepted": False, "reason": "protocol-mismatch"}
+        if not self._sigusr1_supported:
+            return {"accepted": False, "reason": "unsupported"}
+        try:
+            from hermes_cli.gateway_restart_contract import (
+                ExpectedGatewayIdentity, authorize_restart_if_idle)
+            raw_expected = request.get("expected_identity")
+            if not isinstance(raw_expected, dict):
+                raise ValueError("expected identity must be an object")
+            expected = ExpectedGatewayIdentity.from_mapping(raw_expected)
+        except (TypeError, ValueError):
+            return {"accepted": False, "reason": "invalid-expected-identity"}
+        def _already_requested() -> bool:
+            return self._restart_requested
+
+        def _mark_requested() -> None:
+            self._restart_requested = True
+
+        def _authorize(snapshot: Mapping[str, Any]) -> tuple[bool, str]:
+            return authorize_restart_if_idle(snapshot, expected)
+
+        barrier = self._admission_barrier
+        if barrier is not None:
+            accepted, reason, snapshot = barrier.restart_if_idle(
+                snapshot=self._restart_snapshot,
+                authorize=_authorize,
+                signal_restart=self._graceful_signal,
+                already_requested=_already_requested,
+                mark_requested=_mark_requested,
+            )
+            if not accepted:
+                return {"accepted": False, "reason": reason}
+            return {"accepted": True, "reason": "accepted", "pid": snapshot["pid"]}
+
+        with self._restart_lock:
+            if _already_requested():
+                return {"accepted": False, "reason": "restart-already-requested"}
+            snapshot = self._restart_snapshot()
+            accepted, reason = authorize_restart_if_idle(snapshot, expected)
+            if not accepted:
+                return {"accepted": False, "reason": reason}
+            # Latch before signalling: if delivery raises after reaching the
+            # process, a retry must not send a second SIGUSR1.
+            _mark_requested()
+            self._graceful_signal()
+            return {"accepted": True, "reason": "accepted", "pid": snapshot["pid"]}
 
     async def start(self) -> bool:
         """Bind and start serving. Returns True on success, False otherwise."""
@@ -206,9 +293,13 @@ class GatewayControlServer:
                 raise ValueError("request must be a JSON object")
             request_id, verb = request.get("id"), request.get("verb")
             handler = self._handlers.get(verb) if isinstance(verb, str) else None
-            if handler is None:
+            if verb == "restart-if-idle":
+                response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION,
+                            "result": self._restart_if_idle(request)}
+            elif handler is None:
                 response: dict[str, Any] = {"ok": False, "error": f"unknown verb: {verb!r}",
-                                            "protocol": CONTROL_PROTOCOL_VERSION, "supported_verbs": sorted(self._handlers)}
+                                            "protocol": CONTROL_PROTOCOL_VERSION,
+                                            "supported_verbs": sorted((*self._handlers, "restart-if-idle"))}
             else:
                 response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION, "result": handler()}
         except Exception as exc:
@@ -264,11 +355,15 @@ class _PipeControlProtocol(asyncio.Protocol):
                 self._transport.close()
 
 
-def query_gateway_control(home: Path, verb: str, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
+def query_gateway_control(home: Path, verb: str, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT,
+                          request_fields: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
     """Ask the gateway serving ``home`` a control verb; returns its ``result`` payload. Any failure (no/stale
     socket, timeout, malformed answer, ``ok: false``) returns None so callers fall back to the scan layer.
     Never raises."""
-    request = json.dumps({"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION}).encode("utf-8") + b"\n"
+    payload = {"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION}
+    if request_fields:
+        payload.update(request_fields)
+    request = json.dumps(payload).encode("utf-8") + b"\n"
     query = _query_windows_pipe if _IS_WINDOWS else _query_unix_socket
     try:
         raw = query(Path(home), request, timeout)
