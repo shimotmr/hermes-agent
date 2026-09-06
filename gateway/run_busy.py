@@ -1056,9 +1056,9 @@ class GatewayBusySessionMixin:
         session_key = self._session_key_for_source(event.source)
 
         async def _on_confirm(choice: str):
-            # Via the class, not ``self``: tests drive this gate on a bare SimpleNamespace runner.
+            # Via the class so tests can drive this gate on a bare SimpleNamespace runner.
             return await GatewayBusySessionMixin._run_confirmed_destructive_slash(
-                choice, command, execute, session_key
+                self, choice, command, execute, session_key
             )
 
         _p = self._typed_command_prefix_for(event.source.platform)
@@ -1092,32 +1092,41 @@ class GatewayBusySessionMixin:
         ),
     }
 
-    @staticmethod
-    async def _run_confirmed_destructive_slash(choice: str, command: str, execute, session_key: str):
-        """Confirm-callback body: ``cancel`` → message; ``always`` persists the opt-out, then runs."""
+    async def _run_confirmed_destructive_slash(self, choice: str, command: str, execute, session_key: str):
+        """Run an approved destructive command only while restart admission remains open."""
         if choice == "cancel":
             return f"🟡 /{command} cancelled. Conversation unchanged."
-        persisted = False
-        if choice == "always":
-            try:
-                from cli import save_config_value
-                # save_config_value swallows its own errors and reports the outcome in the return
-                # value, so the try block alone says nothing about whether the write landed.
-                persisted = bool(save_config_value("approvals.destructive_slash_confirm", False))
-                if persisted:
-                    logger.info("User opted out of destructive slash confirm (session=%s)", session_key)
-                else:
-                    logger.warning(
-                        "Could not persist destructive_slash_confirm=false "
-                        "(session=%s); config.yaml is not writable", session_key,
-                    )
-            except Exception as exc:
-                logger.warning("Failed to persist destructive_slash_confirm=false: %s", exc)
-        result = await execute()
-        # Only plain-string results get the note: it would mangle an EphemeralReply.
-        if choice == "always" and isinstance(result, str):
-            return result + GatewayBusySessionMixin._DESTRUCTIVE_OPTOUT_NOTE[persisted]
-        return result
+
+        from gateway.restart_runtime import GatewayAdmissionDenied
+
+        barrier = getattr(self, "_restart_admission_barrier", None)
+        admission = barrier.admission() if barrier is not None else contextlib.nullcontext()
+        try:
+            with admission:
+                persisted = False
+                if choice == "always":
+                    try:
+                        from cli import save_config_value
+                        # save_config_value swallows its own errors and reports the outcome in the return
+                        # value, so the try block alone says nothing about whether the write landed.
+                        persisted = bool(save_config_value("approvals.destructive_slash_confirm", False))
+                        if persisted:
+                            logger.info("User opted out of destructive slash confirm (session=%s)", session_key)
+                        else:
+                            logger.warning(
+                                "Could not persist destructive_slash_confirm=false "
+                                "(session=%s); config.yaml is not writable", session_key,
+                            )
+                    except Exception as exc:
+                        logger.warning("Failed to persist destructive_slash_confirm=false: %s", exc)
+                result = await execute()
+                # Only plain-string results get the note: it would mangle an EphemeralReply.
+                if choice == "always" and isinstance(result, str):
+                    return result + GatewayBusySessionMixin._DESTRUCTIVE_OPTOUT_NOTE[persisted]
+                return result
+        except GatewayAdmissionDenied:
+            logger.info("拒絕已確認的 /%s：gateway 正在重啟", command)
+            return f"⏸️ /{command} not run because the gateway is restarting."
 
     async def _request_slash_confirm(
         self, *, event: MessageEvent, command: str, title: str, message: str, handler

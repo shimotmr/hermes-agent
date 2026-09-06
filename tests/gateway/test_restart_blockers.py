@@ -118,6 +118,45 @@ async def test_cross_thread_restart_rejects_live_lease_without_blocking_loop():
     assert barrier.closed_reason() is None
 
 
+@pytest.mark.asyncio
+async def test_confirmed_reset_callback_is_denied_after_restart_barrier_closes():
+    from gateway.run_busy import GatewayBusySessionMixin
+
+    runner = object.__new__(GatewayBusySessionMixin)
+    runner._restart_admission_barrier = GatewayAdmissionBarrier()
+    runner._restart_admission_barrier.close('restart')
+    executed = False
+
+    async def execute():
+        nonlocal executed
+        executed = True
+        return 'reset'
+
+    result = await runner._run_confirmed_destructive_slash('once', 'new', execute, 'telegram:dm:1')
+
+    assert executed is False
+    assert 'restart' in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_reset_callback_holds_admission_for_entire_execution():
+    from gateway.run_busy import GatewayBusySessionMixin
+
+    runner = object.__new__(GatewayBusySessionMixin)
+    runner._restart_admission_barrier = GatewayAdmissionBarrier()
+    observed = []
+
+    async def execute():
+        observed.append(runner._restart_admission_barrier.active_admissions())
+        return 'reset'
+
+    result = await runner._run_confirmed_destructive_slash('once', 'reset', execute, 'telegram:dm:1')
+
+    assert result == 'reset'
+    assert observed == [1]
+    assert runner._restart_admission_barrier.active_admissions() == 0
+
+
 def test_final_snapshot_is_closed_even_to_reentrant_admission():
     barrier = GatewayAdmissionBarrier()
     signals = []
