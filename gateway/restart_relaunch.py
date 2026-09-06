@@ -14,6 +14,25 @@ def _read_manager(args: list[str]) -> str:
     return result.stdout if result.returncode == 0 else ""
 
 
+def _systemd_exit75_policy(props: Mapping[str, str]) -> dict[str, str] | None:
+    """以已載入的狀態碼分類判斷 exit 75，未知格式拒絕。"""
+    policy = props.get('Restart')
+    if policy not in {'always', 'on-failure'}:
+        return None
+    statuses = {}
+    for key in ('RestartPreventExitStatus', 'SuccessExitStatus'):
+        raw = props.get(key)
+        if raw is None or any(not token.isdecimal() for token in raw.split()):
+            return None
+        statuses[key] = {int(token) for token in raw.split()}
+    if 75 in statuses['RestartPreventExitStatus']:
+        return None
+    if policy == 'on-failure' and 75 in statuses['SuccessExitStatus']:
+        return None
+    return {'policy': policy, 'prevent_exit_status': props['RestartPreventExitStatus'],
+            'success_exit_status': props['SuccessExitStatus']}
+
+
 def _systemd_contract(pid: int) -> dict[str, Any] | None:
     # cgroup 來自核心；環境變數與 gateway 自行寫入的狀態不能指定服務身分。
     cgroups = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8")
@@ -22,16 +41,15 @@ def _systemd_contract(pid: int) -> dict[str, Any] | None:
     for unit in sorted(units):
         for scope in (['--user'], []):
             output = _read_manager(['systemctl', *scope, 'show', unit,
-                '--property=MainPID,ActiveState,Restart,RestartPreventExitStatus'])
+                '--property=MainPID,ActiveState,Restart,RestartPreventExitStatus,SuccessExitStatus'])
             props = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
             if props.get('MainPID') != str(pid) or props.get('ActiveState') != 'active':
                 continue
-            policy = props.get('Restart')
-            # 無 prevent override 才能保證 exit 75；未知格式一律不推測。
-            if policy not in {'always', 'on-failure'} or props.get('RestartPreventExitStatus', '').strip():
+            policy = _systemd_exit75_policy(props)
+            if policy is None:
                 return None
             return {'manager': 'systemd', 'service': unit,
-                    'scope': 'user' if scope else 'system', 'policy': policy}
+                    'scope': 'user' if scope else 'system', **policy}
     return None
 
 

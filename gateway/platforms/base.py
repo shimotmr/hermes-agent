@@ -2105,7 +2105,7 @@ class BasePlatformAdapter(ABC):
                 started = get_process_start_time(pid)
             except Exception:
                 started = None
-            if type(started) in (int, float) and started > 0:
+            if type(started) is int and started > 0:
                 result.update(state="connected", writer_pid=pid, writer_start_time=started)
         return result
 
@@ -3519,12 +3519,13 @@ class BasePlatformAdapter(ABC):
 
     async def handle_message(self, event: MessageEvent) -> None:
         from gateway.restart_runtime import GatewayAdmissionDenied
-        from hermes_cli.commands import should_bypass_active_session
+        from hermes_cli.commands import resolve_command
 
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
         barrier = getattr(self, "_restart_admission_barrier", None)
-        bypass = event.allow_gateway_control and should_bypass_active_session(event.get_command())
+        command = resolve_command(event.get_command()) if event.allow_gateway_control and event.get_command() else None
+        bypass = command is not None and command.name in {"stop", "new", "reset", "approve", "deny", "status", "restart"}
         if barrier is None or bypass:
             if barrier is not None and barrier.closed_reason() is not None and bypass:
                 if self._message_handler:

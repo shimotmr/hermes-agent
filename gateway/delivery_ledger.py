@@ -158,6 +158,20 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
     return hashlib.sha256(f"{session_key}|{message_ref}|{content}".encode("utf-8", "replace")).hexdigest()[:24]
 
 
+def count_active_owned_obligations() -> int:
+    """目前 writer 尚未獲得 ACK 的義務；讀取失敗交由 restart caller 拒絕。"""
+    pid, started = _owner_stamp()
+    if started is None:
+        raise RuntimeError("無法確認 delivery writer 的程序啟動時間")
+    with _DB_LOCK, _transaction() as conn:
+        return int(conn.execute(
+            """SELECT COUNT(*) FROM delivery_obligations
+               WHERE owner_pid=? AND (owner_started_at=? OR owner_started_at IS NULL)
+                 AND state IN ('pending', 'attempting', 'failed')""",
+            (pid, started),
+        ).fetchone()[0])
+
+
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                       thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
     """Record a final response as owed to the platform (state='pending')."""

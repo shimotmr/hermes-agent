@@ -1235,7 +1235,7 @@ class MatrixAdapter(BasePlatformAdapter):
     @property
     def send_path_degraded(self) -> bool:
         task = self._sync_task
-        return self._closing or task is None or task.done()
+        return self._closing or task is None or task.done() or not self._last_sync_ts
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._device_id_unverified = False
@@ -1757,8 +1757,11 @@ class MatrixAdapter(BasePlatformAdapter):
                     return
                 if isinstance(sync_data, dict):
                     next_batch = await self._absorb_sync(client, sync_data) or next_batch
-                    self._mark_connected()
+                    if not getattr(self, "_writer_path_healthy", False):
+                        self._mark_connected()
                     await asyncio.sleep(0)  # let fresh invite joins start before the next sync
+                else:
+                    self._mark_degraded()
             except asyncio.CancelledError:
                 return
             except Exception as exc:

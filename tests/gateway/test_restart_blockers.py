@@ -64,6 +64,7 @@ async def test_platform_admission_spans_topic_lookup_and_stop_bypasses(monkeypat
     barrier.close('restart')
     a._topic_recovery_fn = None
     await a.handle_message(event('blocked'))
+    await a.handle_message(event('/retry'))
     await a.handle_message(event('/stop'))
     await asyncio.gather(*a._background_tasks)
     assert routed == ['hello', '/stop']
@@ -322,3 +323,105 @@ def test_sync_delegation_spawn_is_closed_but_control_bypasses(monkeypatch):
     monkeypatch.setattr(delegate_tool, '_handle_control_action', lambda *args: calls.append(args) or '{}')
     assert delegate_tool.delegate_task(action='stop', parent_agent=parent) == '{}'
     assert len(calls) == 1
+
+
+@pytest.mark.macos_only
+@pytest.mark.asyncio
+async def test_live_runner_writer_and_caller_manager_proof_over_control_socket(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner, _start_gateway_start_control_socket
+    from gateway.control_socket import query_gateway_control
+    from gateway.status import get_process_start_time
+    from hermes_cli.gateway_restart_contract import ExpectedGatewayIdentity, restart_gateway_if_idle
+    import gateway.restart_relaunch as relaunch
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('XPC_SERVICE_NAME', 'ai.hermes.test')
+    pid = os.getpid()
+    started = get_process_start_time(pid)
+    commands = []
+
+    def manager_read(args):
+        commands.append(args)
+        if args == ['launchctl', 'list']:
+            return f'{pid}\t0\tai.hermes.test\n'
+        assert args == ['launchctl', 'print', f'gui/{os.getuid()}/ai.hermes.test']
+        return f'pid = {pid}\nproperties = keepalive | runatload\n'
+
+    monkeypatch.setattr(relaunch, '_read_manager', manager_read)
+    runner = GatewayRunner(GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="test")}))
+    runner._running = True
+    a = adapter()
+    runner._wire_adapter_handlers(a)
+    runner.adapters[Platform.TELEGRAM] = a
+    await a.connect()
+    assert a._restart_admission_barrier is runner._restart_admission_barrier
+    snapshot = runner._build_restart_control_snapshot()
+    assert snapshot['platforms']['telegram']['writer_start_time'] == started
+    assert snapshot['session_store']['status'] == 'ok'
+    server = await _start_gateway_start_control_socket(runner)
+    assert server is not None
+    signals = []
+    server._graceful_signal = lambda: signals.append(pid)
+    try:
+        expected = ExpectedGatewayIdentity.from_mapping(snapshot)
+        result = await asyncio.to_thread(restart_gateway_if_idle, expected,
+            lambda verb, **kw: query_gateway_control(tmp_path, verb, **kw))
+        assert result.exit_code == 0, result.reason
+        assert signals == [pid]
+        assert runner._restart_admission_barrier.closed_reason() == 'restart'
+        assert sum(cmd == ['launchctl', 'list'] for cmd in commands) == 2
+    finally:
+        await server.stop()
+        await a.disconnect()
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize('pid_offset,policy', [(1, 'keepalive'), (0, 'runatload'), (0, 'keepalive')])
+def test_manager_policy_and_pid_are_read_only_and_start_time_is_rechecked(monkeypatch, pid_offset, policy):
+    from gateway.status import get_process_start_time
+    import gateway.restart_relaunch as relaunch
+    import gateway.status as status
+    pid, calls = os.getpid(), []
+    started = get_process_start_time(pid)
+
+    def read(args):
+        calls.append(args)
+        if args == ['launchctl', 'list']:
+            return f'{pid}\t0\tai.hermes.test\n'
+        assert args[0:2] == ['launchctl', 'print']
+        return f'pid = {pid + pid_offset}\nproperties = {policy}\n'
+
+    monkeypatch.setattr(relaunch, '_read_manager', read)
+    if not pid_offset and policy == 'keepalive':
+        starts = iter((started, started + 1))
+        monkeypatch.setattr(status, 'get_process_start_time', lambda _: next(starts))
+    assert relaunch.probe_gateway_relaunch(pid, started) is None
+    assert calls
+
+
+def test_owned_delivery_count_tracks_durable_pending_until_ack(tmp_path, monkeypatch):
+    from gateway import delivery_ledger as ledger
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    assert ledger.count_active_owned_obligations() == 0
+    ledger.record_obligation(obligation_id='ours', session_key='s', platform='telegram',
+                             chat_id='1', thread_id=None, content='reply')
+    assert ledger.count_active_owned_obligations() == 1
+    ledger.mark_attempting('ours')
+    assert ledger.count_active_owned_obligations() == 1
+    ledger.mark_failed('ours', 'offline')
+    assert ledger.count_active_owned_obligations() == 1
+    ledger.mark_delivered('ours')
+    assert ledger.count_active_owned_obligations() == 0
+
+
+@pytest.mark.parametrize('restart,prevent,success,accepted', [
+    ('always', '78', '', True), ('on-failure', '', '', True),
+    ('always', '75', '', False), ('on-failure', '', '75', False),
+    ('no', '', '', False), ('on-failure', '', 'unknown', False),
+])
+def test_systemd_exit75_contract_respects_loaded_exit_status_policy(restart, prevent, success, accepted):
+    from gateway.restart_relaunch import _systemd_exit75_policy
+    policy = _systemd_exit75_policy({'Restart': restart, 'RestartPreventExitStatus': prevent,
+                                    'SuccessExitStatus': success})
+    assert (policy is not None) is accepted
