@@ -65,9 +65,43 @@ async def test_platform_admission_spans_topic_lookup_and_stop_bypasses(monkeypat
     a._topic_recovery_fn = None
     await a.handle_message(event('blocked'))
     await a.handle_message(event('/retry'))
+    await a.handle_message(event('/new'))
+    await a.handle_message(event('/reset'))
     await a.handle_message(event('/stop'))
     await asyncio.gather(*a._background_tasks)
     assert routed == ['hello', '/stop']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('command', ['/new', '/reset'])
+async def test_reset_commands_hold_admission_during_topic_recovery(monkeypatch, command):
+    a = adapter()
+    barrier = a._restart_admission_barrier = GatewayAdmissionBarrier()
+    entered, release = threading.Event(), threading.Event()
+
+    def recover(_event):
+        entered.set()
+        assert release.wait(3)
+
+    async def handler(_event):
+        return None
+
+    a.set_message_handler(handler)
+    a._topic_recovery_fn = recover
+    monkeypatch.setattr(a, '_apply_topic_recovery', recover)
+    task = asyncio.create_task(a.handle_message(event(command)))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert barrier.active_admissions() == 1
+        result = await asyncio.to_thread(
+            barrier.restart_if_idle, snapshot=lambda: {}, authorize=lambda _: (True, 'accepted'),
+            signal_restart=lambda: None, already_requested=lambda: False,
+            mark_requested=lambda: None)
+        assert result[:2] == (False, 'admissions-active')
+    finally:
+        release.set()
+        await task
+        await asyncio.gather(*a._background_tasks)
 
 
 @pytest.mark.asyncio

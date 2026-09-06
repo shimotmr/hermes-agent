@@ -3525,7 +3525,7 @@ class BasePlatformAdapter(ABC):
             coerce_plaintext_gateway_command(event)
         barrier = getattr(self, "_restart_admission_barrier", None)
         command = resolve_command(event.get_command()) if event.allow_gateway_control and event.get_command() else None
-        bypass = command is not None and command.name in {"stop", "new", "reset", "approve", "deny", "status", "restart"}
+        bypass = command is not None and command.name in {"stop", "approve", "deny", "status", "restart"}
         if barrier is None or bypass:
             if barrier is not None and barrier.closed_reason() is not None and bypass:
                 if self._message_handler:
