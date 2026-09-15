@@ -28,6 +28,7 @@ import type {
 import { useI18n } from '@/i18n'
 import { isCodeSkewRestartRequired } from '@/lib/code-skew-error'
 import { AlertTriangle, Cpu, Loader2 } from '@/lib/icons'
+import { isSubmitEnter } from '@/lib/ime'
 import { cn } from '@/lib/utils'
 import { setMainModelAssignment } from '@/store/cron-model-impact'
 import { notifyError, readableError } from '@/store/notifications'
@@ -117,6 +118,11 @@ const AUX_TASKS: readonly AuxTaskMeta[] = [
   { key: 'mcp' },
   { key: 'title_generation' },
   { key: 'review' },
+  // Same three canonical slots the backend serves but the list below used to
+  // omit (#97297): triage_specifier, kanban_decomposer, profile_describer.
+  { key: 'triage_specifier' },
+  { key: 'kanban_decomposer' },
+  { key: 'profile_describer' },
   { key: 'curator' }
 ]
 
@@ -560,8 +566,11 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
 
   const fastOn = isFastTier(getNested(config ?? {}, 'agent.service_tier'))
 
-  // Persist a single agent.* default by round-tripping the whole config record
-  // (PUT /api/config replaces it) — optimistic, with rollback on failure.
+  // Persist a single agent.* default as a sparse patch (PUT /api/config
+  // deep-merges onto disk). Never send the whole cached record: it is a
+  // default-expanded snapshot, and echoing it back rewrites every key another
+  // surface changed meanwhile — a CLI-pinned auxiliary slot came back as
+  // provider "auto" / model "" (#95460). Optimistic, with rollback on failure.
   const writeAgentDefault = useCallback(
     async (key: string, value: string) => {
       if (!config) {
@@ -573,7 +582,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       setConfig(next)
 
       try {
-        await saveHermesConfig(next, scopeProfile)
+        await saveHermesConfig(setNested({}, key, value), scopeProfile)
       } catch (err) {
         setConfig(prev)
         notifyError(err, m.defaultsFailed)
@@ -869,7 +878,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
                   className={cn('min-w-60 flex-1', CONTROL_TEXT)}
                   onChange={event => setApiKeyDraft(event.target.value)}
                   onKeyDown={event => {
-                    if (event.key === 'Enter') {
+                    if (isSubmitEnter(event)) {
                       void activateApiKeyProvider()
                     }
                   }}
