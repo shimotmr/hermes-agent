@@ -9,6 +9,7 @@ crash-recovery wiring. Only the async lifecycle lives here; the child run is an 
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -531,13 +532,17 @@ _restart_admission_barrier = None
 def _dispatch(**kwargs) -> Dict[str, Any]:
     from contextlib import nullcontext
     from gateway.restart_runtime import GatewayAdmissionDenied
+    from hermes_cli.backend_retirement import retirement
 
-    barrier = _restart_admission_barrier
-    try:
-        with barrier.admission() if barrier is not None else nullcontext():
-            return _dispatch_admitted(**kwargs)
-    except GatewayAdmissionDenied:
-        return {"status": "rejected", "error": "Gateway 正在重啟，暫停委派新工作"}
+    with retirement.work() as admitted:
+        if not admitted:
+            return {"status": "rejected", "error": "backend is retiring; reconnect to continue"}
+        barrier = _restart_admission_barrier
+        try:
+            with barrier.admission() if barrier is not None else nullcontext():
+                return _dispatch_admitted(**kwargs)
+        except GatewayAdmissionDenied:
+            return {"status": "rejected", "error": "Gateway 正在重啟，暫停委派新工作"}
 
 
 def _dispatch_admitted(
@@ -570,6 +575,9 @@ def _dispatch_admitted(
         "slot_key": slot_key or delegation_id,
         # Which of the call's ``goals`` this unit runs (None = all of them).
         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
+        # The one stale-monitor thread serves every profile and starts with an empty Context;
+        # a forced finalization runs under the dispatcher's so it settles the same state.db.
+        "_context": contextvars.copy_context(),
         # Stale-monitor bookkeeping (see _stale_monitor_loop).
         "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None}
     with _records_lock:
@@ -600,10 +608,16 @@ def _dispatch_admitted(
         finally:
             _finalize(delegation_id, result, status)
 
+    from hermes_cli.backend_retirement import retirement
+
+    # The outer dispatch reservation prevents a freeze during this handoff. Retain a worker
+    # reservation too: the stall monitor may finalize its registry record before it really exits.
+    retirement.acquire()
     try:
-        # Propagate the dispatching profile so the detached child resolves get_hermes_home() correctly.
-        executor.submit(propagate_context_to_thread(_worker))
+        future = executor.submit(propagate_context_to_thread(_worker))
+        future.add_done_callback(lambda _: retirement.release())
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
+        retirement.release()
         with _records_lock:
             _records.pop(delegation_id, None)
         with _DB_LOCK, _transaction() as conn:
@@ -868,7 +882,9 @@ def _stale_monitor_loop() -> None:
                 fn = (_records.get(delegation_id) or {}).get("interrupt_fn")
             _call_interrupt(fn, "Async delegation %s stall interrupt failed: %s", delegation_id)
         for delegation_id in expired:
-            _finalize(delegation_id, lambda rec, d=delegation_id: _stalled_result(d, rec), "stalled")
+            with _records_lock:
+                ctx = (_records.get(delegation_id) or {}).get("_context") or contextvars.copy_context()
+            ctx.run(_finalize, delegation_id, lambda rec, d=delegation_id: _stalled_result(d, rec), "stalled")
         if not any_monitorable:
             return
 

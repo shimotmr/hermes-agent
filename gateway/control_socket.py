@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -126,7 +127,7 @@ class GatewayControlServer:
     because its control socket couldn't bind; consumers fall back to the scan layer."""
 
     def __init__(self, home: Optional[Path] = None, *,
-                 verb_handlers: Optional[dict[str, Callable[[], dict[str, Any]]]] = None,
+                 verb_handlers: Optional[dict[str, Callable[..., dict[str, Any]]]] = None,
                  restart_snapshot: Optional[Callable[[], dict[str, Any]]] = None,
                  active_agents: Optional[Callable[[], int]] = None,
                  obligations: Optional[Callable[[], Mapping[str, int]]] = None,
@@ -141,7 +142,7 @@ class GatewayControlServer:
         self._pipe_server: Any = None  # Windows proactor pipe server
         self._bind_path: Optional[Path] = None
         self._pointer_file: Optional[Path] = None
-        self._handlers: dict[str, Callable[[], dict[str, Any]]] = {
+        self._handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "identify": build_identify_payload, "status": build_status_payload, **(verb_handlers or {})}
         self._active_agents = active_agents
         self._obligations = obligations
@@ -310,7 +311,12 @@ class GatewayControlServer:
                                             "protocol": CONTROL_PROTOCOL_VERSION,
                                             "supported_verbs": sorted((*self._handlers, "restart-if-idle"))}
             else:
-                response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION, "result": handler()}
+                # Verbs that carry arguments (e.g. migrate-profile-identity) declare a ``params``
+                # parameter; argument-less verbs (identify/status/rescan) keep their bare signature.
+                params = request.get("params") if isinstance(request.get("params"), dict) else {}
+                wants_params = "params" in inspect.signature(handler).parameters
+                response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION,
+                            "result": handler(params) if wants_params else handler()}
         except Exception as exc:
             response = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "protocol": CONTROL_PROTOCOL_VERSION}
         if request_id is not None:
@@ -364,12 +370,16 @@ class _PipeControlProtocol(asyncio.Protocol):
                 self._transport.close()
 
 
-def query_gateway_control(home: Path, verb: str, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT,
-                          request_fields: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+def query_gateway_control(home: Path, verb: str, *, params: Optional[dict[str, Any]] = None,
+                          request_fields: Optional[dict[str, Any]] = None,
+                          timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
     """Ask the gateway serving ``home`` a control verb; returns its ``result`` payload. Any failure (no/stale
     socket, timeout, malformed answer, ``ok: false``) returns None so callers fall back to the scan layer.
-    Never raises."""
-    payload = {"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION}
+    ``params`` carries ordinary verb arguments; ``request_fields`` carries restart authorization fields at
+    the top level of the protocol request. Never raises."""
+    payload: dict[str, Any] = {"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION}
+    if params:
+        payload["params"] = params
     if request_fields:
         payload.update(request_fields)
     request = json.dumps(payload).encode("utf-8") + b"\n"
@@ -452,3 +462,23 @@ def rescan_gateway_profiles(home: Path, *, timeout: float = 8.0) -> Optional[dic
     when no gateway answers / the gateway predates the verb — callers then rely on the periodic rescan
     (or the restart reminder)."""
     return query_gateway_control(home, "rescan-profiles", timeout=timeout)
+
+
+def migrate_gateway_profile_identity(home: Path, old_name: str, new_name: str, *,
+                                     timeout: float = 8.0) -> Optional[dict[str, Any]]:
+    """Ask the multiplexer serving ``home`` to rekey a renamed profile's in-memory + on-disk routing
+    from ``agent:<old>:`` to ``agent:<new>:`` now. Returns its ``{"rekeyed": N, ...}`` answer, or None
+    when no gateway answers / the gateway predates the verb — the CLI's durable DB rewrite still lands,
+    and a restart reconciles the in-memory copy."""
+    return query_gateway_control(home, "migrate-profile-identity",
+                                 params={"old": old_name, "new": new_name}, timeout=timeout)
+
+
+def purge_gateway_profile_identity(home: Path, name: str, *,
+                                   timeout: float = 8.0) -> Optional[dict[str, Any]]:
+    """Ask the multiplexer serving ``home`` to drop a deleted profile's routing identity now — the
+    in-memory index AND the durable rows, neither of which a CLI-side delete can settle: this process
+    writes its in-memory copy back, so it re-creates what the CLI removed. Returns its
+    ``{"ok": True, "dropped": N, ...}`` answer, or None when no gateway answers / the gateway predates
+    the verb."""
+    return query_gateway_control(home, "purge-profile-identity", params={"name": name}, timeout=timeout)

@@ -204,6 +204,12 @@ def has_blocking_approval(session_key: str) -> bool:
         return bool(_gateway_queues.get(session_key))
 
 
+def pending_gateway_approval_count() -> int:
+    """Unresolved gateway approvals across every session — a backend blocked on one is not idle."""
+    with _lock:
+        return sum(len(queue) for queue in _gateway_queues.values())
+
+
 def get_pending_gateway_approval(session_key: str) -> dict | None:
     """Copy of the oldest unresolved gateway approval, for reconnecting clients
     to restore a prompt. Read-only snapshot — the queue stays authoritative."""
@@ -483,7 +489,7 @@ _USER_SUMMARIES = {
     "denied": "You denied this {noun} — it did not run.",
     "timeout": "No answer within {minutes} — the {noun} did not run.",
     "notify_failed": "The approval request could not be delivered — the {noun} did not run.",
-    "cancelled": "The approval prompt was withdrawn before you answered — the {noun} did not run.",
+    "cancelled": "The approval prompt was withdrawn or never reached you — the {noun} did not run.",
     "blocked": "This {noun} is not allowed in an unattended session — it did not run.",
 }
 
@@ -894,6 +900,13 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
         return deny(spec.cli_timeout, "timeout")
+    if choice == "cancelled":
+        # The prompt never reached a human (callback raised, no callback under prompt_toolkit, interrupted
+        # read): fail closed, but do not attribute a refusal to the user (#22992).
+        return deny(spec.gateway_refused, "cancelled",
+                    reason="was not approved: the approval prompt could not be delivered or was not answered "
+                           f"({getattr(choice, 'cause', 'no answer')})",
+                    reason_addendum="", timeout_addendum=" Silence is not consent.", deny_reason=None)
     if choice == "deny":
         # No _record_denial(): the breaker counts consecutive guardian LLM
         # DENY verdicts, not deliberate human denials.
@@ -995,7 +1008,16 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     exception once host paths are bind-mounted: ``rm -rf /workspace`` then reaches host files."""
     if env_type == "docker":
         return not has_host_access
-    return env_type in ("singularity", "modal", "daytona", "vercel_sandbox")
+    if env_type in ("singularity", "modal", "daytona", "vercel_sandbox"):
+        return True
+    # Plugin backends declare the same classification through the provider ABI (#94400);
+    # fail-soft to False so an unknown or raising backend — or a raising registry
+    # lookup — keeps the guards on rather than propagating out of the approval predicate.
+    try:
+        from agent.terminal_env_registry import provider_flag
+        return bool(provider_flag(env_type, "skip_container_guards", False))
+    except Exception:
+        return False
 
 
 def _user_deny_block(command: str) -> dict | None:
@@ -1129,6 +1151,11 @@ def check_all_command_guards(command: str, env_type: str,
     blocked = _floor_block(command, sudo_guard=True)
     if blocked is not None:
         return blocked
+
+    from agent.terminal_approval_batch import consume_prepared_guard
+    prepared = consume_prepared_guard(command, env_type, has_host_access)
+    if prepared is not None:
+        return prepared
 
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":

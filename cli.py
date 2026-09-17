@@ -2399,7 +2399,8 @@ def save_config_value(key_path: str, value: any) -> bool:
     config_path = get_hermes_home() / 'config.yaml'
 
     try:
-        config_path.parent.mkdir(parents=True, exist_ok=True)
+        from hermes_constants import mkdir_under_hermes_home
+        mkdir_under_hermes_home(config_path.parent)
         from utils import atomic_roundtrip_yaml_update
         atomic_roundtrip_yaml_update(config_path, key_path, value)
         try:  # owner-only: config files contain API keys
@@ -4089,28 +4090,33 @@ def _sync_cli_session_id_from_agent(cli) -> None:
         cli.session_id = cli.agent.session_id
 
 
+# ``failure_reason`` values that say nothing about the task itself: the provider is walled,
+# down or unreachable, or the account is out of credit, so a Kanban worker signals "try
+# later" instead of "I failed" and the dispatcher does not spend the task's retry budget on it.
+_TRANSIENT_PROVIDER_REASONS = frozenset({
+    "rate_limit", "upstream_rate_limit", "billing", "overloaded", "server_error", "timeout",
+})
+
+
 def _single_query_exit_code(result) -> int:
-    """Map a one-shot turn result onto a process exit code.
+    """Map a one-shot turn result onto a process exit code, for both `-q` and `-Q`.
 
-    0 success, 1 failure, and ``KANBAN_RATE_LIMIT_EXIT_CODE`` (EX_TEMPFAIL) when a
-    Kanban worker failed purely because the provider rate-limited or the account hit a
-    billing/quota wall. The dispatcher's reap classifier maps that sentinel to a
-    ``rate_limited`` exit and releases the task back to ``ready`` WITHOUT counting a
-    failure, so a multi-day quota window cannot trip the circuit breaker and
-    permanently block the card.
-
-    Shared by both one-shot paths. It previously lived inline in the ``-Q`` path only,
-    which is how the ``-q`` path — the one the Kanban dispatcher actually spawns —
-    ended up with no exit contract at all.
+    0 only when the turn completed; 130 when it was interrupted; 1 when it failed, stopped
+    partway (`partial`, `completed: False`) or never ran at all (credentials / agent init
+    failed, so ``result`` is not a dict). A Kanban worker (``HERMES_KANBAN_TASK`` set) that
+    failed purely on a provider rate-limit / billing wall exits ``KANBAN_RATE_LIMIT_EXIT_CODE``
+    (EX_TEMPFAIL): the dispatcher books that run ``rate_limited`` and requeues the task
+    WITHOUT counting a failure, so a quota window or a provider outage cannot trip the breaker.
     """
-    if not (isinstance(result, dict) and result.get("failed")):
+    if not isinstance(result, dict):
+        return 1
+    if result.get("interrupted"):
+        return 130
+    if not (result.get("failed") or result.get("partial") or result.get("completed") is False):
         return 0
-    if os.environ.get("HERMES_KANBAN_TASK") and result.get("failure_reason") in ("rate_limit", "billing"):
-        try:
-            from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
-            return KANBAN_RATE_LIMIT_EXIT_CODE
-        except Exception:
-            return 1
+    if os.environ.get("HERMES_KANBAN_TASK") and result.get("failure_reason") in _TRANSIENT_PROVIDER_REASONS:
+        from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+        return KANBAN_RATE_LIMIT_EXIT_CODE
     return 1
 
 
@@ -4124,10 +4130,13 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     from agent.interrupt_compat import _accepts_keyword
     from agent.turn_author import take_turn_author_from_env
     from hermes_cli.quiet_single_query import (
-        bind_quiet_session_key, continue_quiet_notify_completions, quiet_notify_linger_seconds,
+        adopt_unanswered_turn, bind_quiet_session_key, continue_quiet_notify_completions,
+        quiet_notify_linger_seconds,
     )
 
     author = take_turn_author_from_env()
+    # A dispatcher's re-run of a failed bot delivery resumes the DM row its first attempt persisted.
+    adopt_unanswered_turn(cli, effective_query)
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
         try:
@@ -4543,14 +4552,9 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         cli._show_security_advisories()
         cli.chat(query, images=single_query_images or None)
         cli._print_exit_summary(clear_screen=False)
-        # A dispatcher-spawned Kanban worker must report its outcome in its exit code.
-        # This path fell through to an implicit 0 for every outcome, and the reaper
-        # reads rc=0 with the task still `running` as a protocol violation: a provider
-        # quota wall was re-dispatched straight back into the same wall until the
-        # violation budget auto-blocked the card. Plain `-q` runs by a person are
-        # unaffected: they still exit 0.
-        if os.environ.get("HERMES_KANBAN_TASK"):
-            sys.exit(_single_query_exit_code(getattr(cli, "_last_turn_result", None)))
+        # Same exit contract as `-Q`: scripts and the Kanban dispatcher read the outcome from
+        # the exit code. This path used to fall through to an implicit 0 for every outcome.
+        sys.exit(_single_query_exit_code(cli._last_turn_result))
     finally:
         _finalize_single_query(cli)
 
