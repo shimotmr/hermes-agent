@@ -434,6 +434,14 @@ override-dependencies = [
   # merge, so we floor it here to make the fix merge-proof. Remove when
   # upstream's lock carries >=6.5.8 on its own.
   "tornado>=6.5.8,<7",
+  # anyio is transitive-only (httpx/httpcore, mcp, openai, ...); fixed
+  # GHSA-82r6-8w77-94w6 (CVE-2026-63374, CRITICAL — TLS certificate
+  # spoofing via IDNA 2003 encoding in TLSStream) plus the stderr-capture
+  # issue GHSA-5p39-cfhj-2xmp, both in 4.14.2, published 2026-09-18.
+  # Same merge-proofing shape as tornado above: a bare lockfile bump gets
+  # reverted by the next upstream uv.lock regeneration, so floor it here.
+  # Remove when upstream's lock carries >=4.14.2 on its own.
+  "anyio>=4.14.2,<5",
 ]
 exclude-newer = "14 days"
 # h2: temporary exclude-newer exception for the CVE-2026-71554 (GHSA-6hr6-w5qg-qmwg,
@@ -491,6 +499,7 @@ aiohttp-socks = false
 aiosqlite = false
 alibabacloud-dingtalk = false
 anthropic = false
+anyio = false
 asyncpg = false
 azure-identity = false
 boto3 = false
