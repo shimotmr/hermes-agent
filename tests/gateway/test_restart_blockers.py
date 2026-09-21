@@ -473,6 +473,51 @@ def test_manager_policy_and_pid_are_read_only_and_start_time_is_rechecked(monkey
     assert calls
 
 
+@pytest.mark.macos_only
+def test_launchd_wrapper_and_successful_exit_false_form_a_live_relaunch_contract(monkeypatch):
+    """The generated plist owns a stderr wrapper and renders KeepAlive as a semaphore."""
+    import gateway.restart_relaunch as relaunch
+
+    pid, wrapper_pid = 1234, 5678
+    child_argv = ['/venv/bin/python', '-m', 'hermes_cli.main', 'gateway', 'run', '--external-supervisor']
+    wrapper_argv = [
+        '/venv/bin/python', '-m', 'hermes_cli.stderr_timestamp',
+        '--error-log', '/tmp/gateway.error.log', '--', *child_argv,
+    ]
+
+    class Process:
+        def __init__(self, process_pid):
+            self.pid = process_pid
+
+        def parent(self):
+            return Process(wrapper_pid) if self.pid == pid else None
+
+        def cmdline(self):
+            return child_argv if self.pid == pid else wrapper_argv
+
+    monkeypatch.setattr(relaunch.psutil, 'Process', Process)
+
+    def read(args):
+        if args == ['launchctl', 'list']:
+            return f'{wrapper_pid}\t0\tai.hermes.test\n'
+        assert args == ['launchctl', 'print', f'gui/{os.getuid()}/ai.hermes.test']
+        return (
+            f'pid = {wrapper_pid}\n'
+            'semaphores = {\n'
+            '    successful exit => 0\n'
+            '}\n'
+            'properties = runatload | inferred program\n'
+        )
+
+    monkeypatch.setattr(relaunch, '_read_manager', read)
+
+    assert relaunch._launchd_contract(pid) == {
+        'manager': 'launchd',
+        'service': f'gui/{os.getuid()}/ai.hermes.test',
+        'policy': 'keepalive',
+    }
+
+
 def test_owned_delivery_count_tracks_durable_pending_until_ack(tmp_path, monkeypatch):
     from gateway import delivery_ledger as ledger
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))

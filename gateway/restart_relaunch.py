@@ -8,6 +8,8 @@ import subprocess
 import sys
 from typing import Any, Mapping
 
+import psutil
+
 
 def _read_manager(args: list[str]) -> str:
     result = subprocess.run(args, capture_output=True, text=True, timeout=3, check=False)
@@ -53,11 +55,30 @@ def _systemd_contract(pid: int) -> dict[str, Any] | None:
     return None
 
 
+def _launchd_supervised_pid(pid: int) -> int:
+    """Return the launchd-owned PID for a direct gateway or its official stderr wrapper."""
+    try:
+        child = psutil.Process(pid)
+        parent = child.parent()
+        if parent is None:
+            return pid
+        parent_argv = parent.cmdline()
+        if len(parent_argv) < 4 or parent_argv[1:3] != ['-m', 'hermes_cli.stderr_timestamp']:
+            return pid
+        from hermes_cli.stderr_timestamp import _parse_args
+
+        wrapped = _parse_args(parent_argv[3:]).command
+        return parent.pid if list(wrapped) == child.cmdline() else pid
+    except (OSError, psutil.Error, SystemExit):
+        return pid
+
+
 def _launchd_contract(pid: int) -> dict[str, Any] | None:
     # list 的 PID 欄位決定 label；print 驗證「已載入」政策，不能讀磁碟 plist 代替。
+    supervised_pid = _launchd_supervised_pid(pid)
     for line in _read_manager(['launchctl', 'list']).splitlines():
         fields = line.split()
-        if len(fields) != 3 or fields[0] != str(pid):
+        if len(fields) != 3 or fields[0] != str(supervised_pid):
             continue
         label = fields[2]
         for domain in (f'gui/{os.getuid()}', f'user/{os.getuid()}', 'system'):
@@ -65,9 +86,13 @@ def _launchd_contract(pid: int) -> dict[str, Any] | None:
             output = _read_manager(['launchctl', 'print', service])
             current = re.search(r'^\s*pid = (\d+)\s*$', output, re.MULTILINE)
             props = re.search(r'^\s*properties = (.+)$', output, re.MULTILINE)
-            if current is None or int(current[1]) != pid or props is None:
+            if current is None or int(current[1]) != supervised_pid or props is None:
                 continue
-            if 'keepalive' not in {p.strip() for p in props[1].split('|')}:
+            properties = {p.strip() for p in props[1].split('|')}
+            successful_exit_false = re.search(
+                r'^\s*successful exit => 0\s*$', output, re.MULTILINE
+            ) is not None
+            if 'keepalive' not in properties and not successful_exit_false:
                 return None
             return {'manager': 'launchd', 'service': service, 'policy': 'keepalive'}
     return None
