@@ -31,6 +31,10 @@ interface CatalogPlugin {
   installCommand: string;
   /** GitHub stargazers at the last daily probe; null when the repo is not on GitHub or unprobed. */
   stars?: number | null;
+  /** ISO committer date of the commit that added the entry to plugin-catalog/ (null: no git history at build). */
+  addedAt?: string | null;
+  /** ISO committer date of the last commit touching the entry (pin bumps, metadata edits). */
+  updatedAt?: string | null;
   /** Lowercase pre-joined haystack for the search filter (built at load). */
   _search?: string;
 }
@@ -80,6 +84,29 @@ const TIER_CONFIG: Record<
 
 const TIER_ORDER = ["all", "official", "community"];
 
+// Sort orders. "stars" is the extractor's own order (stars desc, name), so it
+// needs no client-side work; the two date sorts read the git-derived
+// addedAt/updatedAt fields and push undated entries last.
+type SortKey = "stars" | "newest" | "updated";
+const SORT_OPTIONS: { key: SortKey; label: string; title: string }[] = [
+  { key: "stars", label: "Most starred", title: "GitHub stars, most first" },
+  { key: "newest", label: "Newest", title: "Most recently added to the catalog first" },
+  { key: "updated", label: "Recently updated", title: "Most recently re-pinned or edited first" },
+];
+
+function dateMs(iso?: string | null): number {
+  const t = iso ? new Date(iso).getTime() : NaN;
+  return Number.isFinite(t) ? t : -Infinity;
+}
+
+function sortPlugins(list: CatalogPlugin[], sort: SortKey): CatalogPlugin[] {
+  if (sort === "stars") return list;
+  const field = sort === "newest" ? "addedAt" : "updatedAt";
+  return [...list].sort(
+    (a, b) => dateMs(b[field]) - dateMs(a[field]) || a.name.localeCompare(b.name),
+  );
+}
+
 // Browse taxonomy. Order here is the order of the filter pills and of the
 // grouped sections; keep it in sync with CATALOG_CATEGORIES in
 // hermes_cli/plugin_catalog.py and website/scripts/extract-plugins.py.
@@ -111,6 +138,13 @@ function formatRelativeTime(iso?: string): string | null {
   if (days < 30) return `${days} day${days === 1 ? "" : "s"} ago`;
   const months = Math.floor(days / 30);
   return `${months} month${months === 1 ? "" : "s"} ago`;
+}
+
+function formatDate(iso?: string | null): string {
+  const d = iso ? new Date(iso) : null;
+  return d && Number.isFinite(d.getTime())
+    ? d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })
+    : "";
 }
 
 function formatStars(n: number): string {
@@ -294,6 +328,23 @@ function PluginCard({
           ))}
         </div>
 
+        {/* Updated is omitted while it equals Added: a fresh entry has nothing to say yet. */}
+        {plugin.addedAt && (
+          <div className={styles.cardDates}>
+            <span title={`Added to the catalog ${formatDate(plugin.addedAt)}`}>
+              Added {formatRelativeTime(plugin.addedAt) ?? formatDate(plugin.addedAt)}
+            </span>
+            {plugin.updatedAt && plugin.updatedAt !== plugin.addedAt && (
+              <>
+                <span aria-hidden="true" className={styles.cardDatesSep}>·</span>
+                <span title={`Last catalog change ${formatDate(plugin.updatedAt)}`}>
+                  Updated {formatRelativeTime(plugin.updatedAt) ?? formatDate(plugin.updatedAt)}
+                </span>
+              </>
+            )}
+          </div>
+        )}
+
         {onPick ? (
           <button
             className={styles.pickBtn}
@@ -446,6 +497,7 @@ export default function PluginCatalogPage() {
   const [search, setSearch] = useState("");
   const [tierFilter, setTierFilter] = useState("all");
   const [categoryFilter, setCategoryFilter] = useState("all");
+  const [sort, setSort] = useState<SortKey>("stars");
   const [expandedCard, setExpandedCard] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
@@ -494,13 +546,14 @@ export default function PluginCatalogPage() {
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase().trim();
-    return allPlugins.filter((p) => {
+    const matching = allPlugins.filter((p) => {
       if (tierFilter !== "all" && p.tier !== tierFilter) return false;
       if (categoryFilter !== "all" && p.category !== categoryFilter) return false;
       if (q) return (p._search || "").includes(q);
       return true;
     });
-  }, [search, tierFilter, categoryFilter, allPlugins]);
+    return sortPlugins(matching, sort);
+  }, [search, tierFilter, categoryFilter, sort, allPlugins]);
 
   // Browse mode (no search, no category picked): render one section per
   // category so Memory, Desktop, Platforms… read as distinct shelves rather
@@ -675,6 +728,25 @@ export default function PluginCatalogPage() {
                   >
                     {tier === "all" ? "All" : conf?.label || tier}
                     <span className={styles.tierCount}>{count}</span>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className={styles.sortPills} role="radiogroup" aria-label="Sort plugins">
+              <span className={styles.sortLabel}>Sort</span>
+              {SORT_OPTIONS.map((opt) => {
+                const active = sort === opt.key;
+                return (
+                  <button
+                    key={opt.key}
+                    className={`${styles.tierBtn} ${active ? styles.sortBtnActive : ""}`}
+                    onClick={() => setSort(opt.key)}
+                    role="radio"
+                    aria-checked={active}
+                    title={opt.title}
+                  >
+                    {opt.label}
                   </button>
                 );
               })}
