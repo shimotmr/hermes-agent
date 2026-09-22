@@ -22,6 +22,7 @@ import {
   setYoloActive
 } from '@/store/session'
 import {
+  $parkedTileStoredIds,
   $sessionStates,
   $sessionTiles,
   isSessionInForeground,
@@ -68,6 +69,11 @@ export function useSessionStateCache({
 }: SessionStateCacheOptions) {
   const busy = useStore(PRIMARY_SESSION_VIEW.$busy)
   const sessionTiles = useStore($sessionTiles)
+  // Parking is driven by pane-lifecycle when focus moves off a tile (onto a
+  // terminal pane, say). That changes neither the active/selected ids nor the
+  // tile list, so without subscribing here an idle window would keep the parked
+  // transcript pinned until some unrelated publish happened to re-run prune.
+  const parkedTileStoredIds = useStore($parkedTileStoredIds)
   const activeSessionIdRef = useRef<string | null>(activeSessionId)
   const selectedStoredSessionIdRef = useRef<string | null>(selectedStoredSessionId)
 
@@ -107,8 +113,9 @@ export function useSessionStateCache({
           .get()
           .some(
             tile =>
-              tile.runtimeId === runtimeId ||
-              (state.storedSessionId !== null && tile.storedSessionId === state.storedSessionId)
+              !$parkedTileStoredIds.get().has(tile.storedSessionId) &&
+              (tile.runtimeId === runtimeId ||
+                (state.storedSessionId !== null && tile.storedSessionId === state.storedSessionId))
           ),
       // A connection death mid-turn leaves snapshots whose frozen busy flags
       // will never settle (the respawned backend re-mints runtime ids), which
@@ -171,7 +178,11 @@ export function useSessionStateCache({
 
             // A rotation event needs a real next id — a null/cleared stored id
             // is a detach, not a rotation the route-follow effect should chase.
-            if (storedSessionId && sessionId === $activeSessionId.get() && isSessionInForeground(existing.storedSessionId)) {
+            if (
+              storedSessionId &&
+              sessionId === $activeSessionId.get() &&
+              isSessionInForeground(existing.storedSessionId)
+            ) {
               setActiveSessionStoredIdRotation({
                 nextStoredSessionId: storedSessionId,
                 previousStoredSessionId: existing.storedSessionId,
@@ -387,7 +398,7 @@ export function useSessionStateCache({
 
   useEffect(() => {
     sessionStateCache.prune()
-  }, [activeSessionId, selectedStoredSessionId, sessionStateCache, sessionTiles])
+  }, [activeSessionId, parkedTileStoredIds, selectedStoredSessionId, sessionStateCache, sessionTiles])
 
   const getRuntimeIdForStoredSession = useCallback(
     (storedSessionId: string): string | null => {
