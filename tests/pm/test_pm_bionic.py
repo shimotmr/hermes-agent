@@ -146,3 +146,62 @@ def test_deb_rejects_traversal_before_touching_outside(tmp_path):
     with pytest.raises(InstallError, match="unsafe|escape|traversal"):
         DebPackage().unpack(deb, tmp_path / "staged", "linux-arm64-bionic")
     assert sentinel.read_bytes() == b"owned outside extraction"
+
+
+def test_every_declared_target_resolves_an_artifact_url(lock):
+    """A package may only claim a target it can build an artifact URL for.
+
+    ``gaps`` is the per-target "this package does not exist here" table, and
+    ``pm update`` skips those targets before it ever calls ``fetch_url``. A
+    package that claims a target but cannot build a URL for it fails the whole
+    pin: the OS/arch split inside ``fetch_url`` sees "linux-arm64-bionic" as
+    three segments and raises ValueError, so the update is abandoned on EVERY
+    host, not just the one that needs the bionic arm.
+
+    GitHub CLI shipped that shape until it declared the bionic arm as a gap.
+    This test is the general contract so the next package cannot reintroduce
+    it.
+
+    Each package is resolved with its own pinned version, because versions
+    live on different axes: chromium's is "<playwright revision>+<chrome
+    version>", not a bare semver.
+
+    The failure this guards is the unpack: a ValueError raised while splitting
+    the target means the package cannot name an artifact for a target it
+    claims. Other refusals -- an upstream index that is rate-limited, an
+    artifact the supplier no longer advertises -- are availability, not a
+    target-shape defect, and are not this test's business.
+    """
+    from pm.registry import get_package
+    from pm.store import ALL_TARGETS
+
+    packages = lock["packages"]
+    for name in sorted(_registered_names()):
+        package = get_package(name)
+        version = (packages.get(name) or {}).get("version")
+        if not version:
+            continue
+        for target in ALL_TARGETS:
+            if package.missing_reason(target) is not None:
+                continue
+            try:
+                url = package.fetch_url(version, target)
+            except ValueError as exc:
+                raise AssertionError(
+                    f"{name} claims {target} (no gap declared) but fetch_url could not "
+                    f"split it: {type(exc).__name__}: {exc}. Declare the target in the "
+                    f"package's `gaps` table, or teach fetch_url to build its URL."
+                ) from exc
+            except Exception:
+                # Availability, not shape: an upstream index that is down or
+                # rate-limited says nothing about the target contract.
+                continue
+            # The URL must be an absolute one. termux-docker resolves to a
+            # docker:// URI rather than https, which is its own contract.
+            assert "://" in url, f"{name} {target} -> not an absolute URL {url!r}"
+
+
+def _registered_names():
+    from pm import registry
+
+    return list(registry._packages)

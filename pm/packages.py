@@ -772,6 +772,11 @@ class Gh(BinaryPackage):
     name = "gh"
     optional = True
     binary_rel = {"win32": "bin/gh.exe", "posix": "bin/gh"}
+    # GitHub CLI publishes no Android/Termux build, so the bionic arm has no
+    # artifact. Declaring it as a gap keeps `pm update` from resolving a URL
+    # for it: the target string "linux-arm64-bionic" splits into three
+    # segments, which the OS/arch split below cannot unpack.
+    gaps = {"linux-arm64-bionic": "GitHub CLI publishes no Android build"}
 
     def fetch_url(self, version: str, target: str) -> str:
         # GitHub CLI's Linux release matrix is built with CGO_ENABLED=0,
