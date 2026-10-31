@@ -204,4 +204,10 @@ def test_every_declared_target_resolves_an_artifact_url(lock):
 def _registered_names():
     from pm import registry
 
-    return list(registry._packages)
+    # ``registry._packages`` is populated lazily: ``pm.registry`` deliberately
+    # defers importing the package catalogue until the first read, so reaching
+    # into the private dict directly yields an EMPTY mapping. The contract
+    # test would then iterate over nothing and pass vacuously -- it would not
+    # catch the very defect it exists to catch. ``all_packages()`` is the
+    # public accessor that performs the lazy load.
+    return list(registry.all_packages())
